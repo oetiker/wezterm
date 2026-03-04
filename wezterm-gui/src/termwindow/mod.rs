@@ -2229,6 +2229,9 @@ impl TermWindow {
 
         self.last_scroll_info = render_dims;
 
+        if let Some(state) = self.purecpu_state.as_mut() {
+            state.force_full_repaint = true;
+        }
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
         }
@@ -2350,6 +2353,9 @@ impl TermWindow {
             self.tab_bar = new_tab_bar;
             self.invalidate_fancy_tab_bar();
             self.invalidate_modal();
+            if let Some(state) = self.purecpu_state.as_mut() {
+                state.force_full_repaint = true;
+            }
             if let Some(window) = self.window.as_ref() {
                 window.invalidate();
             }
