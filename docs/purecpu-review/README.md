@@ -16,7 +16,8 @@ Two detail documents sit behind this page, and every claim here is traceable to
 a row or a finding in one of them:
 
 - **[parity-matrix.md](parity-matrix.md)** — 21 feature rows, each with a
-  verdict and the command and numbers behind it.
+  verdict. The 16 that were investigated carry the command and the numbers
+  behind them; the 5 out-of-scope rows carry a reason instead.
 - **[findings.md](findings.md)** — 18 defects found by reading the fork's own
   patch, ranked, with evidence class stated per finding.
 - [noise-floor.md](noise-floor.md) — the calibration that makes the pixel
@@ -113,16 +114,26 @@ Evidence cell rather than letting it read as equivalent to the others.
 
 **What is degraded.**
 
-- **Inline images at any non-native size** (sixel, iTerm2 OSC 1337) — measured,
-  and severe. Requesting an image at a non-native size (measured at 200x132 px,
-  and again at 20x4 cells) gives you a *dotted grid of tiny cropped fragments*,
-  one top-left tile per covered cell, with background showing through the rest of
-  every cell, where OpenGL draws a solid stretched block. Over a crop covering
-  both non-native blocks: `AE = 39360`, `PAE = 61423` (0.937, near-maximal).
-  Reachable from an ordinary escape sequence. Sixel additionally fails through a
-  second, unrelated mechanism at large sizes: once the atlas must grow past
-  `GL_MAX_TEXTURE_SIZE` the GPU path downscales and PureCpu does not, so every
-  pixel in the strip differs by a uniform ~2-3/255.
+- **Inline images**, both protocols, but the two rows were measured on different
+  content and the evidence does not transfer between them:
+  - **iTerm2 OSC 1337 at a non-native size** is the severe one, and it is
+    measured directly. Requested at 200x132 px, and again at 20x4 cells, PureCpu
+    draws a *dotted grid of tiny cropped fragments* — one top-left tile per
+    covered cell, background showing through the rest of every cell — where
+    OpenGL draws a solid stretched block. Over a crop covering both non-native
+    blocks: `AE = 39360`, `PAE = 61423` (0.937, near-maximal). Reachable from an
+    ordinary escape sequence.
+  - **Sixel** is `degraded` from **two independent mechanisms**, neither of which
+    is the dotted grid above — no sixel was ever captured at a non-native
+    requested size, so that failure mode is *predicted* for sixel via the shared
+    `populate_image_quad` path, not shown. What *was* measured: (a) at 300x300,
+    still requested at its native size, source-stepping rounding displaces the
+    gradient band boundary by one scan row — `AE = 3300`, `PAE = 1542` (6 LSB),
+    which fails the gate; and (b) at 17000x64, once the atlas must grow past
+    `GL_MAX_TEXTURE_SIZE`, the GPU path downscales via `AllowImage::Scale(2)` and
+    PureCpu does not, so **every pixel in the visible strip differs** (`AE =
+    64000` of 64000) by a uniform ~2-3/255.
+  - Both protocols are bit-identical at native size (`AE = 0`, `PAE = 0`).
 - **Animated GIFs** never advance a frame on an otherwise-idle screen. Over 12
   samples across 6 s, GL cycled both frames; PureCpu reported the same frame all
   12 times.
@@ -164,8 +175,9 @@ The review distinguishes these deliberately, and this page does not flatten them
 
 - **Measured** — a command was run against the built binary and the numbers are
   in the Evidence cell. **13 of 21 rows**, including every `parity` and every
-  `missing`. These were re-run from clean shells, in several cases by a second
-  reviewer independently.
+  `missing`. Five of them state "reproduced from a clean shell" in the matrix
+  (the four cursor/animation rows plus text glyphs); several others were
+  re-run independently by a second reviewer during the review rounds.
 - **By reading** — the code path is unambiguous but no runtime trigger was
   demonstrated. 3 rows. Two of them — double-width/height lines and scaled
   fallback/bitmap glyphs — are consequences of root cause 1, whose mechanism
@@ -197,9 +209,12 @@ measured `missing`.
 severity order inside Medium. The order below is the severity ladder the
 document itself defines, applied consistently.
 
-**Important — content silently not drawn in an ordinary configuration. These
-two the pixel harness could never have caught**, because it only ever captured a
-single settled full-window state:
+**Important — content silently not drawn in an ordinary configuration. Neither
+of these was reachable by the parity matrix at all**, for a reason worth
+internalising: every case in the harness put the content under test in a
+**single full-width pane**, where `pos.top` and `pos.left` are both zero and the
+active pane is the only one with live output. The corpus was blind along an axis
+nobody thought to vary — not along an axis the tool could not see:
 
 - **I1** — dirty tracking consults only the **active** pane, so output in any
   other pane of a split is never repainted until something forces a full repaint.
@@ -265,25 +280,32 @@ any way.
 machine — the arithmetic does not need a demonstration that could take out other
 people's work), and crafted malformed fonts for M3/M4/M5.
 
-**Declared unmeasured within rows that were otherwise measured.**
-`VisualBellTarget::CursorColor`; rapid blink (SGR 6 / `text_blink_rate_rapid`);
-any interaction between the three animations; and the DECSCUSR cursor-blink
-sub-finding, whose numbers come from a hand-written config because
-`gen-config.sh` correctly refuses the combination that probe requires (its
-regeneration block is fenced in the matrix and does run).
+**Declared unmeasured inside rows that were otherwise measured** (all four now
+recorded in the matrix itself, under "Grading basis for animation rows"):
+`VisualBellTarget::CursorColor` — the bell row samples an empty-background
+pixel, so only the default `BackgroundColor` target was exercised; rapid blink
+(SGR 6 / `text_blink_rate_rapid`), as distinct from the SGR 5 path the blinking
+-text row measures; any interaction between the three animations running at
+once; and the DECSCUSR cursor-blink sub-finding, whose numbers come from a
+hand-written config because `gen-config.sh` correctly refuses the combination
+that probe requires (its regeneration block is fenced in the matrix and does
+run). Each row's verdict covers what its Evidence cell actually sampled.
 
 **Method limits.** Three worth knowing:
 
-- The parity harness only ever captured a **single settled, full-window** state
-  with one pane. That is structurally blind to I1 and I2 — the two findings about
-  panes in a split not repainting — which were found by reading and then measured
-  with purpose-built probes, not by the matrix. If a defect needs a split, or
-  needs the window to be mid-change, no matrix row would have caught it.
-- The three animation rows cannot be diffed across backends at all: each
-  backend's blink phase runs off its own wall clock, so a cross-backend pixel
-  diff would measure phase offset, not a defect. They are graded by sampling one
-  pixel repeatedly *within* each backend and asking whether the value changes
-  over time.
+- **Every harness case ran the content under test in a single full-width pane.**
+  That is what made I1 and I2 invisible to the matrix — not that captures were
+  settled, since Task 4 added a non-settling sampler that the animation rows and
+  the GIF row all use. With one pane, `pos.top`/`pos.left` are zero and the
+  active pane is the only one producing output, so both defects are identically
+  silent. Any defect that needs a split would have been missed the same way.
+- **Time-driven rows cannot be diffed across backends at all**: each backend's
+  blink/bell/animation phase runs off its own wall clock, so a cross-backend
+  pixel diff of two captures "at the same moment" would measure phase offset,
+  not a defect. The three animation rows (cursor blink, blinking text, visual
+  bell) and the animated-GIF row are therefore graded by sampling a region
+  repeatedly *within* each backend and asking whether the value changes over
+  time. A flat sequence against a varying one is the finding.
 - The tab strip has **no established noise floor** (Task 3 stopped there
   deliberately rather than inventing one), so chrome pixels are graded on
   explicit per-region pixel evidence, never on a threshold. `FUZZ` was never
