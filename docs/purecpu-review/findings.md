@@ -28,6 +28,16 @@ class, but only C1's trigger was actually run. The rule is written down here
 because the first draft of this document applied it silently and the ladder
 then contradicted itself three times (review round 1, I-R2).
 
+**The rule applies once, to the defect class, and does not stack** (Task 8,
+Mi2). The Medium definition already reads "or a robustness hole with no
+demonstrated trigger", which describes the *same* condition the demotion rule
+tests, so applying the rule a second time to a finding that is *natively*
+Medium (M6, M7) or natively Low (L3) would push it down a class for a reason
+already priced into its definition. Read it as: establish the defect class
+from what the defect *is*, demote by one if its trigger was not reproduced,
+stop. That is what the ladder below actually does; this clause only removes
+the ambiguity.
+
 Each finding states its evidence class explicitly:
 
 - **measured** — reproduced against the running binary, command included.
@@ -411,7 +421,7 @@ ordinary config:
   colour-emoji fonts set `scale` below 1 (`glyphcache.rs:749-798`); the
   sprite is cropped rather than downscaled.
 - **Fancy tab bar glyph runs with `glyph.scale != 1`** (by reading,
-  `box_model.rs:902-913`).
+  `termwindow/box_model.rs:902-913`).
 
 **Evidence class:** measured for images; by reading for DECDWL/DECDHL and
 scaled glyphs.
@@ -423,6 +433,16 @@ sampler for every non-background case at modest cost.
 ---
 
 ## Medium
+
+**Ordering note (Task 8, Mi1).** Findings are presented in id order within each
+class, *not* most-severe-first, and in this class the two orderings differ:
+**M3, M4 and M5 are defect-class Critical** (process aborts reachable from font
+data) recorded Medium under the demotion rule, while M1 and M2 ahead of them are
+cosmetic rendering errors. If you are reading this section to decide what to fix
+first, read M3/M4/M5 first. The ids are left as they are because Task 7's review
+verified the numbering is contiguous and every internal cross-reference resolves
+against it; renumbering to fix a presentation order would put that at risk for
+no gain. The README's ordering reflects severity, not id.
 
 ### M1 — Destination coordinates are truncated rather than rounded, displacing sub-pixel-positioned quads one pixel left/up
 
