@@ -80,3 +80,32 @@ capture_settled() {  # capture_settled <winid> <outfile>
 kill_class() {  # kill_class <class>
   pkill -f -- "--class $1" || true
 }
+
+# sample_region <winid> <crop-geometry> <count> <interval>
+#
+# `capture_settled` cannot measure animation: it *defines* success as two
+# consecutive captures, `$interval` apart, being pixel-identical, so it is
+# blind by construction to anything that is still changing when the driver
+# looks at it — an animated GIF frame, a blinking cursor, blinking text, a
+# ringing visual bell. Waiting for those to "settle" either times out or,
+# worse, silently reports whatever frame the sampling luckily landed on.
+#
+# `sample_region` takes the opposite approach on purpose: instead of waiting
+# for stability, it samples one pixel of `<crop-geometry>` (an ImageMagick
+# geometry string, e.g. `4x4+14+262`) `<count>` times, `<interval>` seconds
+# apart, and prints the raw colour sequence — space-separated, one call per
+# import — with no judgement about whether it changed. The caller (or a
+# human) compares the two backends' sequences directly. Added in Task 4 fix
+# round 1 (CRIT-2) to demonstrate the animated-GIF idle-skip defect; Tasks 5
+# and 6 reuse it as-is for cursor blink, blink-attribute text and the visual
+# bell, which share the same do_paint_purecpu idle-skip mechanism
+# (termwindow/mod.rs:1436-1447).
+sample_region() {
+  local id="$1" geom="$2" count="$3" interval="$4" i color
+  for i in $(seq "$count"); do
+    color=$(import -window "$id" -crop "$geom" +repage png:- 2>/dev/null \
+             | convert - -format '%[pixel:p{0,0}]' info:)
+    printf '%s ' "$color"
+    pause "$interval"
+  done
+}
