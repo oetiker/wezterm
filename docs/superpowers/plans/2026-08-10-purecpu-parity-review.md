@@ -177,14 +177,38 @@ kill_class() {  # kill_class <class>
 
 Colours are pinned explicitly rather than by scheme name, so the comparison cannot drift with wezterm's bundled schemes.
 
+Two optional environment variables let later tasks reuse this one generator:
+`FANCY` (default `true`) selects the fancy or retro tab bar, and `SPAWN_TABS`
+(default `false`) adds a `gui-startup` handler that creates extra tabs and a
+split for the chrome case.
+
 ```bash
 #!/usr/bin/env bash
 # gen-config.sh <front_end> <outfile>
+#   env: FANCY=true|false      (tab bar style, default true)
+#        SPAWN_TABS=true|false (spawn 3 tabs + a split, default false)
 set -euo pipefail
 FRONT_END="$1"
 OUT="$2"
+FANCY="${FANCY:-true}"
+SPAWN_TABS="${SPAWN_TABS:-false}"
+
+STARTUP=""
+if [ "$SPAWN_TABS" = "true" ]; then
+STARTUP=$(cat <<'LUA'
+wezterm.on('gui-startup', function(cmd)
+  local tab, pane, window = wezterm.mux.spawn_window {}
+  pane:split { direction = 'Right', size = 0.5 }
+  window:spawn_tab {}
+  window:spawn_tab {}
+end)
+LUA
+)
+fi
+
 cat > "$OUT" <<EOF
 local wezterm = require 'wezterm'
+${STARTUP}
 return {
   front_end = '${FRONT_END}',
   font_size = 12.0,
@@ -194,7 +218,7 @@ return {
   text_blink_rate = 0,
   animation_fps = 1,
   enable_tab_bar = true,
-  use_fancy_tab_bar = true,
+  use_fancy_tab_bar = ${FANCY},
   audible_bell = 'Disabled',
   window_close_confirmation = 'NeverPrompt',
   check_for_updates = false,
@@ -453,7 +477,14 @@ git commit -m "test: measure inline image parity for PureCpu"
 
 - [ ] **Step 1: Write `tools/purecpu-parity/corpus/chrome.sh`**
 
-Chrome needs multiple tabs and a split to exercise dividers. Panes are created by the corpus itself so no keyboard input is required.
+Multiple tabs and a split are required to exercise the tab bar and dividers.
+The mux CLI is not built, so they are created from the config itself via the
+`gui-startup` event, which needs no interactive input and is identical across
+both backends. This is already supported by `gen-config.sh` from Task 2 through
+the `SPAWN_TABS` environment variable — no new generator is needed.
+
+The corpus itself stays trivial, because the window structure comes from the
+config:
 
 ```bash
 #!/usr/bin/env bash
@@ -463,74 +494,33 @@ printf 'tab bar, window buttons, rounded corners, split divider\n'
 exec sleep 600
 ```
 
-Multiple tabs and a split are required to exercise the tab bar and dividers.
-The mux CLI is not built, so they are created from the config itself via the
-`gui-startup` event, which needs no interactive input and is identical across
-both backends. Write `tools/purecpu-parity/gen-config-chrome.sh`:
+`SPAWN_TABS=true` yields three tabs with a vertical split in the first — enough
+for tab bar, active/inactive tab styling, and divider rendering. If
+`gui-startup` does not fire (check the launch log for a Lua error), record the
+split-divider row as `known gap` with that reason rather than leaving it
+unmeasured.
 
-```bash
-#!/usr/bin/env bash
-# gen-config-chrome.sh <front_end> <use_fancy_tab_bar:true|false> <outfile>
-set -euo pipefail
-FRONT_END="$1"; FANCY="$2"; OUT="$3"
-cat > "$OUT" <<EOF
-local wezterm = require 'wezterm'
-wezterm.on('gui-startup', function(cmd)
-  local tab, pane, window = wezterm.mux.spawn_window {}
-  pane:split { direction = 'Right', size = 0.5 }
-  window:spawn_tab {}
-  window:spawn_tab {}
-end)
-return {
-  front_end = '${FRONT_END}',
-  font_size = 12.0,
-  initial_cols = 100,
-  initial_rows = 30,
-  cursor_blink_rate = 0,
-  text_blink_rate = 0,
-  animation_fps = 1,
-  enable_tab_bar = true,
-  use_fancy_tab_bar = ${FANCY},
-  audible_bell = 'Disabled',
-  window_close_confirmation = 'NeverPrompt',
-  check_for_updates = false,
-  window_padding = { left = 0, right = 0, top = 0, bottom = 0 },
-  colors = {
-    foreground = '#c0c0c0',
-    background = '#101010',
-    cursor_bg = '#e0e0e0',
-    cursor_fg = '#101010',
-    cursor_border = '#e0e0e0',
-  },
-}
-EOF
-```
+- [ ] **Step 2: Run the fancy tab bar case**
 
-This yields three tabs with a vertical split in the first — enough for tab bar,
-active/inactive tab styling, and divider rendering. If `gui-startup` does not
-fire (check the launch log), record the split-divider row as `known gap` with
-the reason, rather than leaving it unmeasured.
-
-- [ ] **Step 2: Run the chrome case**
+`compare-case.sh` passes `FANCY` and `SPAWN_TABS` through to `gen-config.sh`, so
+both variants run through the same path:
 
 ```bash
 cd /scratch/oetiker/wezterm/tools/purecpu-parity
 chmod +x corpus/chrome.sh
-FUZZ=<value> ./compare-case.sh chrome "$PWD/corpus/chrome.sh"
+FANCY=true SPAWN_TABS=true FUZZ=<value> ./compare-case.sh chrome "$PWD/corpus/chrome.sh"
 ```
 
-- [ ] **Step 3: Capture the retro tab bar variant**
+- [ ] **Step 3: Run the retro tab bar case**
 
-The fancy tab bar and the retro tab bar are different draw paths. Generate a second config pair with `use_fancy_tab_bar = false` and repeat, so both are covered.
+The fancy and retro tab bars are different draw paths, so both are covered:
 
 ```bash
-sed 's/use_fancy_tab_bar = true/use_fancy_tab_bar = false/' \
-  "$PARITY_OUT/opengl.lua"  > "$PARITY_OUT/opengl-retro.lua"
-sed 's/use_fancy_tab_bar = true/use_fancy_tab_bar = false/' \
-  "$PARITY_OUT/purecpu.lua" > "$PARITY_OUT/purecpu-retro.lua"
+FANCY=false SPAWN_TABS=true FUZZ=<value> ./compare-case.sh chrome-retro "$PWD/corpus/chrome.sh"
 ```
 
-Then launch with those configs using the same `launch`/`find_window`/`capture_settled` sequence as `compare-case.sh`, writing to `chrome-retro-gl.png` and `chrome-retro-cpu.png`.
+This writes `chrome-retro-gl.png`, `chrome-retro-cpu.png`, and
+`chrome-retro-diff.png` alongside the fancy captures.
 
 - [ ] **Step 4: Update the matrix and commit**
 
