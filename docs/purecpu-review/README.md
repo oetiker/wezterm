@@ -170,10 +170,14 @@ Evidence cell rather than letting it read as equivalent to the others.
   failing the gate by two orders of magnitude) against **`PAE = 257` for
   ordinary single-width lines in the very same capture**. Worse, the DECDHL
   **bottom half is not drawn at all** — the top line's quad is supposed to cover
-  both rows, and the 1:1 blit clips it away (ink ratio 16.9, zero PureCpu ink on
-  every scan row of the band). `degraded` rather than `missing` because the text
-  is still delivered and legible; the bottom-half row alone is a `missing`
-  sub-case.
+  both rows, and the 1:1 blit clips it away (over y=99-110, OpenGL lays down 1824
+  ink px and PureCpu exactly 0). `degraded` rather than `missing`, and the blank
+  band does not change that: a DECDHL pair's two lines are **required to hold the
+  same content** (`screen_line.rs:32`) — they are one logical line drawn across
+  two rows — so the empty band withholds nothing the row above is not already
+  showing. The text is all there, once, at the wrong size. That is what
+  distinguishes this from I1/I2, where a blank region means output was genuinely
+  lost and appears nowhere. The bottom-half band alone is a scoped `missing`.
 - **Scaled fallback and bitmap glyphs** (including colour emoji) — same
   `purecpu.rs:346-347` mechanism, now demonstrated by the row above, but
   deliberately not measured: it needs an installed font that actually yields
