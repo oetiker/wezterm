@@ -30,6 +30,14 @@ FRONT_END="$1"
 OUT="$2"
 FANCY="${FANCY:-true}"
 SPAWN_TABS="${SPAWN_TABS:-false}"
+# WINDOW_DECORATIONS is unset by default, which means "don't emit the key at
+# all" so every existing case reproduces wezterm's own default
+# (TITLE | RESIZE, wezterm-input-types/src/lib.rs:2123-2126) exactly as
+# before. Task 5 sets it to "INTEGRATED_BUTTONS|RESIZE" to exercise the
+# window-buttons render path (fancy_tab_bar.rs:314,372 gates WindowButton
+# items on WindowDecorations::INTEGRATED_BUTTONS), which is otherwise
+# unreachable through any existing env var.
+WINDOW_DECORATIONS="${WINDOW_DECORATIONS:-}"
 CURSOR_BLINK_RATE="${CURSOR_BLINK_RATE:-0}"
 TEXT_BLINK_RATE="${TEXT_BLINK_RATE:-0}"
 ANIMATION_FPS="${ANIMATION_FPS:-1}"
@@ -81,6 +89,11 @@ case "$DEFAULT_CURSOR_STYLE" in
     ;;
 esac
 
+WINDOW_DECORATIONS_LINE=""
+if [ -n "$WINDOW_DECORATIONS" ]; then
+  WINDOW_DECORATIONS_LINE="  window_decorations = '${WINDOW_DECORATIONS}',"
+fi
+
 STARTUP=""
 if [ "$SPAWN_TABS" = "true" ]; then
 STARTUP=$(cat <<'LUA'
@@ -89,6 +102,11 @@ wezterm.on('gui-startup', function(cmd)
   pane:split { direction = 'Right', size = 0.5 }
   window:spawn_tab {}
   window:spawn_tab {}
+  -- spawn_tab activates each new tab as it's created, so without this the
+  -- window starts on tab 3 and the split created above (in tab 1) is not on
+  -- screen for any capture. Task 5 needs the divider visible, so reactivate
+  -- the split tab last.
+  tab:activate()
 end)
 LUA
 )
@@ -108,6 +126,7 @@ return {
   default_cursor_style = '${DEFAULT_CURSOR_STYLE}',
   enable_tab_bar = true,
   use_fancy_tab_bar = ${FANCY},
+${WINDOW_DECORATIONS_LINE}
   audible_bell = 'Disabled',
   window_close_confirmation = 'NeverPrompt',
   check_for_updates = false,
