@@ -5,6 +5,15 @@ source "$(dirname "$0")/lib.sh"
 CASE="$1"; CORPUS="$2"
 FUZZ="${FUZZ:?set FUZZ from docs/purecpu-review/noise-floor.md}"
 
+# (fix round 3, NEW-7) A printed regeneration command that omits an env var
+# the case actually needs (e.g. PARITY_SETTLE_WARMUP for slow-to-render
+# content) silently reproduces the noise floor from two blank captures
+# instead of the real result — this has happened twice now, and the second
+# time the wrong numbers were the reassuring ones. Echo the warmup value
+# actually in effect so a run's provenance is visible in its own output,
+# not just in prose elsewhere.
+echo "== $CASE: PARITY_SETTLE_WARMUP=${PARITY_SETTLE_WARMUP:-0} =="
+
 "$PARITY_DIR/gen-config.sh" OpenGL  "$PARITY_OUT/opengl.lua"
 "$PARITY_DIR/gen-config.sh" PureCpu "$PARITY_OUT/purecpu.lua"
 kill_class "par-$CASE-gl"; kill_class "par-$CASE-cpu"
@@ -25,6 +34,24 @@ launch "par-$CASE-cpu" "$PARITY_OUT/purecpu.lua" "$CORPUS"
 CPU=$(find_window "par-$CASE-cpu")
 capture_settled "$CPU" "$PARITY_OUT/$CASE-cpu.png" || echo "WARN: cpu never settled"
 kill_class "par-$CASE-cpu"
+
+# (fix round 3, NEW-7) capture_settled can declare victory on a window that
+# hasn't started drawing anything yet — two identical *blank* captures pass
+# the same "unchanged" test as two identical *finished* ones. For a corpus
+# whose content is a colour image, a blank/text-only capture always develops
+# as ImageMagick colorspace Gray (background + monochrome text, no chroma).
+# That's a strong, cheap signal that this run measured nothing: warn loudly
+# rather than let a blank-vs-blank pair silently report the noise floor as
+# if it were a real comparison.
+for side in gl cpu; do
+  space=$(identify -format '%[colorspace]' "$PARITY_OUT/$CASE-$side.png" 2>/dev/null || echo "?")
+  if [ "$space" = "Gray" ]; then
+    echo "WARNING: $CASE-$side.png captured as Gray colorspace — this" \
+         "backend likely hadn't drawn any colour content yet when" \
+         "capture_settled declared it settled (see PARITY_SETTLE_WARMUP" \
+         "in lib.sh). Numbers below may be spuriously close to parity." >&2
+  fi
+done
 
 # Three numbers, not one. Task 3 established that a fuzzed pixel count alone can
 # hide a real defect: at fuzz 3% a uniform +6/255 body-wide brightness error

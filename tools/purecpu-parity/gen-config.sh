@@ -35,6 +35,33 @@ TEXT_BLINK_RATE="${TEXT_BLINK_RATE:-0}"
 ANIMATION_FPS="${ANIMATION_FPS:-1}"
 DEFAULT_CURSOR_STYLE="${DEFAULT_CURSOR_STYLE:-SteadyBlock}"
 
+# (fix round 3, NEW-8) A non-zero CURSOR_BLINK_RATE with DEFAULT_CURSOR_STYLE
+# left at SteadyBlock is not a harmless no-op, it's a silent trap: wezterm
+# only blinks the cursor when the *effective* cursor shape is one of the
+# Blinking* variants (termwindow/mod.rs:1383, cursor.shape.is_blinking()), so
+# this combination emits a config that never blinks on either backend and
+# reports a false `parity` for whoever measures cursor blink with it — the
+# exact failure this whole corpus-must-trigger-the-defect fix effort exists
+# to eliminate. The round-2 fix documented the pairing in a comment; a
+# reviewer reproduced the silent false-parity anyway, because a header
+# comment does not survive a copy-pasted invocation. Fail loudly instead.
+# (TEXT_BLINK_RATE has no equivalent check here: whether it takes effect
+# depends on the corpus emitting SGR 5 blinking text, which this script
+# can't see — that half of the pairing is still only a comment, on purpose.)
+if [ "$CURSOR_BLINK_RATE" != "0" ]; then
+  case "$DEFAULT_CURSOR_STYLE" in
+    Blinking*) ;;
+    *)
+      echo "gen-config.sh: CURSOR_BLINK_RATE=$CURSOR_BLINK_RATE is set but" \
+           "DEFAULT_CURSOR_STYLE=$DEFAULT_CURSOR_STYLE is not a Blinking*" \
+           "variant, so the cursor will never blink and a comparison will" \
+           "silently read as parity. Set DEFAULT_CURSOR_STYLE=BlinkingBlock" \
+           "(or BlinkingUnderline/BlinkingBar) to actually test blink." >&2
+      exit 1
+      ;;
+  esac
+fi
+
 STARTUP=""
 if [ "$SPAWN_TABS" = "true" ]; then
 STARTUP=$(cat <<'LUA'
