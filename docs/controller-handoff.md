@@ -10,7 +10,7 @@
 > not blank page. On merge into another branch, rewrite that branch's handoff
 > to the merged reality — do not merge or preserve this text.
 
-Handoff commit: 17f8677   Date: 2026-08-10   Reason: context budget
+Handoff commit: c057c04   Date: 2026-08-11   Reason: plan complete
 Worktree / branch: `/scratch/oetiker/wezterm` (primary checkout) @ `update-optimization-rebased`
 Trunk at time of writing: `main` @ 05343b3 — **reader: if trunk has moved, §2 is provisionally stale; if trunk now contains this branch's HEAD, this file is a tombstone** (`git merge-base --is-ancestor HEAD main`). `main` here is upstream wezterm and runs ahead of this branch by ordinary upstream commits; that is normal and is NOT a merge signal.
 Sibling worktrees: `/scratch/oetiker/claude-worktrees/wezterm-osc52-upstream` @ `osc52-x11-fix` — the two-commit upstream PR (wezterm/wezterm#8043), unrelated to this review; leave it alone until that PR resolves. This line cannot see worktrees created later; check yourself.
@@ -62,9 +62,23 @@ by a second, and fix-looped to a clean re-review. The ledger is authoritative.
   1 Critical, 5 Important, 7 Medium, 5 Low, plus seven documented non-findings.
   Ids were **renumbered** during the fix round (now C1 / I1–I5 / M1–M7 / L1–L5);
   ledger lines written before that use the old scheme.
-- **Task 8 (consolidation) is dispatched and running** as of this commit —
-  implementer `task8-impl`, BASE `17f8677`. Check the ledger before assuming it
-  is unstarted or complete.
+- **Task 8 (consolidation)** — 2 fix rounds, closed clean. Produced
+  `docs/purecpu-review/README.md`, the summary the user actually asked for.
+
+**THE PLAN IS COMPLETE.** All eight tasks closed, each implemented by one
+subagent, reviewed by an independent second, and fix-looped to a clean
+re-review. Deliverables: `docs/purecpu-review/{README,parity-matrix,findings,
+noise-floor}.md` plus the `tools/purecpu-parity/` harness. Matrix: 21 rows
+(14 measured / 2 by-reading / 5 out-of-scope; 6 `parity`, 7 `degraded`,
+3 `missing`, 5 `known gap`). Findings: 18 defects (1 Critical, 5 Important,
+7 Medium, 5 Low) plus 7 documented non-findings.
+
+Task 8 also carried an authorised addendum: **DECDWL/DECDHL was measured**,
+because two by-reading verdicts had already been overturned by measurement and
+a third was about to ship unmeasured. It **confirmed** the prediction (body
+PAE=45232 against a 257 gate; GL lays down exactly 2.01x the ink) — the first
+by-reading prediction in the plan that measurement upheld — and turned up an
+unpredicted sub-case: the DECDHL *bottom* half is not drawn at all.
 
 Task 7 produced findings the parity harness was structurally blind to: **dirty
 tracking consults only the active pane** (other panes of a split never repaint
@@ -86,16 +100,22 @@ is an instrumented dump of `dirty_pixel_rects` at the frame that produced it.
 
 ## 3. Do this next
 
-1. Land Task 8: review it, fix-loop it, close it. Then the plan is finished and
-   the user gets `docs/purecpu-review/README.md` — **the only artefact they have
-   actually asked for. They have seen no review output yet beyond my summaries.**
-2. Task 8's own gate checks are the last line of defence. The plan's printed
-   `grep -n "needs-measurement"` check is **wrong as written** (that string is
-   also a legitimate Method-column value, so it hits every measured row); the
-   real invariant is "every row has a Verdict token and every non-`known gap`
-   verdict cites evidence". Verify the implementer tested *that*.
-3. After Task 8 closes, the whole branch still deserves one review pass, and the
-   ledger's deferred-minor list is its input.
+**Nothing is in flight. Do not start work here without asking the user first** —
+the plan is done and what follows is all their call.
+
+1. **The user has still read none of it.** Point them at
+   `docs/purecpu-review/README.md` and let them drive. Lead with the two things
+   they'd act on: findings C1 (a ~1.5 KB sixel sequence allocates 4 GiB, on a
+   fork-introduced arm) and I1/I2 (split panes stop repainting).
+2. **Nothing has been fixed — by design.** The plan produced documents only.
+   What gets fixed, and in what order, has never been put to the user. If they
+   ask, the cheap high-value ones are C1 (a bounds check on one arm) and the 1:1
+   blit (nearest-neighbour scaling in one loop would address inline images,
+   double-width/height lines and scaled bitmap emoji together). **Fixing means a
+   new plan — the constraints in §5 assume a read-only source tree.**
+3. A whole-branch review pass — the fork's patch as a whole, beyond the
+   PureCpu/font/X11 scope Task 7 covered — remains undone. The ledger's ~12
+   deferred minors are its natural input.
 
 ## 4. Lessons & traps  ← the irreplaceable part
 
@@ -196,7 +216,7 @@ is an instrumented dump of `dirty_pixel_rects` at the frame that produced it.
 
 ## 6. Where the detail lives
 
-- Change history: `git log 17f8677..HEAD`
+- Change history: `git log c057c04..HEAD`
 - Spec: `docs/superpowers/specs/2026-08-10-purecpu-parity-review-design.md`
 - Plan: `docs/superpowers/plans/2026-08-10-purecpu-parity-review.md` — the
   Global Constraints block at the top carries every generalised lesson
