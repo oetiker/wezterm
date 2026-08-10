@@ -16,10 +16,11 @@ Two detail documents sit behind this page, and every claim here is traceable to
 a row or a finding in one of them:
 
 - **[parity-matrix.md](parity-matrix.md)** — 21 feature rows, each with a
-  verdict. The 16 that were investigated carry the command and the numbers
-  behind them; the 5 out-of-scope rows carry a reason instead.
+  verdict. **14 carry the command and the numbers behind them; 2 carry a code
+  citation and no measurement; 5 are out of scope and carry a reason instead.**
 - **[findings.md](findings.md)** — 18 defects found by reading the fork's own
-  patch, ranked, with evidence class stated per finding.
+  patch, the most severe of them then confirmed by runtime probes against the
+  built binary, ranked, with evidence class stated per finding.
 - [noise-floor.md](noise-floor.md) — the calibration that makes the pixel
   comparisons trustworthy. Worth reading only if you want to check the method.
 
@@ -34,16 +35,25 @@ tested and is false (the GPU path has only one texture too; see
 `parity-matrix.md`, "Settled by reading: the single-texture question").
 
 So the gaps are not missing features. They are places where the hand-written
-rasteriser cannot reproduce what the GPU's fixed function does for free. Nearly
-every confirmed rendering defect traces back to **three** root causes:
+rasteriser cannot reproduce what the GPU's fixed function does for free — plus
+one place where it never gets asked to draw at all. **Four root causes account
+for every confirmed defect in this review:**
 
 | # | Root cause | Where | What it costs you |
 |---|---|---|---|
 | 1 | **The blit is 1:1 and crops; there is no resampler at all** | `purecpu.rs:346` | Anything whose quad is drawn at a size different from its atlas sprite: non-native-size inline images, double-width/height lines, scaled fallback and bitmap glyphs |
-| 2 | **The idle skip returns before the paint pass when no line is dirty** | `termwindow/mod.rs:1436-1447` | Everything time-driven: GIF frames, blinking text, the visual bell, cursor blink |
-| 3 | **Cursor-blink detection tests the raw, unresolved cursor shape** | `termwindow/mod.rs:1383` vs `render/mod.rs:604-611` | `default_cursor_style = "Blinking*"` — the documented way to turn blinking on — is inert |
+| 2 | **The idle skip returns before the paint pass when no line is dirty** | `termwindow/mod.rs:1436-1447` | Everything time-driven: GIF frames, blinking text, the visual bell, and cursor blink's *app-driven* path (quantised to ~2 paints/cycle) |
+| 3 | **Cursor-blink detection tests the raw, unresolved cursor shape** | `termwindow/mod.rs:1383` vs `render/mod.rs:604-611` | `default_cursor_style = "Blinking*"` — the documented way to turn blinking on — is inert. This is the *config-driven* blink path; root cause 2 governs the app-driven one |
+| 4 | **Dirty tracking is scoped to the active pane, and dirty-rect geometry omits the pane's origin** | `findings.md` I1, I2 | **Panes in a split stop repainting.** Output in any non-active pane never appears; and even the active pane freezes when it is not at the window's top-left |
 
-The single most severe finding is separate from all three, and it is not a
+**Root cause 4 is not in the parity matrix, and if you use splits it is
+probably the one that will bite you first.** No matrix row could have caught it:
+every harness case ran a single full-width pane, where both offsets are zero and
+the active pane is the only one with output. It was found by reading the fork's
+patch and then confirmed with purpose-built probes. Root causes 1-3 are what the
+pixel comparisons measure; 4 is why the pixel comparisons were not the whole job.
+
+The single most severe finding is separate from all four, and it is not a
 rendering issue at all. See below.
 
 **A related question the matrix settles in passing: `Software` is not a third
@@ -58,7 +68,7 @@ per-frame animation repaints — which is precisely the list above.
 
 ---
 
-## Start here: the one finding that is not cosmetic
+## Start here: the most severe finding
 
 **C1 — the atlas has no size ceiling. A ~1.5 KB sixel escape sequence makes
 PureCpu allocate 4 GiB.** ([findings.md](findings.md), C1)
@@ -85,6 +95,14 @@ is no upstream software arm the missing ceiling could have come from.
 Fix direction: give the `PureCpu` arm a ceiling and a `bail!`, so it reaches the
 same `AllowImage::Scale` fallback the `Glium` arm already reaches.
 
+**And read I1/I2 next, before the matrix.** C1 is the most severe finding, but
+it needs a hostile or freak escape sequence to fire. The split-pane repaint bugs
+(root cause 4 above; `findings.md` I1 and I2) fire during ordinary everyday use
+of a feature you probably use, and they are `Important` for the same reason C1
+is `Critical` — content is silently not drawn. They are written up under "the
+rest of findings.md" below only because that section follows findings.md's own
+severity ladder, not because they are minor.
+
 ---
 
 ## Headline parity result
@@ -97,14 +115,17 @@ feature.
 | Verdict | Count | |
 |---|---|---|
 | `parity` | 6 | all measured; 4 bit-identical on the element measured, 2 within 1 LSB |
-| `degraded` | 7 | 4 measured, 3 concluded by reading |
+| `degraded` | 7 | 5 measured, 2 concluded by reading |
 | `missing` | 3 | all measured |
 | `known gap` | 5 | out of scope, not measured |
 
-**What works.** Ordinary terminal text — the thing you actually look at all day
-— is sound. Monochrome text is within one 8-bit step everywhere, with *zero*
-difference on background pixels (body `PAE = 257`, body `AE = 0` from 0.5% fuzz
-up). Static cursors in all three shapes (block, bar, underline), window buttons,
+**What works — in a single pane.** Ordinary terminal text is *rendered* soundly:
+monochrome text is within one 8-bit step everywhere, with *zero* difference on
+background pixels (body `PAE = 257`, body `AE = 0` from 0.5% fuzz up). Read that
+as a statement about the rasteriser, not about daily use: **every row in this
+table was measured on a single full-width pane, and in a split the same text can
+simply stop updating** (root cause 4 / I1 / I2). Correct pixels and delivered
+pixels are different claims, and the matrix only certifies the first. Static cursors in all three shapes (block, bar, underline), window buttons,
 rounded corners and split dividers are **bit-identical** on a crop tight to the
 element (`AE = 0`, `PAE = 0`) — no threshold question to answer, nothing differs.
 Inline images at their **native** size are bit-identical too. The retro tab bar
@@ -142,11 +163,30 @@ Evidence cell rather than letting it read as equivalent to the others.
   larger (~77/255) non-integer positioning divergence that shifting does not fix.
   The retro tab bar reproduces neither, which is what pins it to the `box_model`
   glyph-quad path rather than to text rendering generally.
-- **Double-width/height lines, scaled fallback and bitmap glyphs (including
-  colour emoji), and subpixel-antialiased text** (`freetype_render_target =
-  "HorizontalLcd"` — the rasteriser has one scalar alpha and no per-channel
-  mask). These three are **by reading, not measured** — see the confidence note
-  below.
+- **Double-width and double-height lines (DECDWL/DECDHL)** — measured in a
+  Task 8 addendum, and the result is stark. OpenGL stretches each glyph to the
+  doubled cell; PureCpu draws it at **base size, spaced at the doubled pitch**,
+  so the line reads as small letters with gaps. Body `PAE = 45232` (176 LSB,
+  failing the gate by two orders of magnitude) against **`PAE = 257` for
+  ordinary single-width lines in the very same capture**. Worse, the DECDHL
+  **bottom half is not drawn at all** — the top line's quad is supposed to cover
+  both rows, and the 1:1 blit clips it away (ink ratio 16.9, zero PureCpu ink on
+  every scan row of the band). `degraded` rather than `missing` because the text
+  is still delivered and legible; the bottom-half row alone is a `missing`
+  sub-case.
+- **Scaled fallback and bitmap glyphs** (including colour emoji) — same
+  `purecpu.rs:346-347` mechanism, now demonstrated by the row above, but
+  deliberately not measured: it needs an installed font that actually yields
+  `glyph.scale != 1`, and a capture that used no such font would return a null
+  result indistinguishable from parity.
+- **Subpixel-antialiased text** (`freetype_render_target = "HorizontalLcd"`) —
+  the mildest entry here, and the README previously made it sound like the
+  worst. **PureCpu falls back to ordinary grayscale antialiasing**: the LCD path
+  already stores a max-of-channels alpha alongside the per-channel coverage
+  (`skrifa_rasterizer.rs:687,701`), which PureCpu's glyph branch uses
+  (`purecpu.rs:412-419`). The glyph is entirely present, correctly positioned
+  and legible. What you lose is the subpixel horizontal resolution and the
+  colour fringing — not the text.
 
 **What is missing.**
 
@@ -174,32 +214,41 @@ Evidence cell rather than letting it read as equivalent to the others.
 The review distinguishes these deliberately, and this page does not flatten them:
 
 - **Measured** — a command was run against the built binary and the numbers are
-  in the Evidence cell. **13 of 21 rows**, including every `parity` and every
-  `missing`. Five of them state "reproduced from a clean shell" in the matrix
-  (the four cursor/animation rows plus text glyphs); several others were
-  re-run independently by a second reviewer during the review rounds.
+  in the Evidence cell. **14 of 21 rows**, including every `parity`, every
+  `missing`, and (as of the Task 8 addendum) double-width/height lines. Five
+  state "reproduced from a clean shell" in the matrix — the four
+  cursor/animation rows plus text glyphs — and the DECDWL addendum was run twice
+  from clean shells with identical numbers; several others were re-run
+  independently by a second reviewer during the review rounds.
 - **By reading** — the code path is unambiguous but no runtime trigger was
-  demonstrated. 3 rows. Two of them — double-width/height lines and scaled
-  fallback/bitmap glyphs — are consequences of root cause 1, whose mechanism
-  *was* measured on images. The third, subpixel-antialiased text, is a
-  **separate mechanism** that was never measured at all: dual-source blending
-  with a per-channel `colorMask` on the GPU side versus a single scalar alpha in
-  `blend_over` on PureCpu's. Note also that Task 1 predicted `degraded` for
-  images by reading, and measurement then showed images are bit-identical at
-  native size. **Reading correctly identified the mechanism and got the
-  conditions wrong.** Treat all three as well-founded predictions, not results —
-  and the subpixel row as the weakest of them, since not even its mechanism has
-  been exercised.
+  demonstrated. **2 rows**, and they are not equally exposed:
+  - *Subpixel-antialiased text* has **no runtime precondition left to fail**.
+    The chain is traceable end to end (`HorizontalLcd` → `use_lcd_subpixel` →
+    `subpixel_mask_to_rgba` → `has_color = false` → PureCpu's glyph branch). If
+    you set the option, the divergence follows. This is the better-founded of
+    the two, and its consequence is mild — grayscale AA, see above.
+  - *Scaled fallback / bitmap glyphs* shares its mechanism with the DECDWL row,
+    which is now measured, but its precondition — that some installed font
+    yields `glyph.scale != 1` — is untested and font-dependent. It was left
+    unmeasured on purpose, because a null result would be indistinguishable
+    from parity.
 - In `findings.md`, the same distinction is enforced by a written demotion rule:
   a defect whose trigger was not reproduced is recorded one class below its
   defect class. That is why M3/M4/M5 sit at Medium.
 
-Two verdicts changed during the review as a direct result of measuring, which is
-the best evidence that the instrument was not merely confirming its own
-predictions: inline images went from a predicted `degraded` to measured `parity`
-at native size (and then to `degraded` again on a corpus that could actually
-trigger the defect), and cursor blink went from a by-reading `degraded` to a
-measured `missing`.
+**Measurement has overturned a by-reading verdict twice in this review, and
+confirmed one — and the pattern in the failures is worth knowing.** Inline
+images went from a predicted `degraded` to measured `parity` at native size (and
+back to `degraded` only on a corpus that could actually trigger the defect), and
+cursor blink went from a by-reading `degraded` to a measured `missing`. In
+neither case was the *mechanism* wrong; both times the **precondition** was —
+images needed a non-native requested size, blink needed the shape to be resolved.
+That is why the last untested precondition in the document was worth spending a
+measurement on: nobody had shown `printf '\033#6'` actually reaches the
+double-width path in this fork. It does, and the reading was right. Two
+overturns and one confirmation is the honest record; it is also the best
+evidence available that the instrument was not merely confirming its own
+predictions.
 
 ---
 
@@ -209,9 +258,11 @@ measured `missing`.
 severity order inside Medium. The order below is the severity ladder the
 document itself defines, applied consistently.
 
-**Important — content silently not drawn in an ordinary configuration. Neither
-of these was reachable by the parity matrix at all**, for a reason worth
-internalising: every case in the harness put the content under test in a
+**Important — content silently not drawn in an ordinary configuration. This is
+root cause 4 from the summary table, and if you use splits it is the part of
+this review to act on first. Neither finding was reachable by the parity matrix
+at all**, for a reason worth internalising: every case in the harness put the
+content under test in a
 **single full-width pane**, where `pos.top` and `pos.left` are both zero and the
 active pane is the only one with live output. The corpus was blind along an axis
 nobody thought to vary — not along an axis the tool could not see:
@@ -280,16 +331,19 @@ any way.
 machine — the arithmetic does not need a demonstration that could take out other
 people's work), and crafted malformed fonts for M3/M4/M5.
 
-**Declared unmeasured inside rows that were otherwise measured** (all four now
-recorded in the matrix itself, under "Grading basis for animation rows"):
-`VisualBellTarget::CursorColor` — the bell row samples an empty-background
-pixel, so only the default `BackgroundColor` target was exercised; rapid blink
-(SGR 6 / `text_blink_rate_rapid`), as distinct from the SGR 5 path the blinking
--text row measures; any interaction between the three animations running at
-once; and the DECSCUSR cursor-blink sub-finding, whose numbers come from a
-hand-written config because `gen-config.sh` correctly refuses the combination
-that probe requires (its regeneration block is fenced in the matrix and does
-run). Each row's verdict covers what its Evidence cell actually sampled.
+**Declared unmeasured inside rows that were otherwise measured** — **three**
+things, all recorded in the matrix under "Grading basis for animation rows":
+`VisualBellTarget::CursorColor` (the bell row samples an empty-background pixel,
+so only the default `BackgroundColor` target was exercised); rapid blink (SGR 6
+/ `text_blink_rate_rapid`), as distinct from the SGR 5 path the blinking-text
+row measures; and any interaction between the three animations running at once.
+Each row's verdict covers what its Evidence cell actually sampled.
+
+A fourth item belongs beside these but is a different thing and should not be
+counted with them: the DECSCUSR cursor-blink sub-finding **was** measured (30
+samples at 0.1 s), just with a hand-written config, because `gen-config.sh`
+correctly refuses the blink-rate/cursor-style combination that probe requires.
+Its regeneration block is fenced in the matrix and does run.
 
 **Method limits.** Three worth knowing:
 
@@ -368,7 +422,12 @@ the animation rows need (`CURSOR_BLINK_RATE`, `DEFAULT_CURSOR_STYLE`,
 non-blinking cursor, and `compare-case.sh`/`sample-case.sh` both call
 `check_no_config_error`, which fails loudly if wezterm rejected the config —
 a rejected config falls back to defaults, which means *both* windows use the
-same backend and report a triumphant `AE = 0`.
+same backend and report a triumphant `AE = 0`. **One limit worth knowing before
+you trust an `AE = 0`:** the guard greps `launch`'s log
+(`lib.sh:87-90`, `grep -q "Configuration Error" "$log" 2>/dev/null`), so if that
+log were missing or unreadable it would pass silently rather than fail closed.
+Every capture cited in these documents was produced with logs present and
+checked, but a future run that loses the log loses the guard with it.
 
 **Copy regeneration commands verbatim out of the rendered document, including
 any leading env vars.** Several of them carry a `PARITY_SETTLE_WARMUP=20` that
