@@ -285,6 +285,18 @@ every 0.4s aliases onto exactly three fixed phase offsets every cycle, so
 repeated runs keep landing on the same three levels rather than sweeping
 through a continuum.
 
+**Declared unmeasured within these rows** (Task 6's implementer disclosed
+these; Task 6's reviewer judged all three legitimate scope boundaries that
+undermine no verdict; recorded here in Task 8 so the disclosure lives in the
+published document and not only in the task reports). Three things inside the
+scope of these rows were **not** exercised: `VisualBellTarget::CursorColor`
+(the visual-bell row samples an empty-background pixel, which exercises the
+default `BackgroundColor` target only); rapid blink (SGR 6 /
+`text_blink_rate_rapid`, as distinct from the SGR 5 / `text_blink_rate` path
+the blinking-text row measures); and any interaction between the three
+animations when more than one is active at once. Each row's verdict covers
+what its Evidence cell actually sampled, and no more.
+
 **Grading basis: a row is graded against its own named feature, not the
 generic mechanism behind it** (fix round 2, addition per controller ruling,
 now also a plan Global Constraint). Animated GIF and Cursor blink are both
