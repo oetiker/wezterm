@@ -40,9 +40,9 @@ Wayland, no upstreamability. Background image and transparency are out of scope.
 
 ## 2. Where we are now
 
-As of handoff commit 17f8677 (re-derive merge/push state — see §8):
+As of handoff commit c057c04 (re-derive merge/push state — see §8):
 
-**Tasks 1–7 of 8 are complete.** Each was implemented by a subagent, reviewed
+**All eight tasks are complete.** Each was implemented by a subagent, reviewed
 by a second, and fix-looped to a clean re-review. The ledger is authoritative.
 
 - **Tasks 1–3** — static audit, harness, noise-floor gate: PROCEED for the
