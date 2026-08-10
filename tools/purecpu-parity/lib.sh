@@ -1,5 +1,15 @@
 #!/usr/bin/env bash
 # Shared helpers for the PureCpu parity harness.
+#
+# Cleanup contract: `launch` records every class it starts and registers a
+# single EXIT trap (on the shell that sourced this file) which kills all of
+# them via kill_class. This fires on normal exit, `set -e` aborts, and
+# signals alike, so a driver script that dies between `launch` and an
+# explicit `kill_class` (e.g. capture_settled returning 1) will not leak
+# `wezterm-gui ... sleep 600` processes/windows on the display. Driver
+# authors do not need their own cleanup for classes started via `launch`;
+# calling `kill_class` explicitly after a successful run is still fine and
+# just makes cleanup happen immediately instead of at shell exit.
 set -euo pipefail
 
 PARITY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,8 +28,23 @@ mkdir -p "$PARITY_OUT"
 # instead, which blocks until timeout fires.
 pause() { timeout "$1" tail -f /dev/null || true; }
 
+declare -ag _PARITY_LAUNCHED_CLASSES=()
+_PARITY_TRAP_SET=0
+
+_parity_cleanup() {
+  local class
+  for class in "${_PARITY_LAUNCHED_CLASSES[@]:-}"; do
+    [ -n "$class" ] && kill_class "$class"
+  done
+}
+
 launch() {  # launch <class> <config> <shell-command>
   local class="$1" config="$2" cmd="$3"
+  if [ "$_PARITY_TRAP_SET" -eq 0 ]; then
+    trap _parity_cleanup EXIT
+    _PARITY_TRAP_SET=1
+  fi
+  _PARITY_LAUNCHED_CLASSES+=("$class")
   WEZTERM_CONFIG_FILE="$config" WEZTERM_LOG=info setsid nohup "$WEZTERM_BIN" start \
     --always-new-process --class "$class" \
     -- bash -c "$cmd" >"$PARITY_OUT/$class.log" 2>&1 </dev/null &
