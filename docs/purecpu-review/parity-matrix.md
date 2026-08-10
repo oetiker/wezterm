@@ -28,7 +28,7 @@ a silently wrong number, only a loud one. Not repeated per command/row.
 | Rounded corners | `poly_quad` rasterises the corner poly into the atlas at exactly the requested corner size and marks it `IS_GRAY_SCALE` (`render/mod.rs:290-328`, `box_model.rs:1038-1092`) | `has_color==4.0` branch: `fg` tinted by atlas alpha; source and destination sizes are equal by construction, so the 1:1 blit is exact (`purecpu.rs:406-411`) | needs-measurement | parity | Exercised in every fancy-tab-bar capture above (every fancy tab, active and inactive, has `border_corners` set — `fancy_tab_bar.rs:183-195,229-241`); only the active tab's two corners were actually measured, since inactive tabs share the bar background and their corners are not visually separable from it. Top-left and top-right corners of the active tab, `out/chrome-gl.png` vs `out/chrome-cpu.png`, crops `10x10+0+0` and `10x10+79+0` (re-located after the hermetic-corpus fix changed tab-title text from "bash" to "sleep", which widened the active tab and moved its right edge): AE=0, PAE=0 — bit-identical, unaffected by the adjacent title-text shift. |
 | Split dividers | `filled_rectangle` → `IS_SOLID_COLOR` quad, texture ignored by the shader (`render/split.rs:32,55`, `render/mod.rs:266-287`, `glyph-frag.glsl:115-118`) | `IS_SOLID_COLOR` fill path, colour-only, size-independent (`purecpu.rs:300-341`) | needs-measurement | parity | `SPAWN_TABS=true`'s `gui-startup` handler (`tools/purecpu-parity/gen-config.sh`) splits the first tab right at 50%; that handler unconditionally activates the last-spawned tab (tab 3) once done, which put the split off-screen for every capture until fixed by adding an explicit `tab:activate()` at the end of the handler to reselect the split tab (see `gen-config.sh` diff — this is what "gui-startup does not exercise what the row claims" means in practice: the event fired, but the config it produced could not show a divider in any capture without this fix). With the fix (and the later hermetic-corpus fix, review round 1 I4, which does not move the divider — it is independent of tab-title text), `out/chrome-gl.png` vs `out/chrome-cpu.png` show the vertical divider at x=495; column crop `1x661+495+32` (full body height): AE=0, PAE=0 — bit-identical. |
 | Cursor (static) | Block/bar/underline drawn as a poly or solid quad at exact pixel size | Same quads; 1:1 blit is exact | needs-measurement | parity | Animation cannot be diffed frame-for-frame across backends (phases are not synchronised — see "Grading basis for animation rows" below); this row is the one exception, since with `cursor_blink_rate=0` (the harness default) the cursor is genuinely static in both backends and the standard cross-backend capture applies. `cd tools/purecpu-parity && FUZZ=1 ./compare-case.sh cursor "$PWD/corpus/cursor.sh"` — `out/cursor-gl.png` vs `out/cursor-cpu.png`. Whole-frame AE=1095 (fuzz 0) / 132 (fuzz 1%); body PAE=257, exactly the Task 3 gate boundary (both captures warn `Gray` colorspace, expected and correct here per the Fancy-tab-bar row's precedent — this corpus is deliberately monochrome text). The whole-frame noise is ordinary glyph antialiasing elsewhere in the frame, not the cursor: isolated to the cursor cell alone (crop `24x24+375+70`, located by inspecting `out/cursor-gl.png`/`out/cursor-cpu.png` directly), `compare -metric AE -fuzz 1% <(convert out/cursor-gl.png -crop 24x24+375+70 +repage png:-) <(convert out/cursor-cpu.png -crop 24x24+375+70 +repage png:-) null:` and the PAE equivalent both give **AE=0, PAE=0 — bit-identical**. Reproduced from a clean shell. **Bar and underline shapes (fix round 1):** the GPU-behaviour claim above names all three cursor shapes, but the run above only exercises the default `SteadyBlock`; also measured `DEFAULT_CURSOR_STYLE=SteadyBar FUZZ=1 ./compare-case.sh cursor-steadybar "$PWD/corpus/cursor.sh"` and the same with `SteadyUnderline` — both AE=1095/132/PAE=257 whole-frame (ink stddev 2951.04/2951.66 for bar, 2940.8/2941.41 for underline — different from `SteadyBlock`'s 3080, confirming the shape genuinely changed and the instrument is not blind to it), and both give cursor-cell crop `24x24+375+70` **AE=0, PAE=0**, same as block. `parity` holds for all three shapes. |
-| Cursor blink | `ColorEase::intensity_continuous()` is evaluated on the CPU every animation frame and delivered as `fg_color_mix` / `cursor_border_mix`, giving a continuous eased fade (`render/mod.rs:680-696`) | Config-driven blink (`default_cursor_style` set to a `Blinking*` variant, the documented way to enable it) never starts: `do_paint_purecpu`'s blink-detection tests the raw, unresolved cursor shape, which never satisfies `is_blinking()` for this path. An app that drives the shape itself via DECSCUSR does blink, but quantised to ~2 paints/cycle with a shallow floor, not the continuous eased fade (see Evidence) | needs-measurement | missing | Sampled within-backend, not diffed cross-backend (phases are not synchronised — see "Grading basis for animation rows" below): does the cursor's colour actually change over time within each backend? `cd tools/purecpu-parity && CURSOR_BLINK_RATE=600 DEFAULT_CURSOR_STYLE=BlinkingBlock ANIMATION_FPS=30 ./sample-case.sh cursorblink "$PWD/corpus/cursor.sh" "4x4+382+78" 16 0.4` samples one pixel inside the cursor cell 16 times over 6.4s. `gl`: `gray(132) gray(220) gray(73) gray(182) gray(206) gray(17) gray(209) gray(178) gray(74) gray(221) gray(131) gray(138) gray(222) gray(74) gray(179) gray(207)` — continuously varying across nearly the full 17-222 range, the expected eased sweep (a re-run gives different digits sampling the same unsynchronised sweep — see "Grading basis for animation rows" below; the invariant is range and variance, not the digits). `cpu`: `gray(224) gray(224) gray(224) gray(224) gray(224) gray(224) gray(224) gray(224) gray(224) gray(224) gray(224) gray(224) gray(224) gray(224) gray(224) gray(224)` — **flat for the entire 6.4s window: the cursor never blinks at all**, not merely quantised. Reproduced from a clean shell (numbers above are the reproduction run). **Root cause, and why this is `missing` rather than the `degraded`/quantised-easing reading this row previously carried on a by-reading basis:** `do_paint_purecpu`'s blink check at `termwindow/mod.rs:1383` tests `cursor.shape.is_blinking()` on the *raw* pane cursor shape (`pane.get_cursor_position()`), which is `CursorShape::Default` unless the running program issues a DECSCUSR escape — `CursorShape::Default.is_blinking()` is `false` (`wezterm-surface/src/lib.rs:79-85`), so `cursor_blinking` is always false and the entire blink-transition block (`mod.rs:1380-1412`) never fires. The GPU path does not have this gap: it resolves the shape through `params.config.default_cursor_style.effective_shape(cursor.shape)` first (`render/mod.rs:604-611`, `config/src/config.rs:1921-1933`), which is exactly what turns `Default` into `BlinkingBlock` per this row's (and the harness's) `DEFAULT_CURSOR_STYLE` config knob — the *documented*, ordinary way to enable cursor blink. So on PureCpu, config-only blink is not degraded, it is absent. **The verdict is scoped to that config-only path, which is the common case; it does not mean the app-driven path is fine (fix round 1, I1).** Isolated with a follow-up probe that bypasses the config knob and sends DECSCUSR (`\033[1 q`) directly, so the raw `cursor.shape` itself is `BlinkingBlock`: sampled 12x over 4.8s at the same relative cell position (`gray(176) gray(159) gray(159) gray(224) gray(159) gray(159) gray(224) gray(159) gray(176) gray(224) gray(159) gray(175) gray(159) gray(159)`) — this *does* vary, confirming the gap is specifically the missing `default_cursor_style` resolution, not a blanket inability to blink. But the app-driven path is itself `degraded`, not parity: a finer probe (30 samples, 0.1s, PureCpu vs OpenGL, same DECSCUSR corpus and config apart from `front_end`) gives `cpu: gray(175) gray(224) gray(224) gray(159) gray(159) gray(159) gray(159) gray(159) gray(175) gray(175) gray(224) gray(224) gray(159) gray(159) gray(159) gray(159) gray(175) gray(175) gray(224) gray(224) gray(224) gray(159) gray(159) gray(159) gray(159) gray(169) gray(169) gray(224) gray(224) gray(159)` — dwelling on two plateaux (159 and 224) with brief transients, floor **gray(159)** — against `gl: gray(198) gray(222) gray(220) gray(190) gray(146) gray(75) gray(25) gray(110) gray(163) gray(207) gray(224) gray(215) gray(181) gray(125) gray(54) gray(58) gray(133) gray(188) gray(218) gray(222) gray(201) gray(145) gray(76) gray(24) gray(101) gray(159) gray(203) gray(224) gray(213) gray(179)` — a continuous sweep with far more distinct levels, down to **gray(24)**, i.e. near-background. So the app-driven cursor blinks, but is both quantised (`mod.rs:1387-1394`, `1440-1447` — the source's own comment at `mod.rs:1381-1386` states this is deliberate, "~2 paints/cycle instead of animation_fps paints/cycle") and never approaches invisible — that sub-finding from this row's prior by-reading verdict is superseded in scope by `missing` (config-driven blink), not deleted. The rasteriser's own `mix_value` handling (`purecpu.rs:252-255`) is not implicated either way. |
+| Cursor blink | `ColorEase::intensity_continuous()` is evaluated on the CPU every animation frame and delivered as `fg_color_mix` / `cursor_border_mix`, giving a continuous eased fade (`render/mod.rs:680-696`) | Config-driven blink (`default_cursor_style` set to a `Blinking*` variant, the documented way to enable it) never starts: `do_paint_purecpu`'s blink-detection tests the raw, unresolved cursor shape, which never satisfies `is_blinking()` for this path. An app that drives the shape itself via DECSCUSR does blink, but quantised to ~2 paints/cycle with a shallow floor, not the continuous eased fade (see Evidence) | needs-measurement | missing | Sampled within-backend, not diffed cross-backend (phases are not synchronised — see "Grading basis for animation rows" below): does the cursor's colour actually change over time within each backend? `cd tools/purecpu-parity && CURSOR_BLINK_RATE=600 DEFAULT_CURSOR_STYLE=BlinkingBlock ANIMATION_FPS=30 ./sample-case.sh cursorblink "$PWD/corpus/cursor.sh" "4x4+382+78" 16 0.4` samples one pixel inside the cursor cell 16 times over 6.4s. `gl`: `gray(132) gray(220) gray(73) gray(182) gray(206) gray(17) gray(209) gray(178) gray(74) gray(221) gray(131) gray(138) gray(222) gray(74) gray(179) gray(207)` — continuously varying across nearly the full 17-222 range, the expected eased sweep (a re-run gives different digits sampling the same unsynchronised sweep — see "Grading basis for animation rows" below; the invariant is range and variance, not the digits). `cpu`: `gray(224) gray(224) gray(224) gray(224) gray(224) gray(224) gray(224) gray(224) gray(224) gray(224) gray(224) gray(224) gray(224) gray(224) gray(224) gray(224)` — **flat for the entire 6.4s window: the cursor never blinks at all**, not merely quantised. Reproduced from a clean shell (numbers above are the reproduction run). **Root cause, and why this is `missing` rather than the `degraded`/quantised-easing reading this row previously carried on a by-reading basis:** `do_paint_purecpu`'s blink check at `termwindow/mod.rs:1383` tests `cursor.shape.is_blinking()` on the *raw* pane cursor shape (`pane.get_cursor_position()`), which is `CursorShape::Default` unless the running program issues a DECSCUSR escape — `CursorShape::Default.is_blinking()` is `false` (`wezterm-surface/src/lib.rs:79-85`), so `cursor_blinking` is always false and the entire blink-transition block (`mod.rs:1380-1412`) never fires. The GPU path does not have this gap: it resolves the shape through `params.config.default_cursor_style.effective_shape(cursor.shape)` first (`render/mod.rs:604-611`, `config/src/config.rs:1921-1933`), which is exactly what turns `Default` into `BlinkingBlock` per this row's (and the harness's) `DEFAULT_CURSOR_STYLE` config knob — the *documented*, ordinary way to enable cursor blink. So on PureCpu, config-only blink is not degraded, it is absent. **The verdict is scoped to that config-only path, which is the common case; it does not mean the app-driven path is fine (fix round 1, I1).** Isolated with a follow-up probe that bypasses the config knob and sends DECSCUSR (`\033[1 q`) directly, so the raw `cursor.shape` itself is `BlinkingBlock`: sampled 12x over 4.8s at the same relative cell position (`gray(176) gray(159) gray(159) gray(224) gray(159) gray(159) gray(224) gray(159) gray(176) gray(224) gray(159) gray(175) gray(159) gray(159)`) — this *does* vary, confirming the gap is specifically the missing `default_cursor_style` resolution, not a blanket inability to blink. But the app-driven path is itself `degraded`, not parity: a finer probe (30 samples, 0.1s, PureCpu vs OpenGL, same DECSCUSR corpus and config apart from `front_end`) gives `cpu: gray(175) gray(224) gray(224) gray(159) gray(159) gray(159) gray(159) gray(159) gray(175) gray(175) gray(224) gray(224) gray(159) gray(159) gray(159) gray(159) gray(175) gray(175) gray(224) gray(224) gray(224) gray(159) gray(159) gray(159) gray(159) gray(169) gray(169) gray(224) gray(224) gray(159)` — dwelling on two plateaux (159 and 224) with brief transients, floor **gray(159)** — against `gl: gray(198) gray(222) gray(220) gray(190) gray(146) gray(75) gray(25) gray(110) gray(163) gray(207) gray(224) gray(215) gray(181) gray(125) gray(54) gray(58) gray(133) gray(188) gray(218) gray(222) gray(201) gray(145) gray(76) gray(24) gray(101) gray(159) gray(203) gray(224) gray(213) gray(179)` — a continuous sweep with far more distinct levels, sweeping continuously to within a few LSB of background (gray(24) in this run; the digit varies per run — an independent re-run in fix round 2 review gave gray(21) — the near-background reach does not, unlike the CPU side's gray(159) floor, which is a fixed paint-transition value that reproduces run to run). So the app-driven cursor blinks, but is both quantised (`mod.rs:1387-1394`, `1440-1447` — the source's own comment at `mod.rs:1381-1386` states this is deliberate, "~2 paints/cycle instead of animation_fps paints/cycle") and never approaches invisible — that sub-finding from this row's prior by-reading verdict is superseded in scope by `missing` (config-driven blink), not deleted. The rasteriser's own `mix_value` handling (`purecpu.rs:252-255`) is not implicated either way. |
 | Blinking text attribute | `blink_state` / `rapid_blink_state` intensity is applied CPU-side to the cell foreground each paint, and `update_next_frame_time` schedules the next frame (`render/screen_line.rs:797-825`) | Nothing marks cells carrying the blink attribute as dirty, so once the window settles the word is frozen forever at whichever intensity the eased fade happened to be at on that one paint — deterministically the fully-invisible end, not by chance (see Evidence) | needs-measurement | missing | `cd tools/purecpu-parity && TEXT_BLINK_RATE=400 ANIMATION_FPS=30 ./sample-case.sh blinktext "$PWD/corpus/cursor.sh" "1x1+122+60" 16 0.4` samples one pixel inside the "B" of the corpus's `BLINKING` word (crop located by inspecting a capture directly: `blink attr: ` is 12 columns, `1x1+122+60` sits on the letter stroke) 16 times over 6.4s. `gl`: `gray(117) gray(167) gray(60) gray(186) gray(25) gray(191) gray(50) gray(180) gray(86) gray(166) gray(135) gray(130) gray(167) gray(95) gray(175) gray(72)` — continuously varying, cycling between near-full foreground (`192` is the resting fg colour) and near-invisible (a re-run gives different digits sampling the same unsynchronised sweep — see "Grading basis for animation rows" below; the invariant is range and variance, not the digits). `cpu`: `gray(16) gray(16) gray(16) gray(16) gray(16) gray(16) gray(16) gray(16) gray(16) gray(16) gray(16) gray(16) gray(16) gray(16) gray(16) gray(16)` — **flat background colour for the entire window: the word is not merely frozen at some intensity, it is frozen fully invisible**, confirmed visually (`out/blinktext-cpu-shot.png`: the word "BLINKING" is blank space where GL and a static capture both show it). Reproduced from a clean shell. This is `missing`: the dirty-rect pass in `do_paint_purecpu` marks only rows returned by `pane.get_changed_since(...)` (line seqno changes, `mod.rs:1279-1325`) and the moved cursor cell (`mod.rs:1331-1371`); nothing marks cells carrying the blink attribute, so after the one paint that happens when the window first settles — **deterministically, not by chance (fix round 1, M1): `ColorEase::intensity_continuous()` starts at intensity ≈ 0 on that first paint, and `render/screen_line.rs:810-821` sets `fg = bg` at intensity 0**, landing in the "off" phase of the eased intensity every time — the early exit at `mod.rs:1436-1447` suppresses every subsequent paint, forever, regardless of `text_blink_rate`. Unlike cursor blink there is no `schedule_blink_timer_if_needed`-equivalent rescheduling mechanism for text blink at all, so this is not a resolution gap, it is a structural absence. |
 | Visual bell | `get_intensity_if_bell_target_ringing` returns a continuously varying mix that is applied to the cell/cursor background each paint (`render/mod.rs:233-258`, `535-565`, target defaults to `BackgroundColor`: `config/src/bell.rs:62-69`, applied in `render/pane.rs:174-206`) | The bell's `Alert::Bell` handler invalidates the window but marks no dirty rect, so `do_paint_purecpu`'s idle-skip still takes the early-exit branch and the bell's background-mix computation never runs (see Evidence) | needs-measurement | missing | `cd tools/purecpu-parity && VISUAL_BELL=true ./sample-case.sh visualbell "$PWD/corpus/cursor.sh" "1x1+500+200" 16 0.4` samples an empty-background pixel (away from any text/cursor, so this specifically exercises the default `BackgroundColor` bell target, not the cursor-only one) 16 times over 6.4s, against a corpus that rings the bell once per second. `gl`: `gray(169) gray(16) gray(98) gray(16) gray(98) gray(169) gray(98) gray(169) gray(16) gray(169) gray(16) gray(98) gray(16) gray(98) gray(169) gray(16)` — background colour flashes on each ring and fades per the configured 300ms/300ms curve (this 1Hz-ring/0.4s-interval combination aliases to three fixed levels, so unlike the cursor-blink and blink-text rows this sequence does reproduce byte-for-byte on re-run). `cpu`: `gray(16) gray(16) gray(16) gray(16) gray(16) gray(16) gray(16) gray(16) gray(16) gray(16) gray(16) gray(16) gray(16) gray(16) gray(16) gray(16)` — **flat background for the entire window: the bell never visibly rings**, despite ringing once per second throughout the sample. Reproduced from a clean shell. `missing`: the `Alert::Bell` handler (`mod.rs:1574-1594`) calls `window.invalidate()` on each ring but pushes no `DirtyRect`, so `do_paint_purecpu`'s idle-skip (`state.dirty_pixel_rects.is_empty()`, `mod.rs:1436-1447`) still takes the early-exit branch and the bell's background-mix computation (`render/pane.rs:174-206`) never runs. |
 | Double-width / double-height lines (DECDWL/DECDHL) | Glyph destination is scaled by `width_scale` / `height_scale` while the atlas source stays at base size; the GPU rescales (`render/screen_line.rs:50-63`, `632-647`) | 1:1 blit clips to the smaller of source and destination, so the glyph is drawn at base size in the top-left of the enlarged cell (`purecpu.rs:346-347`) | by-reading | degraded | `render/screen_line.rs:636-647` vs `purecpu.rs:346-347` |
@@ -57,6 +57,79 @@ cd /scratch/oetiker/wezterm/tools/purecpu-parity
 FANCY=true SPAWN_TABS=true WINDOW_DECORATIONS="INTEGRATED_BUTTONS|RESIZE" FUZZ=1 \
     ./compare-case.sh chrome-buttons "$PWD/corpus/chrome.sh"
 ```
+
+### Cursor-blink DECSCUSR probe regeneration commands
+
+Reproduces the Cursor blink row's app-driven-path sub-finding ("`degraded`,
+not parity" — gray(159) floor vs. GL's continuous sweep toward background).
+`gen-config.sh` correctly refuses `cursor_blink_rate` set with a
+non-`Blinking*` `default_cursor_style` (its symmetric blink-rate/cursor-style
+guard), which is exactly the combination this probe needs — the cursor shape
+must come from the DECSCUSR escape sequence alone, with nothing in the config
+resolving it — so the config is hand-written here rather than generated:
+
+```bash
+cd /scratch/oetiker/wezterm/tools/purecpu-parity
+source ./lib.sh
+
+cat > /tmp/decscusr-corpus.sh <<'CORPUS'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'DECSCUSR CASE\n'
+printf '\033[1 q'
+printf 'cursor rests at the end of this line: '
+exec sleep 600
+CORPUS
+chmod +x /tmp/decscusr-corpus.sh
+
+for fe in OpenGL PureCpu; do
+cat > "$PARITY_OUT/decscusr-$fe.lua" <<LUA
+local wezterm = require 'wezterm'
+return {
+  front_end = '$fe',
+  font_size = 12.0,
+  initial_cols = 100,
+  initial_rows = 30,
+  cursor_blink_rate = 600,
+  text_blink_rate = 0,
+  animation_fps = 30,
+  default_cursor_style = 'SteadyBlock',
+  enable_tab_bar = true,
+  use_fancy_tab_bar = true,
+  audible_bell = 'Disabled',
+  window_close_confirmation = 'NeverPrompt',
+  check_for_updates = false,
+  window_padding = { left = 0, right = 0, top = 0, bottom = 0 },
+  colors = {
+    foreground = '#c0c0c0',
+    background = '#101010',
+    cursor_bg = '#e0e0e0',
+    cursor_fg = '#101010',
+    cursor_border = '#e0e0e0',
+  },
+}
+LUA
+done
+
+for side in cpu gl; do
+  fe=PureCpu; [ "$side" = "gl" ] && fe=OpenGL
+  kill_class "par-decscusr-$side"
+  launch "par-decscusr-$side" "$PARITY_OUT/decscusr-$fe.lua" "/tmp/decscusr-corpus.sh"
+  W=$(find_window "par-decscusr-$side")
+  check_no_config_error "par-decscusr-$side"
+  pause 2
+  printf '%s: ' "$side"
+  sample_region "$W" "1x1+382+58" 30 0.1
+  echo
+  kill_class "par-decscusr-$side"
+done
+```
+
+Sample crop `1x1+382+58` is the cursor cell for this two-line corpus (row 1,
+not row 2 — `DECSCUSR CASE` is the corpus's only line before the cursor line,
+one fewer than `corpus/cursor.sh`'s three). Backends are launched and
+sampled sequentially, one window at a time, matching every other command in
+this document.
 
 ## Settled by reading: the single-texture question
 
@@ -180,8 +253,40 @@ exercised is selected by the config the driver generates
 `VISUAL_BELL`), all consumed through `gen-config.sh`'s existing guard against
 the blink-rate/cursor-style pairing trap (see its own comments) — except the
 cursor-blink row's DECSCUSR follow-up probe, which deliberately writes its
-own config to bypass that guard for one diagnostic run isolating the root
-cause, and is not itself matrix evidence.
+own config to bypass that guard (the guard correctly refuses
+`cursor_blink_rate` set with a non-`Blinking*` `default_cursor_style`, which is
+exactly the combination a raw-DECSCUSR probe needs — the shape must come from
+the escape sequence alone, not from config). **It is cited as evidence, for
+one specific claim only** (fix round 2, N1): that the app-driven cursor-blink
+path is itself `degraded`, not the config-driven path's `missing` verdict,
+which does not depend on it. Its regeneration commands are fenced below (same
+pattern as the Window buttons row), since a hand-written config cannot be a
+one-line command in a table cell.
+
+**Two sequences from a continuously varying signal are never expected to
+reproduce digit-for-digit** (fix round 2, N2): the cursor-blink and
+blink-attribute-text rows' `gl` sequences are samples of an eased fade whose
+phase is not synchronised with the sampling interval, so a re-run lands on
+different points of the same sweep. The invariant a re-run must reproduce is
+the *range and variance* of the sequence (e.g. "sweeps continuously across
+17-222"), never the specific digits. The one exception is the visual-bell
+row's `gl` sequence, which *does* reproduce byte-for-byte: a 1Hz ring sampled
+every 0.4s aliases onto exactly three fixed phase offsets every cycle, so
+repeated runs keep landing on the same three levels rather than sweeping
+through a continuum.
+
+**Grading basis: a row is graded against its own named feature, not the
+generic mechanism behind it** (fix round 2, addition per controller ruling,
+now also a plan Global Constraint). Animated GIF and Cursor blink are both
+`termwindow/mod.rs:1436-1447`'s idle-skip early exit, with the same observable
+shape (PureCpu freezes, GL keeps animating) — yet one is graded `degraded` and
+the other `missing`, and that is not an inconsistency: an animated GIF is an
+image, and PureCpu draws it correctly, just as a single still frame — the
+*image* is delivered, only its motion is lost, so it is partly there
+(`degraded`). Cursor blink's entire named feature *is* the motion; when it
+doesn't run, none of what the row claims to measure happens at all
+(`missing`). A row's verdict answers "how much of *this row's feature*
+survived", not "which mechanism broke".
 
 ## `Software` versus `PureCpu`
 
