@@ -20,6 +20,14 @@ Severity vocabulary:
   demonstrated trigger.
 - **Low** — performance, latent edge case, or hygiene.
 
+**Demotion rule: a defect whose trigger is not reproduced is recorded one
+class below its defect class.** This is what separates the three font-stack
+panics (M3, M4, M5) from C1: all four are process aborts or memory exhaustion
+reachable from attacker-controlled input, which is the Critical *defect*
+class, but only C1's trigger was actually run. The rule is written down here
+because the first draft of this document applied it silently and the ladder
+then contradicted itself three times (review round 1, I-R2).
+
 Each finding states its evidence class explicitly:
 
 - **measured** — reproduced against the running binary, command included.
@@ -44,7 +52,15 @@ review produces documents only.
 requested side against `caps.max_texture_size` and `bail!`s when it is
 exceeded; the `PureCpu` arm has no cap and no fallible path at all — it calls
 `ImageTexture::new(size, size)`, which allocates `size × size × 4` bytes of
-system memory and cannot fail gracefully.
+system memory and cannot fail gracefully. The memory is **touched, not lazily
+reserved**: `Image::new` is `vec![0; height * width * 4]`
+(`window/src/bitmaps/mod.rs:337-346`) and `Atlas::new` (`atlas.rs:30-49`) then
+builds a *second* full-size `Image` and `texture.write`s the whole rect.
+
+**This arm is fork-introduced, not inherited.**
+`git show e723cf5:wezterm-gui/src/renderstate.rs` has only `Glium` and
+`WebGpu` arms in `allocate_texture_atlas` — there is no upstream software or
+`PureCpu` arm for the missing ceiling to have come from.
 
 **Why that matters.** The atlas side is chosen from attacker-controlled
 content. `Atlas::allocate_with_padding` computes the next side as
@@ -72,14 +88,18 @@ twice a second for 15 s:
 
 | backend | peak RSS | log |
 |---|---|---|
-| OpenGL | 3274 MiB | `Not enough texture space (Cannot use a texture of size 32768 as it is larger than the max 16384 supported by your GPU); will retry render with Scale(2)` |
+| OpenGL — **not a control**, see below | 3274–3284 MiB | `Not enough texture space (Cannot use a texture of size 32768 as it is larger than the max 16384 supported by your GPU); will retry render with Scale(2)` |
 | PureCpu | 4170 MiB | *(no texture-space fallback logged)* |
 
-PureCpu's 4170 MiB is the 4096 MiB atlas plus process overhead — the
-allocation is real, not a virtual reservation. OpenGL's 3274 MiB is llvmpipe's
-own working set around a *capped* 16384 atlas; the point is not that the GL
-number is small, it is that GL **refuses** the 32768 allocation and degrades
-the image instead, while PureCpu performs it.
+**The table is not the argument, and the OpenGL row is not a control.** That
+row is llvmpipe's own working set around a *capped* 16384 atlas; it varies
+run to run (3274 MiB and 3284 MiB in two runs here) and it is large for
+reasons that have nothing to do with this defect. The argument is the pair of
+asymmetries: GL **refuses** the 32768 allocation and says so in its log, five
+to twenty-seven times per run, while PureCpu's log is empty; and PureCpu's
+4170 MiB is 4096 MiB + process overhead almost exactly, i.e. the atlas is
+really there. PureCpu's figure is stable — 4170 MiB in every run, here and on
+the reviewer's independent reproduction.
 
 The next doubling is the problem: a sixel roughly twice as wide selects side
 65536 -> **16 GiB**. This machine has 25 GiB total. `Vec` allocation failure
@@ -99,32 +119,56 @@ asymmetry); by reading for the 16 GiB extrapolation.
 **Fix direction.** Give the `PureCpu` arm a ceiling and a `bail!`, so it
 reaches the same `AllowImage::Scale` fallback the GL arm already reaches.
 
-Reproduce:
+Reproduce. Save as a script and run it as `./c1-repro.sh PureCpu` and
+`./c1-repro.sh OpenGL`, with `PARITY_XAUTH` exported (`lib.sh` fails closed
+without it):
 
 ```bash
-export PARITY_XAUTH=<:20 Xauthority>
-cd /scratch/oetiker/wezterm/tools/purecpu-parity
-source ./lib.sh
-./gen-config.sh PureCpu "$PARITY_OUT/mem-PureCpu.lua"
-launch par-mem-purecpu "$PARITY_OUT/mem-PureCpu.lua" "$PWD/corpus/wide-sixel.sh"
-W=$(find_window par-mem-purecpu)
-for i in $(seq 30); do
-  pid=$(pgrep -u "$USER" -f -- "--class par-mem-purecpu" | head -1)
-  awk '/VmRSS/{print $2}' /proc/$pid/status
+#!/usr/bin/env bash
+set -euo pipefail
+source /scratch/oetiker/wezterm/tools/purecpu-parity/lib.sh
+FE="${1:-PureCpu}"
+cls="par-mem-$(echo "$FE" | tr 'A-Z' 'a-z')"
+kill_class "$cls"
+"$PARITY_DIR/gen-config.sh" "$FE" "$PARITY_OUT/mem-$FE.lua"
+launch "$cls" "$PARITY_OUT/mem-$FE.lua" "$PARITY_DIR/corpus/wide-sixel.sh"
+find_window "$cls" >/dev/null
+peak=0
+for i in $(seq 40); do
+  # Take the max over EVERY matching pid, not the first.  `pgrep -f
+  # -- "--class $cls"` matches the setsid parent and the bash -c wrapper as
+  # well as the gui process, and their order is not stable: `| head -1`
+  # picks the parent often enough to print ~4 MiB for every sample and make
+  # this finding look fabricated by three orders of magnitude (review round
+  # 1, I-R1).  Filtering on /proc/$p/comm does not help either — comm is
+  # truncated to 15 characters, so this binary reads `wezterm-gui-reb`, not
+  # `wezterm-gui`.  The max is unambiguous: the gui process dwarfs both.
+  for p in $(pgrep -u "$USER" -f -- "--class $cls" || true); do
+    rss=$(awk '/VmRSS/{print $2}' "/proc/$p/status" 2>/dev/null || true)
+    [ -n "${rss:-}" ] && [ "$rss" -gt "$peak" ] && peak=$rss
+  done
   pause 0.5
 done
-kill_class par-mem-purecpu
+echo "$FE peak RSS: $peak kB = $((peak/1024)) MiB"
+echo -n "  'Not enough texture space' lines in log: "
+grep -c "Not enough texture space" "$PARITY_OUT/$cls.log" || true
+kill_class "$cls"
 ```
 
-Repeat with `./gen-config.sh OpenGL` and check
-`$PARITY_OUT/par-mem-opengl.log` for the `Not enough texture space` line that
-PureCpu's log never contains.
+Verified output, both arms, from a clean shell:
+
+```
+PureCpu peak RSS: 4270776 kB = 4170 MiB
+  'Not enough texture space' lines in log: 0
+OpenGL  peak RSS: 3363024 kB = 3284 MiB
+  'Not enough texture space' lines in log: 27
+```
 
 ---
 
 ## Important
 
-### I1 — Dirty-rect tracking only ever consults the *active* pane, so output in any other pane of a split is never repainted
+### I1 — Dirty-rect tracking only ever consults the *active* pane, so output in any other pane of a split is not repainted until something else forces a full repaint
 
 `wezterm-gui/src/termwindow/mod.rs:1275-1330`, early exit at
 `mod.rs:1436-1447`
@@ -134,7 +178,14 @@ PureCpu's log never contains.
 When a background pane writes to its terminal, the mux invalidates the
 window, `do_paint_purecpu` runs, finds no changed rows in the *active* pane
 and no cursor movement, hits `state.dirty_pixel_rects.is_empty()` and returns
-before `paint_impl` — so the background pane's new output is never drawn.
+before `paint_impl` — so the background pane's new output is not drawn.
+
+**Not "never", precisely.** The pane catches up at the next *full* repaint,
+and `mod.rs:1226-1252` lists several ordinary triggers for one: a config,
+shape or quad-generation change (which includes focus change, `mod.rs:532`),
+a viewport scroll, or a selection change. So the pane is stale for as long as
+nobody touches the window, not forever — which for a background build is
+still the whole time you are watching it.
 
 **Failure scenario, measured.** Two panes side by side. The **left**
 (inactive) pane runs a script that toggles a 10-cell colour bar at its home
@@ -147,8 +198,11 @@ gl  : red green green red green red green red green red      (alternating)
 cpu : red green green green green green green green green green
 ```
 
-PureCpu changes once — the tail of the initial full repaint — and is then
-**flat for the remaining 3.6 s**, while the pane behind it keeps toggling.
+PureCpu changes once and is then **flat for the remaining 3.6 s**, while the
+pane behind it keeps toggling. (I read the single early transition as the
+tail of the initial full repaint, but that is *inference* — I did not
+establish it, and the independent reviewer saw the same shape without
+establishing it either. Nothing in the finding depends on it.)
 Screenshot `tools/purecpu-parity/out/splitright-cpu.png` shows the left
 pane's bar frozen mid-cycle.
 
@@ -164,7 +218,8 @@ Reproduce: driver listed under I2.
 
 ### I2 — Dirty-rect geometry ignores the pane's position in the split grid, so even the *active* pane is not repainted when it is not at the window's top-left
 
-`wezterm-gui/src/termwindow/mod.rs:1290-1305` (row -> y),
+`wezterm-gui/src/termwindow/mod.rs:1305` (`content_top`, the row origin) and
+`mod.rs:1321` (row -> y),
 `mod.rs:1345-1371` and `mod.rs:1396-1408` (cursor cell -> x, y)
 
 **Defect.** The dirty rectangle for viewport row *r* is placed at
@@ -172,7 +227,9 @@ Reproduce: driver listed under I2.
 `padding_left + border.left + col * cell_w`. Both are *window*-relative. The
 paint pass places the same content at
 `top_pixel_y + (line_idx + pos.top) * cell_height` and
-`left_pixel_x + pos.left * cell_width` (`render/pane.rs:340-342`, `437-440`).
+`left_pixel_x`, which is itself `padding_left + border.left + pos.left *
+cell_width` (`render/pane.rs:340-342`, `437-440`) — note the `pos.left` term
+lives *inside* `left_pixel_x`, it is not added on top of it.
 The `pos.top` / `pos.left` terms — the pane's origin in the split grid — are
 missing from the dirty-rect computation. For a single-pane window both are
 zero and nothing goes wrong, which is why this survives every non-split test
@@ -254,65 +311,7 @@ Note `direction = 'Down'` is not a valid wezterm split direction — it makes
 the handler error out after `spawn_window`, leaving a single pane and a
 probe that silently tests nothing. Use `'Bottom'`.
 
-### I3 — Unconditional panic in the empty-path fallback of the COLR glyph rasteriser
-
-`wezterm-font/src/rasterizer/paint_ops.rs:329-334`
-
-**Defect.**
-
-```rust
-pb.finish().unwrap_or_else(|| {
-    // Return an empty path as fallback
-    let mut pb2 = tiny_skia::PathBuilder::new();
-    pb2.move_to(0.0, 0.0);
-    pb2.finish().unwrap()     // <- always None, always panics
-})
-```
-
-The fallback that exists to handle "this path could not be finished" is
-itself unfinishable. `tiny_skia::PathBuilder::finish` returns `None` when the
-builder is empty **and** when it holds exactly one verb
-(`tiny-skia-path-0.11.4/src/path_builder.rs:411-419`:
-`if self.verbs.len() == 1 { return None; }`). A single `move_to` is exactly
-one verb. So whenever the `unwrap_or_else` arm is entered at all, the process
-panics.
-
-Verified against the pinned dependency (`Cargo.lock`: `tiny-skia 0.11.4`)
-with a standalone program that calls the same two APIs:
-
-```
-empty builder finish()  -> None
-move_to-only finish()   -> None
-```
-
-**Reachability.** `draw_ops_to_path` is called from `skia_colr.rs:137` for
-`PaintOp::PushClip(draw_ops)`, and those draw ops come from
-`PaintOpCollector::push_clip_glyph` (`skrifa_rasterizer.rs:551-554` ->
-`glyph_outline_draw_ops`, `skrifa_rasterizer.rs:453-464`).
-`glyph_outline_draw_ops` returns an **empty `Vec`** whenever
-`outlines.get(glyph_id)` yields `None`, and also whenever the referenced
-glyph has zero contours. A COLRv1 glyph whose clip layer references a blank
-glyph (a space, or a glyph id with no outline entry) therefore produces
-`PushClip(vec![])` -> empty `PathBuilder` -> `finish()` `None` -> the
-fallback -> panic. `finish()` also returns `None` for non-finite coordinates
-(`Rect::from_points` fails), which the `unitsPerEm = 0` case in M4 produces.
-
-**What is proven and what is not.** *Proven:* the fallback panics
-unconditionally when reached, and the shape of input that reaches it is a
-`PushClip` with an empty draw-op list. *Not demonstrated:* an actual font file
-that produces such a layer. `fontTools` is not installed on this machine and
-no COLRv1 font present here exercises the path, so I could neither craft nor
-find one. **Missing evidence: a COLRv1 font whose clip layer references an
-outline-less glyph, rendered through this binary.** Treat the reachability as
-by-reading and the panic itself as verified.
-
-**Evidence class:** by reading (reachability) + measured (the tiny-skia
-half). Trigger **not reproduced**.
-
-**Fix direction.** Skip the op when the path cannot be finished, rather than
-building a degenerate path and unwrapping it.
-
-### I4 — The idle skip suppresses every time-driven repaint, and nothing else marks that content dirty
+### I3 — The idle skip suppresses every time-driven repaint, and nothing else marks that content dirty
 
 `wezterm-gui/src/termwindow/mod.rs:1436-1447`; bell handler at
 `mod.rs:1574-1594`
@@ -352,7 +351,7 @@ image: animated GIF").
 **Fix direction.** Either give blink/bell/animation their own dirty-rect
 producers, or consult `has_animation` before taking the early exit.
 
-### I5 — Cursor-blink detection tests the *raw* pane cursor shape, so the documented way to enable blinking is inert
+### I4 — Cursor-blink detection tests the *raw* pane cursor shape, so the documented way to enable blinking is inert
 
 `wezterm-gui/src/termwindow/mod.rs:1383`
 
@@ -380,7 +379,7 @@ blink.
 **Fix direction.** Resolve through `effective_shape` before calling
 `is_blinking()`, as `render/mod.rs:604-611` does.
 
-### I6 — Textured quads are blitted 1:1 and cropped; the rasteriser contains no resampler
+### I5 — Textured quads are blitted 1:1 and cropped; the rasteriser contains no resampler
 
 `wezterm-gui/src/termwindow/render/purecpu.rs:344-360`
 
@@ -481,31 +480,69 @@ the per-cursor-cell rects (`mod.rs:1338-1371`) and the blink-transition rect
 once per rect too, but clearing twice is idempotent, so it does not cancel
 the double blend.
 
+That is a statement about what the code *can* do, and it is read off the
+source. It is **not** the explanation of the instance measured below: two
+deliberate attempts to make those particular rects overlap produced no double
+composite at all (see "What is not established"). Either those frames did not
+take the incremental path, or overlapping row/cursor rects do not in fact
+reach the blit loop together. Both halves of this finding are real; they are
+simply not yet joined.
+
 **Observed instance, measured.** In the wide-sixel capture pair
 (`tools/purecpu-parity/out/wide-sixel-{gl,cpu}.png`) the label row
-"WIDE SIXEL:" differs between backends only in the first two character cells
-(per-8-column PAE: x 0-8 -> 11565, x 8-16 -> 11308, x >= 16 -> 257 = 1 LSB),
-and the differences are confined to antialiased pixels: fully covered pixels
-are 192 on both, background is 16 on both. The PureCpu values are *exactly*
-what you get by compositing the glyph a second time over OpenGL's own result.
-With foreground 192 and background 16, the coverage implied by a GPU pixel is
-`a = (gl - 16) / 176`; predicting `192*a + gl*(1-a)`:
+"WIDE SIXEL:" (ink occupies y 38–49) differs between backends in **cell 0
+and nowhere else**. `gen-config.sh:166` sets `initial_cols = 100` with zero
+`window_padding` (`:185`) and the capture is 1000 px wide, so a cell is
+exactly **10 px**. Per-column max difference across the label row, in LSB:
 
-| GPU | implied a | predicted 2nd blend | PureCpu |
-|---|---|---|---|
-| 128 | 0.636 | 168.7 | 169 |
-| 87 | 0.403 | 129.3 | 128 |
-| 45 | 0.165 | 69.2 | 69 |
-| 109 | 0.528 | 152.8 | 152 |
-| 154 | 0.784 | 183.8 | 184 |
-| 185 | 0.960 | 191.8 | 192 |
-| 139 | 0.699 | 176.1 | 176 |
-| 98 | 0.466 | 141.8 | 141 |
+```
+x      0  1  2  3  4  5  6  7  8  9 | 10 11 12 13 14 15 16 17 18 19
+diff  44 43 43 43 43 44 43 45 44 31 |  0  1  1  1  1  1  1  0  0  0
+```
 
-Eight independent samples, every one within 1 LSB. PureCpu composited those
-glyph pixels twice. That the affected region is exactly two adjacent cells is
-consistent with a row band overlapped by the previous-cursor and new-cursor
-cell rects.
+The bar marks the cell boundary: x 0-9 is cell 0, x 10-19 is cell 1. Cell 1
+and every cell to its right sit at the 1 LSB noise floor.
+
+Re-binned per 10 px cell: cell 0 = 45 LSB, cells 1–5 = 0 or 1 LSB. **An
+earlier draft of this finding reported "the first two character cells". That
+was wrong — an artefact of binning the PAE in 8 px blocks that are not
+cell-aligned, so the second bin's entire signal was x = 8, 9, still cell 0
+(review round 1, C-R1).**
+
+The differences are confined to antialiased pixels: fully covered pixels are
+192 on both, background is 16 on both. The PureCpu values are *exactly* what
+you get by compositing the glyph a second time over OpenGL's own result. With
+foreground 192 and background 16, the coverage implied by a GPU pixel is
+`a = (gl - 16) / 176`, and the prediction is `192*a + gl*(1-a)`. Evaluated
+over **all 87 label-row pixels that differ by more than 1 LSB** — not a
+hand-picked sample:
+
+| statistic | value |
+|---|---|
+| pixels differing by > 1 LSB | 87 |
+| max abs residual vs. prediction | **1.91 LSB** |
+| mean residual | **−0.05 LSB** |
+
+A mean residual of −0.05 across 87 pixels, with no residual above 2 LSB, is
+not a coincidence: PureCpu composited those glyph pixels twice. The
+signature is also **stable** — three independent re-captures are
+byte-identical to each other and to the stored PNG over the label row.
+
+Recompute:
+
+```bash
+cd /scratch/oetiker/wezterm/tools/purecpu-parity/out
+for s in gl cpu; do
+  convert wide-sixel-$s.png -crop 30x12+0+38 +repage -colorspace Gray -depth 8 txt: \
+    | tail -n +2 | sed 's/:.*gray(/ /;s/)//' > /tmp/$s.txt
+done
+paste /tmp/gl.txt /tmp/cpu.txt | awk '
+{ gl=$2; cpu=$4; d=cpu-gl; if (d<0) d=-d;
+  if (d>1) { n++; a=(gl-16)/176; r=cpu-(192*a+gl*(1-a));
+             s+=r; ar=(r<0?-r:r); if (ar>mx) mx=ar } }
+END { printf "n=%d max|resid|=%.2f mean=%+.2f\n", n, mx, s/n }'
+# n=87 max|resid|=1.91 mean=-0.05
+```
 
 **What is not established.** A deliberate reproduction — print a row, let it
 settle, then append one glyph so that the row band *and* both cursor-cell
@@ -519,27 +556,116 @@ PARITY_SETTLE_WARMUP=9 FUZZ=1 ./compare-case.sh dblblend <corpus>
 # raw AE 1007 / fuzz-1% AE 157 / body PAE 257  -> no double composite
 ```
 
-Either that run's final paint was a full repaint (which would erase the
-evidence), or the wide-sixel instance arises from a different
-double-composite route than the one I predicted. So: **the double composite
-is proven; the specific rect pair that produced it is not.** Missing evidence
-is an instrumented run — or a `WEZTERM_LOG` trace of `dirty_pixel_rects` —
-showing the overlapping pair at the moment of the affected frame.
+A second, tighter attempt was then built against the corrected one-cell
+geometry (review round 1, I-R3): settle a blank window so the initial full
+repaint completes, then emit one line from home, so that in the *same*
+incremental frame the row-0 band and the previous-cursor cell rect at (0, 0)
+fire and overlap in cell 0 alone — precisely the frame the named mechanism
+predicts.
+
+```bash
+# corpus: sleep 5; printf 'ABCDEFGHIJ\n'; exec sleep 600
+# per backend: launch -> find_window -> check_no_config_error
+#              -> PARITY_SETTLE_WARMUP=8 capture_settled
+# label row per-cell max diff: 1 1 1 1 1 1 1 1 1 1 0 0  -> no double composite
+```
+
+Zero pixels above the noise floor, cell 0 included. **The row-band /
+cursor-rect route has therefore been tested and eliminated, across two
+independent deliberate attempts, the second matched to the corrected
+geometry.** It is not merely unproven — it is the one candidate I could name,
+and it is out.
+
+So: **the double composite is proven; the rect pair that produced it is
+unknown, and the only candidate that was namable has been eliminated.** The
+missing evidence is now specific: **an instrumented dump of
+`state.dirty_pixel_rects` at the frame that produced the affected capture.**
+Nothing short of that will settle it — the by-construction mechanism in
+`collect_clip_rects` is real, but so is the possibility that this instance
+came from somewhere else entirely (M7's uncleared-row branch is one such
+place).
 
 This finding does close out the "unexplained wide-sixel label-row
 antialiasing anomaly" carried forward from Task 4 fix rounds 2 and 3: the
-*what* is now known exactly (a second alpha composite of the same glyph), the
-*which rects* is not.
+*what* is now known exactly and to 1.91 LSB across 87 pixels (a second alpha
+composite of the same glyph), the *which rects* is not.
 
-**Evidence class:** measured (the double composite); by reading (the
-mechanism); the link between the two **unverified**.
+**Evidence class:** measured (the double composite, 87 pixels); by reading
+(the mechanism); the link between the two **refuted for the only named
+candidate, otherwise unknown**.
 
 **Fix direction.** Reduce the dirty rects to a disjoint set before blitting,
 or clip each quad against the union rather than blending once per rect.
 
-### M3 — `cpal.color_record_indices()[0]` panics on a CPAL table with zero palettes
+### M3 — Unconditional panic in the empty-path fallback of the COLR glyph rasteriser
+
+`wezterm-font/src/rasterizer/paint_ops.rs:329-334`
+
+**Defect class Critical, recorded Medium** under the demotion rule above: a
+process abort reachable from font data, whose trigger is not reproduced. It
+sits here with M4 and M5, the other two font-stack panics, because their
+reachability arguments are of the same kind and none of the three was run.
+
+**Defect.**
+
+```rust
+pb.finish().unwrap_or_else(|| {
+    // Return an empty path as fallback
+    let mut pb2 = tiny_skia::PathBuilder::new();
+    pb2.move_to(0.0, 0.0);
+    pb2.finish().unwrap()     // <- always None, always panics
+})
+```
+
+The fallback that exists to handle "this path could not be finished" is
+itself unfinishable. `tiny_skia::PathBuilder::finish` returns `None` when the
+builder is empty **and** when it holds exactly one verb
+(`tiny-skia-path-0.11.4/src/path_builder.rs:411-419`:
+`if self.verbs.len() == 1 { return None; }`). A single `move_to` is exactly
+one verb. So whenever the `unwrap_or_else` arm is entered at all, the process
+panics.
+
+Verified against the pinned dependency (`Cargo.lock`: `tiny-skia 0.11.4`)
+with a standalone program that calls the same two APIs:
+
+```
+empty builder finish()  -> None
+move_to-only finish()   -> None
+```
+
+**Reachability.** `draw_ops_to_path` is called from `skia_colr.rs:137` for
+`PaintOp::PushClip(draw_ops)`, and those draw ops come from
+`PaintOpCollector::push_clip_glyph` (`skrifa_rasterizer.rs:551-554` ->
+`glyph_outline_draw_ops`, `skrifa_rasterizer.rs:453-464`).
+`glyph_outline_draw_ops` returns an **empty `Vec`** whenever
+`outlines.get(glyph_id)` yields `None`, and also whenever the referenced
+glyph has zero contours. A COLRv1 glyph whose clip layer references a blank
+glyph (a space, or a glyph id with no outline entry) therefore produces
+`PushClip(vec![])` -> empty `PathBuilder` -> `finish()` `None` -> the
+fallback -> panic. `finish()` also returns `None` for non-finite coordinates
+(`Rect::from_points` fails), which the `unitsPerEm = 0` case in M5 produces.
+
+**What is proven and what is not.** *Proven:* the fallback panics
+unconditionally when reached, and the shape of input that reaches it is a
+`PushClip` with an empty draw-op list. *Not demonstrated:* an actual font file
+that produces such a layer. `fontTools` is not installed on this machine and
+no COLRv1 font present here exercises the path, so I could neither craft nor
+find one. **Missing evidence: a COLRv1 font whose clip layer references an
+outline-less glyph, rendered through this binary.** Treat the reachability as
+by-reading and the panic itself as verified.
+
+**Evidence class:** by reading (reachability) + measured (the tiny-skia
+half). Trigger **not reproduced**.
+
+**Fix direction.** Skip the op when the path cannot be finished, rather than
+building a degenerate path and unwrapping it.
+
+### M4 — `cpal.color_record_indices()[0]` panics on a CPAL table with zero palettes
 
 `wezterm-font/src/rasterizer/skrifa_rasterizer.rs:370`
+
+**Defect class Critical, recorded Medium** under the demotion rule above:
+process abort from font data, trigger not reproduced.
 
 **Defect.** `let first_color_index = cpal.color_record_indices()[0].get() as usize;`
 indexes an array whose length is the table's `numPalettes`. Every other
@@ -558,7 +684,10 @@ downloads one — but this is not reachable from terminal output.
 
 **Evidence class:** by reading. Trigger **not reproduced**.
 
-### M4 — `unitsPerEm = 0` divides by zero in both the shaper and the rasteriser
+### M5 — `unitsPerEm = 0` divides by zero in both the shaper and the rasteriser
+
+**Defect class Critical, recorded Medium** under the demotion rule above (it
+reaches M3's abort), trigger not reproduced.
 
 `wezterm-font/src/shaper/harfrust_shaper.rs:242`,
 `wezterm-font/src/rasterizer/skrifa_rasterizer.rs:383-384`,
@@ -571,17 +700,17 @@ advances then go through `(pos.x_advance as f64 * scale_26_6) as i32`
 `i32::MAX` in Rust — no panic, but glyph advances of two billion pixels and
 completely broken layout. In the COLR path the infinite scale propagates into
 path coordinates, `Rect::from_points` returns `None`, and the result is the
-unconditional panic of **I3**.
+unconditional panic of **M3**.
 
 The author was aware of the hazard elsewhere: `harfrust_shaper.rs:680` guards
 the same division with `if ch > 0.0 && upem > 0.0`.
 
 **Not reproduced.** Missing evidence is a font with `head.unitsPerEm = 0`
-(same tooling gap as M3).
+(same tooling gap as M4).
 
 **Evidence class:** by reading. Trigger **not reproduced**.
 
-### M5 — A dirty band that extends past the bottom of the window is silently not presented
+### M6 — A dirty band that extends past the bottom of the window is silently not presented
 
 `wezterm-gui/src/termwindow/render/purecpu.rs:501-519`
 
@@ -606,7 +735,7 @@ in the presentation path, not because I saw it fire.
 
 **Evidence class:** by reading. **Unverified.**
 
-### M6 — `clear_rect` silently skips a row instead of clamping when the computed row end exceeds the framebuffer
+### M7 — `clear_rect` silently skips a row instead of clamping when the computed row end exceeds the framebuffer
 
 `wezterm-gui/src/termwindow/render/purecpu.rs:102-115`
 
@@ -718,7 +847,8 @@ targets found in package wezterm-gui` — the crate is a binary, not a library.
 Deviation: I ran `cargo test -p wezterm-gui -p wezterm-font` instead, which
 covers the binary's unit tests plus the font crate this task also reviews.
 
-**`purecpu.rs`'s own unit tests do not touch the rasterising path.** All ten
+**`purecpu.rs`'s own unit tests do not touch the rasterising path.** All
+eleven (`purecpu.rs:613, 621, 629, 650, 661, 669, 681, 693, 703, 709, 730`)
 are pure-function tests of helpers:
 
 | test | what it covers |
@@ -732,11 +862,11 @@ are pure-function tests of helpers:
 
 Nothing exercises `call_draw_purecpu`: no test builds a `Vertex`, no test
 walks a quad, no test blits from an atlas, and no test covers the coordinate
-maths of `purecpu.rs:257-360`. Every Important finding above, plus M1, M2, M5
-and M6, sits in code the unit tests cannot reach — and note that
+maths of `purecpu.rs:257-360`. Every Important finding above, plus M1, M2, M6
+and M7, sits in code the unit tests cannot reach — and note that
 `collect_clip_rects_intersection` uses a single dirty rect, so it cannot
 observe M2, while `clear_rect_zeroes_region` uses an in-range rect, so it
-cannot observe M6.
+cannot observe M7.
 
 The `shapecache.rs` snapshot tests were *updated* to the new font stack's
 metrics (`bitmap_pixel_width` 16 -> 5 and 20 -> 8, `bearing_x` 0.0 -> 3.0 —
