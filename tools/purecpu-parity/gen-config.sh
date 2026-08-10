@@ -38,6 +38,32 @@ SPAWN_TABS="${SPAWN_TABS:-false}"
 # items on WindowDecorations::INTEGRATED_BUTTONS), which is otherwise
 # unreachable through any existing env var.
 WINDOW_DECORATIONS="${WINDOW_DECORATIONS:-}"
+
+# (Task 5 review round 1, C1) A backslash in WINDOW_DECORATIONS — e.g. the
+# `\|` a Markdown table cell needs to keep a literal pipe from being read as
+# a column separator, if that escaped form is copy-pasted straight out of
+# the rendered matrix into a shell — becomes `window_decorations =
+# 'INTEGRATED_BUTTONS\|RESIZE'` below, which is not valid Lua. wezterm then
+# rejects the *entire* config, including `front_end`, and both windows fall
+# back to the same default front end: the comparison silently measures a
+# backend against itself and reports a reassuring AE=0/PAE=0 that means
+# nothing. Every regeneration command in this matrix must survive verbatim
+# copy-paste (this is the third time in the plan a printed command has
+# contradicted its own evidence cell), so refuse the input instead of
+# emitting Lua that quietly defeats the whole run.
+case "$WINDOW_DECORATIONS" in
+  *'\'*)
+    echo "gen-config.sh: WINDOW_DECORATIONS=$WINDOW_DECORATIONS contains a" \
+         "backslash, which becomes an invalid Lua escape once it lands in" \
+         "window_decorations = '...' below (e.g. a Markdown-escaped pipe" \
+         "'\\|' pasted verbatim from a table cell). wezterm rejects the" \
+         "whole config on a syntax error, both windows fall back to the" \
+         "default front_end, and the comparison silently measures a" \
+         "backend against itself. Use a literal '|' (e.g." \
+         "INTEGRATED_BUTTONS|RESIZE), not an escaped one." >&2
+    exit 1
+    ;;
+esac
 CURSOR_BLINK_RATE="${CURSOR_BLINK_RATE:-0}"
 TEXT_BLINK_RATE="${TEXT_BLINK_RATE:-0}"
 ANIMATION_FPS="${ANIMATION_FPS:-1}"
@@ -89,19 +115,26 @@ case "$DEFAULT_CURSOR_STYLE" in
     ;;
 esac
 
-WINDOW_DECORATIONS_LINE=""
-if [ -n "$WINDOW_DECORATIONS" ]; then
-  WINDOW_DECORATIONS_LINE="  window_decorations = '${WINDOW_DECORATIONS}',"
-fi
-
 STARTUP=""
 if [ "$SPAWN_TABS" = "true" ]; then
 STARTUP=$(cat <<'LUA'
 wezterm.on('gui-startup', function(cmd)
-  local tab, pane, window = wezterm.mux.spawn_window {}
-  pane:split { direction = 'Right', size = 0.5 }
-  window:spawn_tab {}
-  window:spawn_tab {}
+  -- (Task 5 review round 1, I4) Registering a gui-startup handler at all
+  -- replaces wezterm's normal startup entirely, so a handler that spawns
+  -- windows/tabs/panes without forwarding `cmd.args` discards the corpus
+  -- command the CLI was invoked with -- every tab and pane then runs the
+  -- operator's own login shell and its ~/.bashrc prompt instead of the
+  -- corpus script. That leaked into every capture and crop this task took:
+  -- tab titles read the shell's name, not the corpus's, and two lines of
+  -- prompt text (with real nerd-font colour icons) appeared in the body.
+  -- Passing `args = cmd.args` through to every spawn/split call below makes
+  -- the window's content the same corpus.sh text `launch()` was asked to
+  -- run, on every tab and in the split pane, so captures are hermetic and
+  -- do not depend on the operator's shell configuration.
+  local tab, pane, window = wezterm.mux.spawn_window { args = cmd.args }
+  pane:split { direction = 'Right', size = 0.5, args = cmd.args }
+  window:spawn_tab { args = cmd.args }
+  window:spawn_tab { args = cmd.args }
   -- spawn_tab activates each new tab as it's created, so without this the
   -- window starts on tab 3 and the split created above (in tab 1) is not on
   -- screen for any capture. Task 5 needs the divider visible, so reactivate
@@ -112,31 +145,41 @@ LUA
 )
 fi
 
-cat > "$OUT" <<EOF
-local wezterm = require 'wezterm'
-${STARTUP}
-return {
-  front_end = '${FRONT_END}',
-  font_size = 12.0,
-  initial_cols = 100,
-  initial_rows = 30,
-  cursor_blink_rate = ${CURSOR_BLINK_RATE},
-  text_blink_rate = ${TEXT_BLINK_RATE},
-  animation_fps = ${ANIMATION_FPS},
-  default_cursor_style = '${DEFAULT_CURSOR_STYLE}',
-  enable_tab_bar = true,
-  use_fancy_tab_bar = ${FANCY},
-${WINDOW_DECORATIONS_LINE}
-  audible_bell = 'Disabled',
-  window_close_confirmation = 'NeverPrompt',
-  check_for_updates = false,
-  window_padding = { left = 0, right = 0, top = 0, bottom = 0 },
-  colors = {
-    foreground = '#c0c0c0',
-    background = '#101010',
-    cursor_bg = '#e0e0e0',
-    cursor_fg = '#101010',
-    cursor_border = '#e0e0e0',
-  },
-}
-EOF
+# (Task 5 review round 1, I1) Built as an array and printed one line per
+# element, rather than substituting a possibly-empty ${WINDOW_DECORATIONS_LINE}
+# into a fixed heredoc, so that leaving WINDOW_DECORATIONS unset reproduces
+# byte-for-byte what this script emitted before Task 5 (no extra blank line).
+# Every prior Task 1-4 case leaves WINDOW_DECORATIONS unset.
+CONFIG_LINES=(
+  "local wezterm = require 'wezterm'"
+  "${STARTUP}"
+  "return {"
+  "  front_end = '${FRONT_END}',"
+  "  font_size = 12.0,"
+  "  initial_cols = 100,"
+  "  initial_rows = 30,"
+  "  cursor_blink_rate = ${CURSOR_BLINK_RATE},"
+  "  text_blink_rate = ${TEXT_BLINK_RATE},"
+  "  animation_fps = ${ANIMATION_FPS},"
+  "  default_cursor_style = '${DEFAULT_CURSOR_STYLE}',"
+  "  enable_tab_bar = true,"
+  "  use_fancy_tab_bar = ${FANCY},"
+)
+if [ -n "$WINDOW_DECORATIONS" ]; then
+  CONFIG_LINES+=("  window_decorations = '${WINDOW_DECORATIONS}',")
+fi
+CONFIG_LINES+=(
+  "  audible_bell = 'Disabled',"
+  "  window_close_confirmation = 'NeverPrompt',"
+  "  check_for_updates = false,"
+  "  window_padding = { left = 0, right = 0, top = 0, bottom = 0 },"
+  "  colors = {"
+  "    foreground = '#c0c0c0',"
+  "    background = '#101010',"
+  "    cursor_bg = '#e0e0e0',"
+  "    cursor_fg = '#101010',"
+  "    cursor_border = '#e0e0e0',"
+  "  },"
+  "}"
+)
+printf '%s\n' "${CONFIG_LINES[@]}" > "$OUT"
