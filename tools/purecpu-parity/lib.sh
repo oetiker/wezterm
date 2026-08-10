@@ -62,6 +62,44 @@ find_window() {  # find_window <class> -> window id on stdout
   return 1
 }
 
+# check_no_config_error <class>
+#
+# (Task 5 review round 2, N1) A backslash-escaped WINDOW_DECORATIONS value
+# (gen-config.sh's own guard) is one way to produce a config wezterm
+# rejects, but it is not the only one — the reviewer demonstrated a second,
+# live example this round (`&#124;`, valid Lua but an invalid
+# WindowDecorations value) that the backslash guard does not and cannot
+# catch, because the failure is general: ANY invalid value for ANY config
+# key makes wezterm reject the whole struct and fall back to hardcoded
+# defaults for every key, including front_end — so a GL-vs-PureCpu
+# comparison silently becomes a backend-vs-itself comparison and reports a
+# reassuring AE=0/PAE=0. Guarding one spelling of one variable (as C1's fix
+# did) cannot generalise; catching it here does, because every `launch`
+# already writes a log and wezterm logs "Configuration Error" there
+# (confirmed for both a Lua syntax error and a struct-conversion failure)
+# regardless of which config key was bad. Task 6 introduces more
+# config-driven env vars (CURSOR_BLINK_RATE, TEXT_BLINK_RATE,
+# DEFAULT_CURSOR_STYLE) and would otherwise inherit this gap.
+#
+# Fails rather than warns: numbers from a run whose front_end was silently
+# ignored are worse than no numbers, because they look like a real
+# comparison instead of announcing that they are not one.
+check_no_config_error() {
+  local class="$1"
+  local log="$PARITY_OUT/$class.log"
+  if grep -q "Configuration Error" "$log" 2>/dev/null; then
+    echo "check_no_config_error: $log contains a Configuration Error --" \
+         "wezterm rejected the whole config and fell back to hardcoded" \
+         "defaults for every key, including front_end. Any numbers from" \
+         "this run would compare a backend against itself and are worse" \
+         "than no numbers, because they look like a real comparison. Fix" \
+         "the config value that caused it; see $log for wezterm's own" \
+         "error text." >&2
+    return 1
+  fi
+  return 0
+}
+
 capture_settled() {  # capture_settled <winid> <outfile>
   #
   # (fix round 2, Task 4 NEW-3) capture_settled defines "settled" as two
