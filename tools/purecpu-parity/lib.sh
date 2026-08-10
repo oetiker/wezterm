@@ -63,7 +63,23 @@ find_window() {  # find_window <class> -> window id on stdout
 }
 
 capture_settled() {  # capture_settled <winid> <outfile>
+  #
+  # (fix round 2, Task 4 NEW-3) capture_settled defines "settled" as two
+  # captures 0.4s apart being identical — which is also true of a window
+  # that hasn't started drawing anything yet. A corpus whose content takes
+  # many seconds to actually reach the framebuffer (e.g. an image large
+  # enough that the atlas needs an expensive grow/retry cycle) can look
+  # "settled" on its first 0.4s poll purely because it's still blank, long
+  # before real rendering begins — capturing a false-early snapshot rather
+  # than the real result. `PARITY_SETTLE_WARMUP` (seconds, default 0) pauses
+  # before the first poll so slow-to-start content has a chance to actually
+  # start; it does not change behaviour for any existing case that doesn't
+  # set it.
   local id="$1" out="$2" prev="${2%.png}-prev.png" i diff
+  local warmup="${PARITY_SETTLE_WARMUP:-0}"
+  if [ "$warmup" != "0" ]; then
+    pause "$warmup"
+  fi
   import -window "$id" "$prev"
   for i in $(seq 20); do
     pause 0.4
