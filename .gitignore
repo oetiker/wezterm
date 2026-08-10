@@ -60,9 +60,15 @@ dhat-heap.json
 /wezterm-linuxbrew.rb
 /wezterm.rb
 /perf.data*
+/perf-*.data
+/profile*.json
+/profile*.json.gz
 .idea/
 /winget-pkgs
 /assets/flatpak/generated-sources.json
 /__pycache__/
 /nix/result
 *.qcow2
+
+# subagent-driven-development scratch workspace
+/.superpowers/
