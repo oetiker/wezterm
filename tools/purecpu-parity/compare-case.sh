@@ -43,6 +43,20 @@ kill_class "par-$CASE-cpu"
 # That's a strong, cheap signal that this run measured nothing: warn loudly
 # rather than let a blank-vs-blank pair silently report the noise floor as
 # if it were a real comparison.
+#
+# (fix round 4, NEW-11) Warn-not-refuse stands, but not for the reason round
+# 3 gave. That reason was "text-only captures may legitimately be Gray";
+# that is not true of this harness's text-only captures. Task 3's
+# deliberately text-only corpus develops as sRGB (`out/plain-{gl,cpu}.png`),
+# as does every other genuine capture in `out/`; the only Gray files there
+# are the known-blank ones (`wide-sixel-noguard-*`) and two hand-made crops.
+# So refusing would not, today, false-positive on anything. It is a warning
+# because this is a shared driver whose Task 5/6 callers are unwritten and
+# because a refusal here would abort before printing the numbers that let a
+# reader see *how* blank the run was — not because any real capture in this
+# harness is expected to be Gray. If a future case legitimately produces a
+# Gray capture, say so where that case is defined; do not assume it from
+# this comment.
 for side in gl cpu; do
   space=$(identify -format '%[colorspace]' "$PARITY_OUT/$CASE-$side.png" 2>/dev/null || echo "?")
   if [ "$space" = "Gray" ]; then

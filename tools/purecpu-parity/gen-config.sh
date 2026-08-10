@@ -48,19 +48,38 @@ DEFAULT_CURSOR_STYLE="${DEFAULT_CURSOR_STYLE:-SteadyBlock}"
 # (TEXT_BLINK_RATE has no equivalent check here: whether it takes effect
 # depends on the corpus emitting SGR 5 blinking text, which this script
 # can't see — that half of the pairing is still only a comment, on purpose.)
-if [ "$CURSOR_BLINK_RATE" != "0" ]; then
-  case "$DEFAULT_CURSOR_STYLE" in
-    Blinking*) ;;
-    *)
+#
+# (fix round 4, NEW-10) The guard is symmetric, because the *other* direction
+# is the likelier mistake. wezterm's own cursor_blink_rate default is 800
+# (config/src/config.rs:1686) and is 0 here only because this harness forces
+# blinking off for Tasks 1-4; so someone who reads the wezterm docs, sets
+# DEFAULT_CURSOR_STYLE=BlinkingBlock and expects the documented default rate
+# gets a config that never blinks (cursor_blink_rate == 0 short-circuits
+# blinking independently of shape: termwindow/mod.rs:1150, mod.rs:1384,
+# render/mod.rs:670) — and the same silent false `parity`, from a script whose
+# guard would have told them nothing.
+case "$DEFAULT_CURSOR_STYLE" in
+  Blinking*)
+    if [ "$CURSOR_BLINK_RATE" = "0" ]; then
+      echo "gen-config.sh: DEFAULT_CURSOR_STYLE=$DEFAULT_CURSOR_STYLE is a" \
+           "Blinking* variant but CURSOR_BLINK_RATE=0 (this harness's" \
+           "default, not wezterm's 800), so the cursor will never blink and" \
+           "a comparison will silently read as parity. Set" \
+           "CURSOR_BLINK_RATE=<ms> (e.g. 400) to actually test blink." >&2
+      exit 1
+    fi
+    ;;
+  *)
+    if [ "$CURSOR_BLINK_RATE" != "0" ]; then
       echo "gen-config.sh: CURSOR_BLINK_RATE=$CURSOR_BLINK_RATE is set but" \
            "DEFAULT_CURSOR_STYLE=$DEFAULT_CURSOR_STYLE is not a Blinking*" \
            "variant, so the cursor will never blink and a comparison will" \
            "silently read as parity. Set DEFAULT_CURSOR_STYLE=BlinkingBlock" \
            "(or BlinkingUnderline/BlinkingBar) to actually test blink." >&2
       exit 1
-      ;;
-  esac
-fi
+    fi
+    ;;
+esac
 
 STARTUP=""
 if [ "$SPAWN_TABS" = "true" ]; then
