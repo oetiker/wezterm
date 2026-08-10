@@ -13,7 +13,10 @@ export XAUTHORITY="$PARITY_XAUTH"
 mkdir -p "$PARITY_OUT"
 
 # Foreground sleep is unavailable in this harness environment; block on timeout.
-pause() { timeout "$1" cat </dev/null || true; }
+# NOTE: `timeout N cat </dev/null` does NOT wait — cat hits EOF immediately, so
+# timeout has nothing to interrupt and this returns in ~0s. Use `tail -f /dev/null`
+# instead, which blocks until timeout fires.
+pause() { timeout "$1" tail -f /dev/null || true; }
 
 launch() {  # launch <class> <config> <shell-command>
   local class="$1" config="$2" cmd="$3"
