@@ -20,6 +20,9 @@
 - Known gaps, recorded but not investigated: `window_background_image`, `window_background_opacity`, `text_background_opacity`, background blur/HSB tint.
 - Verdict vocabulary, used verbatim: `parity`, `degraded`, `missing`, `known gap`.
 - Every non-`known gap` verdict cites evidence: a capture pair path, or the code path making the behaviour impossible.
+- **Comparisons capture ONE window at a time** (launch → find_window → capture_settled → kill_class → next backend). Simultaneous capture leaves one window unfocused, and wezterm draws a hollow cursor when unfocused versus a solid block when focused — a whole-cell artifact that survives 12% fuzz and mimics a real defect.
+- **`FUZZ = 1`, not 3**, for the terminal body, plus a body `PAE <= 257` assertion at fuzz 0 and the raw fuzz-0 AE reported alongside. Measured: at fuzz 3 a uniform +6/255 body-wide brightness error reports zero differing pixels. Never raise `FUZZ` to make a case pass.
+- The tab-bar strip (y < 32) has an open defect no fuzz absorbs (PureCpu draws some title glyph runs 1px left). Do not fold it into a threshold; it belongs to Task 5.
 
 ---
 
@@ -434,9 +437,20 @@ CPU=$(find_window "par-$CASE-cpu")
 capture_settled "$CPU" "$PARITY_OUT/$CASE-cpu.png" || echo "WARN: cpu never settled"
 kill_class "par-$CASE-cpu"
 
+# Three numbers, not one. Task 3 established that a fuzzed pixel count alone can
+# hide a real defect: at fuzz 3% a uniform +6/255 body-wide brightness error
+# reports ZERO differing pixels. So report the raw count too, and assert the
+# sharper calibrated fact — no body pixel may differ by more than 1 LSB (PAE 257).
+echo "== $CASE: raw differing pixels (fuzz 0) =="
+compare -metric AE "$PARITY_OUT/$CASE-gl.png" "$PARITY_OUT/$CASE-cpu.png" null: 2>&1 || true; echo
 echo "== $CASE: differing pixels at fuzz ${FUZZ}% =="
 compare -metric AE -fuzz "${FUZZ}%" \
   "$PARITY_OUT/$CASE-gl.png" "$PARITY_OUT/$CASE-cpu.png" null: 2>&1 || true; echo
+echo "== $CASE: body PAE at fuzz 0 (must be <= 257 = one 8-bit step) =="
+compare -metric PAE \
+  <(convert "$PARITY_OUT/$CASE-gl.png"  -crop 1000x661+0+32 +repage png:-) \
+  <(convert "$PARITY_OUT/$CASE-cpu.png" -crop 1000x661+0+32 +repage png:-) \
+  null: 2>&1 || true; echo
 compare "$PARITY_OUT/$CASE-gl.png" "$PARITY_OUT/$CASE-cpu.png" \
   "$PARITY_OUT/$CASE-diff.png" 2>/dev/null || true
 
@@ -454,7 +468,7 @@ The ink-coverage check matters: if PureCpu draws no image, the diff is large *an
 ```bash
 cd /scratch/oetiker/wezterm/tools/purecpu-parity
 chmod +x corpus/images.sh compare-case.sh
-FUZZ=<value from noise-floor.md> ./compare-case.sh images "$PWD/corpus/images.sh"
+FUZZ=1 ./compare-case.sh images "$PWD/corpus/images.sh"
 ```
 
 - [ ] **Step 4: Inspect captures and classify**
@@ -521,7 +535,7 @@ both variants run through the same path:
 ```bash
 cd /scratch/oetiker/wezterm/tools/purecpu-parity
 chmod +x corpus/chrome.sh
-FANCY=true SPAWN_TABS=true FUZZ=<value> ./compare-case.sh chrome "$PWD/corpus/chrome.sh"
+FANCY=true SPAWN_TABS=true FUZZ=1 ./compare-case.sh chrome "$PWD/corpus/chrome.sh"
 ```
 
 - [ ] **Step 3: Run the retro tab bar case**
@@ -529,7 +543,7 @@ FANCY=true SPAWN_TABS=true FUZZ=<value> ./compare-case.sh chrome "$PWD/corpus/ch
 The fancy and retro tab bars are different draw paths, so both are covered:
 
 ```bash
-FANCY=false SPAWN_TABS=true FUZZ=<value> ./compare-case.sh chrome-retro "$PWD/corpus/chrome.sh"
+FANCY=false SPAWN_TABS=true FUZZ=1 ./compare-case.sh chrome-retro "$PWD/corpus/chrome.sh"
 ```
 
 This writes `chrome-retro-gl.png`, `chrome-retro-cpu.png`, and
@@ -577,7 +591,7 @@ With `cursor_blink_rate = 0` (already pinned), the cursor is steady, so the stan
 ```bash
 cd /scratch/oetiker/wezterm/tools/purecpu-parity
 chmod +x corpus/cursor.sh
-FUZZ=<value> ./compare-case.sh cursor "$PWD/corpus/cursor.sh"
+FUZZ=1 ./compare-case.sh cursor "$PWD/corpus/cursor.sh"
 ```
 
 - [ ] **Step 3: Write `tools/purecpu-parity/sample-animation.sh`**
