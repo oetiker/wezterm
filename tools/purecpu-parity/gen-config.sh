@@ -6,6 +6,8 @@
 #        TEXT_BLINK_RATE=<ms>      (default 0 = disabled, matches Tasks 1-4)
 #        ANIMATION_FPS=<n>         (default 1, matches Tasks 1-4)
 #        DEFAULT_CURSOR_STYLE=<s>  (default SteadyBlock, matches Tasks 1-4)
+#        VISUAL_BELL=true|false    (default false; adds a 300ms/300ms fade
+#                                    visual_bell block when true, Task 6)
 #
 # The blink/animation defaults below are off (SteadyBlock, rates 0, fps 1)
 # because Tasks 1-4 measured a deliberately static terminal — that was the
@@ -68,6 +70,11 @@ CURSOR_BLINK_RATE="${CURSOR_BLINK_RATE:-0}"
 TEXT_BLINK_RATE="${TEXT_BLINK_RATE:-0}"
 ANIMATION_FPS="${ANIMATION_FPS:-1}"
 DEFAULT_CURSOR_STYLE="${DEFAULT_CURSOR_STYLE:-SteadyBlock}"
+# Default false so every existing Tasks 1-5 case (which never sets this)
+# reproduces byte-for-byte unchanged; Task 6 sets it to exercise the visual
+# bell's fade-mix path (render/mod.rs:233-258), which is otherwise never
+# emitted by this generator.
+VISUAL_BELL="${VISUAL_BELL:-false}"
 
 # (fix round 3, NEW-8) A non-zero CURSOR_BLINK_RATE with DEFAULT_CURSOR_STYLE
 # left at SteadyBlock is not a harmless no-op, it's a silent trap: wezterm
@@ -167,6 +174,9 @@ CONFIG_LINES=(
 )
 if [ -n "$WINDOW_DECORATIONS" ]; then
   CONFIG_LINES+=("  window_decorations = '${WINDOW_DECORATIONS}',")
+fi
+if [ "$VISUAL_BELL" = "true" ]; then
+  CONFIG_LINES+=("  visual_bell = { fade_in_duration_ms = 300, fade_out_duration_ms = 300 },")
 fi
 CONFIG_LINES+=(
   "  audible_bell = 'Disabled',"
