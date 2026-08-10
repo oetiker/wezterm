@@ -132,7 +132,10 @@ export XAUTHORITY="$PARITY_XAUTH"
 mkdir -p "$PARITY_OUT"
 
 # Foreground sleep is unavailable in this harness environment; block on timeout.
-pause() { timeout "$1" cat </dev/null || true; }
+# NOTE: `timeout N cat </dev/null` does NOT wait — cat hits EOF immediately and
+# returns in 0s, turning every retry loop into a spin. `tail -f /dev/null` blocks
+# until the timeout fires, which is what we need. Verified on this machine.
+pause() { timeout "$1" tail -f /dev/null || true; }
 
 launch() {  # launch <class> <config> <shell-command>
   local class="$1" config="$2" cmd="$3"
@@ -414,11 +417,22 @@ FUZZ="${FUZZ:?set FUZZ from docs/purecpu-review/noise-floor.md}"
 "$PARITY_DIR/gen-config.sh" PureCpu "$PARITY_OUT/purecpu.lua"
 kill_class "par-$CASE-gl"; kill_class "par-$CASE-cpu"
 
-launch "par-$CASE-gl"  "$PARITY_OUT/opengl.lua"  "$CORPUS"
+# CRITICAL: capture ONE window at a time. Task 3 established that running both
+# simultaneously leaves one window unfocused, and wezterm draws a hollow cursor
+# when unfocused versus a solid block when focused. That injects a full
+# character cell of difference which survives 12% fuzz — it looks exactly like
+# the whole-cell rendering defect the comparison is meant to detect.
+# Launch -> capture -> kill, then the next backend, so every capture is taken
+# while its window holds focus.
+launch "par-$CASE-gl" "$PARITY_OUT/opengl.lua" "$CORPUS"
+GL=$(find_window "par-$CASE-gl")
+capture_settled "$GL" "$PARITY_OUT/$CASE-gl.png" || echo "WARN: gl never settled"
+kill_class "par-$CASE-gl"
+
 launch "par-$CASE-cpu" "$PARITY_OUT/purecpu.lua" "$CORPUS"
-GL=$(find_window "par-$CASE-gl"); CPU=$(find_window "par-$CASE-cpu")
-capture_settled "$GL"  "$PARITY_OUT/$CASE-gl.png"  || echo "WARN: gl never settled"
+CPU=$(find_window "par-$CASE-cpu")
 capture_settled "$CPU" "$PARITY_OUT/$CASE-cpu.png" || echo "WARN: cpu never settled"
+kill_class "par-$CASE-cpu"
 
 echo "== $CASE: differing pixels at fuzz ${FUZZ}% =="
 compare -metric AE -fuzz "${FUZZ}%" \
@@ -431,7 +445,6 @@ for side in gl cpu; do
   printf '%s ink stddev: ' "$side"
   convert "$PARITY_OUT/$CASE-$side.png" -format '%[standard-deviation]' info:; echo
 done
-kill_class "par-$CASE-gl"; kill_class "par-$CASE-cpu"
 ```
 
 The ink-coverage check matters: if PureCpu draws no image, the diff is large *and* its stddev is markedly lower. That distinguishes "missing" from "degraded".
