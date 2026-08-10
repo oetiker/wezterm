@@ -99,3 +99,55 @@ compare "$GL_PNG" "$CPU_PNG" "$PARITY_OUT/plain-diff.png" 2>/dev/null || true
 compare -fuzz 1% "$GL_PNG" "$CPU_PNG" "$PARITY_OUT/plain-diff-fuzz1.png" 2>/dev/null || true
 echo "wrote $PARITY_OUT/plain-diff.png       (every differing pixel)"
 echo "wrote $PARITY_OUT/plain-diff-fuzz1.png (only differences above the 1% noise floor)"
+echo
+
+# ---------------------------------------------------------------------------
+# Calibrated assertions on the terminal body.
+#
+# BODY_PAE_MAX is the sharp one. The calibrated fact is not "few body pixels
+# differ" but "no body pixel differs by more than one 8-bit step", so a peak
+# deviation above 257 (1 LSB at Q16) is a finding whatever the pixel count says.
+# It is strictly stronger than any fuzz threshold: a uniform +1/255 body-wide
+# brightness error is invisible at both fuzz 1% and fuzz 3%, but raises PAE to
+# 514 and trips this check.
+#
+# BODY_FUZZ is the count-based companion at FUZZ=1. Measured sensitivity of a
+# uniform body-wide offset (see docs/purecpu-review/noise-floor.md): fuzz 1%
+# reports 0 px at +1/255, 1492 px at +2/255 and 660134 px at +3/255, whereas
+# fuzz 3% stays at 0 px all the way through +6/255. Hence 1, not 3.
+#
+# Raw fuzz-0 AE is printed next to the fuzzed count so sub-threshold drift stays
+# visible instead of being silently zeroed.
+# ---------------------------------------------------------------------------
+: "${BODY_PAE_MAX:=257}"
+: "${BODY_FUZZ:=1}"
+
+body_pae_raw=$(compare -metric PAE "$work/body-gl.png" "$work/body-cpu.png" null: 2>&1 || true)
+body_pae=${body_pae_raw%% *}
+body_ae0=$(ae "$work/body-gl.png" "$work/body-cpu.png")
+body_ae=$(ae "$work/body-gl.png" "$work/body-cpu.png" "${BODY_FUZZ}%")
+
+echo "== assertions (terminal body, y >= $TAB_H) =="
+echo "raw AE at fuzz 0 : $body_ae0   (reported for drift visibility, not asserted)"
+
+status=0
+if [ "${body_pae%%.*}" -le "$BODY_PAE_MAX" ]; then
+  echo "PASS  body PAE $body_pae <= $BODY_PAE_MAX (no pixel off by more than 1 LSB)"
+else
+  echo "FAIL  body PAE $body_pae > $BODY_PAE_MAX -- a pixel differs by more than 1 LSB"
+  status=1
+fi
+if [ "$body_ae" -eq 0 ]; then
+  echo "PASS  body AE at fuzz ${BODY_FUZZ}% is 0"
+else
+  echo "FAIL  body AE at fuzz ${BODY_FUZZ}% is $body_ae, expected 0"
+  status=1
+fi
+
+if [ "$status" -ne 0 ]; then
+  echo
+  echo "Body differs beyond the calibrated noise floor. This is a finding, not a"
+  echo "threshold to relax. Check first that both captures were taken while their"
+  echo "window held focus -- a focus mismatch alone drives body PAE to 53456."
+fi
+exit "$status"

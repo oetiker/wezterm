@@ -1,6 +1,7 @@
 # PureCpu / OpenGL noise floor
 
-**Task 3 (gate) — outcome: PROCEED for the terminal body with `FUZZ = 3`, STOP for the tab-bar strip.**
+**Task 3 (gate) — outcome: PROCEED for the terminal body with `FUZZ = 1` plus a
+body `PAE <= 257` assertion, STOP for the tab-bar strip.**
 
 Two problems surfaced during calibration, and neither may be absorbed into a
 threshold. One is a defect in the *harness* that silently faked a whole-cell
@@ -21,11 +22,20 @@ terminal body is a textbook noise floor and the rest of the review can proceed.
 
 Task 2 launched both windows at the same time and captured both. Only one X11
 window can hold focus, so one capture was of a focused window and the other of
-an unfocused one. wezterm renders two things differently when unfocused: **the
-cursor becomes a hollow outline instead of a solid block**, and the fancy tab bar
-switches to its inactive titlebar colours. The Task 2 pair
-(`out/plain-gl.png`, `out/plain-cpu.png`) is focus-mismatched — the PureCpu
-window held focus, the OpenGL window did not.
+an unfocused one. When the window is unfocused **wezterm draws the cursor as a
+hollow outline instead of a solid block** (`render/mod.rs:709-718` maps a block
+cursor to `CursorShape::Default` only when `focused_and_active`, and
+`customglyph.rs:5080-5100` fills the cell for `Default` but strokes an outline
+for `SteadyBlock`). The Task 2 pair (`out/plain-gl.png`, `out/plain-cpu.png`) is
+focus-mismatched — the PureCpu window held focus, the OpenGL window did not.
+
+The cursor is the *only* thing that changes here. wezterm does have a separate
+focus-dependent path for the fancy tab bar's titlebar colours, but under the
+harness config `active_titlebar_bg` and `inactive_titlebar_bg` are both the
+default `#333333`, so it produces no visible change: the measured tab-strip
+contribution is **AE = 0** for both backends between their focused and unfocused
+captures. The full 160-pixel delta is the cursor cell, and it lies in the
+terminal body, not the tab strip.
 
 The effect is not subtle: it contributes an **exactly 8x20 solid rectangle**, one
 full character cell, at the cursor position (x 1-9, y 166-186). That is precisely
@@ -34,9 +44,10 @@ artefact of how the captures were taken.
 
 ### Evidence
 
-Two runs were made, differing only in launch order (under `marco` the
-last-mapped window takes focus; `_NET_ACTIVE_WINDOW` confirmed the winner each
-time):
+Regenerate everything in this section with
+`tools/purecpu-parity/focus-probe.sh`. It makes two runs, differing only in
+launch order (under `marco` the last-mapped window takes focus;
+`_NET_ACTIVE_WINDOW` confirmed the winner each time):
 
 | run | launch order | focused window |
 |-----|--------------|----------------|
@@ -57,6 +68,14 @@ Cross-comparing the four captures separates focus from backend cleanly:
 The arithmetic closes exactly: 2622 + 160 = 2782. The 160-pixel cursor cell is
 contributed by focus alone, and each backend on its own shows the *same*
 160-pixel change when focus is taken away.
+
+Split by region, that delta is entirely in the terminal body — the tab strip does
+not move at all, confirming the titlebar-colour path contributes nothing here:
+
+| same backend, focus differs | tab strip AE | body AE |
+|---|---|---|
+| OpenGL focused vs unfocused | 0 | 160 |
+| PureCpu focused vs unfocused | 0 | 160 |
 
 ![cursor vs focus](../../tools/purecpu-parity/out/noise-floor-cursor-focus.png)
 
@@ -98,11 +117,17 @@ OpenGL image reproduces it exactly:
 An AE of exactly 0 over a 12x12 block means those pixels are bit-identical once
 shifted — a pure integer offset, not a rounding difference.
 
-The displacement is **per-glyph-run, not global**: rolling the whole tab strip by
-one pixel makes the match worse (dx=0 gives AE 164, dx=-1 gives 387), so most of
-the title is aligned and only some glyph runs land one pixel early. That is the
-signature of a horizontal glyph-positioning/rounding difference in the fancy tab
-bar text path, not of a shifted tab bar.
+The displacement is **per-glyph-run, not global**. Sliding the whole title by a
+global `dx` — comparing OpenGL at crop `62x12+8+12` against PureCpu at crop
+`62x12+(8-dx)+12`, i.e. the full title band x 8-69, y 12-23 — is best at `dx=0`:
+
+| dx | -2 | -1 | 0 | 1 | 2 |
+|---|---|---|---|---|---|
+| AE | 436 | 387 | **164** | 196 | 409 |
+
+So most of the title is aligned and only some glyph runs land one pixel early.
+That is the signature of a horizontal glyph-positioning/rounding difference in
+the fancy tab bar text path, not of a shifted tab bar.
 
 ![tab bar zoom](../../tools/purecpu-parity/out/noise-floor-tabbar-zoom.png)
 
@@ -168,13 +193,18 @@ rows containing text, and within those rows to antialiased glyph edges.
 
 ### Channel balance
 
+Body region only, consistent with the 1-LSB headline above:
+
 | channel | AE | PAE |
 |---|---|---|
-| Red   | 2535 | 49344 |
-| Green | 2529 | 49344 |
-| Blue  | 2536 | 49344 |
+| Red   | 2347 | 257 |
+| Green | 2341 | 257 |
+| Blue  | 2348 | 257 |
 
-Spread of 7 counts across 2535 (0.3%) — no channel bias. The signed means are
+(The whole-frame figures are AE 2535/2529/2536 with PAE 49344 in every channel;
+that PAE is Finding 2 in the tab strip, not a body deviation.)
+
+Spread of 7 counts across 2347 (0.3%) — no channel bias. The signed means are
 symmetric as well (mean of `gl-cpu` = 4.14e-05, mean of `cpu-gl` = 4.44e-05), so
 neither backend is systematically brighter; PureCpu's sRGB/linear round trip
 rounds in both directions roughly equally.
@@ -203,43 +233,110 @@ additional solid cursor block from Finding 1.
 
 ## Decision
 
-**`FUZZ = 3`** (percent), for the terminal body region only.
+Later tasks apply **three** checks to the terminal body, not one:
 
-Reasoning, following the gate rule:
+1. **`FUZZ = 1`** (percent) — body AE at 1% fuzz must be 0.
+2. **body `PAE <= 257` at fuzz 0** — the sharp check.
+3. **report raw fuzz-0 AE alongside** the fuzzed count, so sub-threshold drift
+   stays visible instead of being silently zeroed.
 
-- Differences in the body concentrate on glyph edges — confirmed both by metrics
-  (`PAE` = 1 LSB; zero differences in the empty background) and by looking at the
-  heat map.
-- The count collapses sharply: 2434 -> 0 between 0.25% and 0.5% fuzz. The
-  smallest percentage at which it reaches zero is 0.5%; rounding that up to the
-  nearest whole percent gives 1%, plus the specified 2 points of margin gives
-  **3%**. There is generous headroom — the body count stays at 0 all the way to
-  50%, so 3% is nowhere near a tuned-to-taste threshold.
-- No channel bias, no uniform background shift, no whole-cell difference once
-  the focus confound is removed.
+All three are mechanised in `calibrate.sh`, which exits non-zero if (1) or (2)
+fails. On the focus-matched pair it reports `PASS body PAE 257 <= 257` and
+`PASS body AE at fuzz 1% is 0`; on the uncorrected Task 2 pair it fails both.
+
+### Why the pixel-count threshold is 1 and not 3
+
+The obvious reading of the gate rule — smallest fuzz where the count reaches
+zero (0.5%), rounded up (1%), plus 2 points of margin — gives 3%. **That margin
+is far too expensive here.** Fuzz is a distance threshold, so raising it does not
+merely tolerate more antialiasing noise; it makes the comparison blind to *any*
+deviation below the threshold, including a perfectly uniform one across the
+entire body.
+
+Measured by injecting a uniform brightness offset into the PureCpu body
+(`convert body-cpu.png -evaluate Add $((n*257))`, Q16, so `n*257` is exactly
+n/255 at 8-bit) and re-running the comparison:
+
+| injected offset | AE @ fuzz 1% | AE @ fuzz 3% | body PAE @ fuzz 0 |
+|---|---|---|---|
+| +1/255 | 0 | 0 | 514 |
+| +2/255 | 1492 | 0 | 771 |
+| +3/255 | **660134** | 0 | 1028 |
+| +4/255 | 661000 | 0 | 1285 |
+| +5/255 | 661000 | 0 | 1542 |
+| +6/255 | 661000 | **0** | 1799 |
+| +7/255 | 661000 | 1492 | 2056 |
+| +8/255 | 661000 | 660134 | 2313 |
+
+At `FUZZ = 3` a uniform body-wide error of up to +6/255 — roughly 2.4% — reports
+**zero differing pixels out of 661000**. That is precisely the defect class most
+plausible in a new software rasteriser (an sRGB/linear round-trip or blend-weight
+error), and precisely what Task 4 most needs to detect. `FUZZ = 1` catches such
+an error from +3/255 upward and partially at +2/255, while still reporting 0 on
+the real floor — it remains about 2.5x the measured 1-LSB floor, so it is margin
+against noise, not a tuned-to-taste number.
+
+### Why the PAE assertion matters more than either
+
+The calibrated fact is not "few body pixels differ" but **"no body pixel differs
+by more than one 8-bit step"** (`PAE = 257` at Q16). Asserting that directly is
+strictly stronger than any fuzz threshold: the rightmost column above shows PAE
+rising at *every* injected level, including the uniform +1/255 that both `FUZZ =
+1` and `FUZZ = 3` miss entirely. A comparison whose body PAE exceeds 257 is a
+finding regardless of how few pixels are involved.
+
+The supporting evidence for the floor itself is unchanged: differences
+concentrate on glyph edges (confirmed by metrics and by looking at the heat map),
+the empty background is untouched, there is no channel bias, and no whole-cell
+difference survives once the focus confound is removed.
 
 **Scope limits that later tasks must respect:**
 
-1. `FUZZ = 3` applies to the **terminal body (y >= 32) only**. The tab strip has
-   an open defect (Finding 2) that no fuzz value hides; do not raise `FUZZ` to
-   make the tab strip pass.
-2. `FUZZ = 3` is only valid for **focus-matched captures**. Applied to a
-   focus-mismatched pair it would let a whole-cell cursor difference through (the
-   160-px cursor cluster survives 12% fuzz). The harness fix in Finding 1 is a
-   precondition for every subsequent comparison task.
+1. These thresholds apply to the **terminal body (y >= 32) only**. The tab strip
+   has an open defect (Finding 2) that no fuzz value hides; do not raise `FUZZ`
+   to make the tab strip pass.
+2. They are only valid for **focus-matched captures**. On a focus-mismatched pair
+   the whole-cell cursor difference survives 12% fuzz and drives body PAE to
+   53456. The harness fix in Finding 1 is a precondition for every subsequent
+   comparison task.
 3. The floor was measured on static plain text. Tasks introducing inline images
    or animation should re-check that their content does not have a different
-   floor before trusting 3%.
+   floor before trusting these numbers.
+4. **Never raise `FUZZ` to make a case pass.** If a comparison fails, the
+   thresholds are doing their job; the table above is what a relaxed threshold
+   costs.
 
 ## Reproducing
 
 ```bash
 cd /scratch/oetiker/wezterm/tools/purecpu-parity
 export PARITY_XAUTH=<path to the :20 Xauthority>
-./calibrate.sh                                    # Task 2 pair (focus-mismatched)
-./calibrate.sh out/focus-B-gl.png out/focus-A-cpu.png   # focus-matched pair
+
+# Regenerate the four focus-{A,B}-{gl,cpu}.png captures, all Finding 1 and
+# Finding 2 evidence tables, and every figure embedded in this document.
+./focus-probe.sh
+
+# Metrics, fuzz sweep and assertions.
+./calibrate.sh out/focus-B-gl.png out/focus-A-cpu.png   # focus-matched -> exit 0
+./calibrate.sh                                          # Task 2 pair   -> exit 1
 ```
 
-`out/` is gitignored, so the PNGs referenced above are run artifacts rather than
-committed files; the focus-matched captures were produced by launching the two
-backends in each order and capturing both windows.
+`out/` is gitignored, so every PNG referenced above is a run artifact rather than
+a committed file — hence `focus-probe.sh`, which regenerates all of them from
+nothing. It is the one script that deliberately launches both backends at the
+same time, because that is how the focus mismatch is produced on purpose in order
+to measure it; production comparison drivers must capture one window at a time.
+
+The injected-defect table is reproduced with:
+
+```bash
+cd /scratch/oetiker/wezterm/tools/purecpu-parity/out
+convert focus-B-gl.png  -crop 1000x661+0+32 +repage /tmp/bg.png
+convert focus-A-cpu.png -crop 1000x661+0+32 +repage /tmp/bc.png
+for n in 1 2 3 4 5 6 7 8; do
+  convert /tmp/bc.png -evaluate Add $((n*257)) -depth 8 /tmp/inj.png
+  echo "+$n/255 fuzz1=$(compare -metric AE -fuzz 1% /tmp/bg.png /tmp/inj.png null: 2>&1)" \
+       "fuzz3=$(compare -metric AE -fuzz 3% /tmp/bg.png /tmp/inj.png null: 2>&1)" \
+       "PAE=$(compare -metric PAE /tmp/bg.png /tmp/inj.png null: 2>&1)"
+done
+```
