@@ -66,12 +66,16 @@ by a second, and fix-looped to a clean re-review. The ledger is authoritative.
   implementer `task8-impl`, BASE `17f8677`. Check the ledger before assuming it
   is unstarted or complete.
 
-Task 7 produced findings the parity harness was structurally blind to, because
-the harness only ever captured a single settled full-window state: **dirty
+Task 7 produced findings the parity harness was structurally blind to: **dirty
 tracking consults only the active pane** (other panes of a split never repaint
 until something forces a full repaint), and **dirty-rect geometry omits
 `pos.top`/`pos.left`** (even the active pane freezes when not at the window's
 top-left). For a user of this fork these may matter more than the matrix does.
+The blindness is **not** that captures were settled — Task 4 added a
+non-settling sampler. It is that every case put the content under test in a
+single full-width pane, where both offsets are zero and the active pane is the
+only one with live output (`findings.md:244-245`). A corpus can be blind along
+an axis nobody thought to vary, not only along the axis a tool cannot see.
 
 The wide-sixel label-row anomaly the plan carried since Task 4 is **diagnosed**:
 PureCpu composites cell 0's glyph pixels twice (a coverage model predicts all 87
