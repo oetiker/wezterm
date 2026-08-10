@@ -23,6 +23,8 @@
 - **Comparisons capture ONE window at a time** (launch → find_window → capture_settled → kill_class → next backend). Simultaneous capture leaves one window unfocused, and wezterm draws a hollow cursor when unfocused versus a solid block when focused — a whole-cell artifact that survives 12% fuzz and mimics a real defect.
 - **`FUZZ = 1`, not 3**, for the terminal body, plus a body `PAE <= 257` assertion at fuzz 0 and the raw fuzz-0 AE reported alongside. Measured: at fuzz 3 a uniform +6/255 body-wide brightness error reports zero differing pixels. Never raise `FUZZ` to make a case pass.
 - The tab-bar strip (y < 32) has an open defect no fuzz absorbs (PureCpu draws some title glyph runs 1px left). Do not fold it into a threshold; it belongs to Task 5.
+- **A corpus must be able to trigger the defect its row claims to test.** Task 4's original corpus requested every image at its *native* pixel size, which makes `blit_w = tex_w.min(dest_w)` (`purecpu.rs:346`) a no-op, so it measured `parity` for a defect it could not reach. Human ruling (2026-08-10): the corpus may be extended past the plan's verbatim text when it cannot exercise the behaviour under test. The real trigger condition is "requested display size differs from the sprite's native size, or the sprite was downscaled by `AllowImage::Scale`" — not cell-grid alignment.
+- **`capture_settled` cannot measure animation**: it defines success as two consecutive captures being identical, so it structurally excludes anything time-driven. Time-driven rows (animated GIF, cursor blink, blink attribute, visual bell) must be measured by *sampling* a region repeatedly, not by settling. Task 4 adds the sampling helper; Tasks 5-6 reuse it.
 
 ---
 
