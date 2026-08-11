@@ -85,8 +85,8 @@ fn collect_clip_rects(
 ) {
     out.clear();
     for r in rects {
-        let rx2 = r.x + r.width;
-        let ry2 = r.y + r.height;
+        let rx2 = r.x.saturating_add(r.width);
+        let ry2 = r.y.saturating_add(r.height);
         if dest_x < rx2 && dest_x2 > r.x && dest_y < ry2 && dest_y2 > r.y {
             out.push([
                 dest_x.max(r.x),
@@ -137,7 +137,8 @@ fn coalesce_to_bands(rects: &[DirtyRect], screen_width: u32) -> Vec<DirtyRect> {
     }
 
     // Collect all y-ranges
-    let mut y_ranges: Vec<(i32, i32)> = rects.iter().map(|r| (r.y, r.y + r.height)).collect();
+    let mut y_ranges: Vec<(i32, i32)> =
+        rects.iter().map(|r| (r.y, r.y.saturating_add(r.height))).collect();
     y_ranges.sort_by_key(|r| r.0);
 
     // Merge overlapping y-ranges
@@ -157,7 +158,7 @@ fn coalesce_to_bands(rects: &[DirtyRect], screen_width: u32) -> Vec<DirtyRect> {
             x: 0,
             y,
             width: screen_width as i32,
-            height: y2 - y,
+            height: y2.saturating_sub(y),
         })
         .collect()
 }
@@ -539,6 +540,11 @@ impl crate::TermWindow {
                 };
                 let offset = y * fb_w * 4;
                 let size = h * fb_w * 4;
+                debug_assert!(
+                    offset + size <= state.frame_buffer.len(),
+                    "band {y}+{h} exceeds framebuffer {} — fb_w/height disagree with the buffer length",
+                    state.frame_buffer.len()
+                );
                 if offset + size <= state.frame_buffer.len() {
                     window.present_software_frame_region(
                         &state.frame_buffer[offset..offset + size],
@@ -788,15 +794,35 @@ mod test {
     #[test]
     fn clear_rect_survives_a_negative_extent() {
         // The other half of M7: (rect.x + rect.width) is cast to usize AFTER
-        // .min(), so a negative sum wraps to a huge x1 rather than clamping to
-        // zero.  The `row_end <= fb.len()` guard then silently skips the row —
-        // which is the "silently not drawn" symptom the finding names.
+        // .min(), so a negative sum wraps to a huge x1.  In a debug build the
+        // index arithmetic then panics with "attempt to multiply with overflow"
+        // at the `row_end` computation; in release it wraps quietly and the
+        // `row_end <= fb.len()` guard skips the row — the "silently not drawn"
+        // symptom.  Both are fixed by clamping in i32 before the cast.
         let fb_w = 4usize;
         let fb_h = 3usize;
         let mut fb = vec![0xFFu8; fb_w * fb_h * 4];
         let rect = DirtyRect { x: -10, y: 0, width: 2, height: 1 };
         clear_rect(&mut fb, fb_w, fb_h, &rect);
         assert!(fb.iter().all(|&b| b == 0xFF), "off-screen rect touched pixels");
+    }
+
+    #[test]
+    fn clear_rect_clamps_a_rect_straddling_the_bottom_right_corner() {
+        // The pair above cover total rejection and the pre-existing test covers
+        // total acceptance; without a straddling rect nothing distinguishes
+        // "clamp to the visible part" from "skip the whole rect", which is the
+        // entire content of the M7 fix.
+        let (fb_w, fb_h) = (4usize, 3usize);
+        let mut fb = vec![0xFFu8; fb_w * fb_h * 4];
+        clear_rect(&mut fb, fb_w, fb_h, &DirtyRect { x: 2, y: 1, width: 5, height: 5 });
+        for y in 0..fb_h {
+            for x in 0..fb_w {
+                let i = (y * fb_w + x) * 4;
+                let cleared = fb[i..i + 4] == [0, 0, 0, 0];
+                assert_eq!(cleared, x >= 2 && y >= 1, "pixel ({x},{y})");
+            }
+        }
     }
 
     #[test]
