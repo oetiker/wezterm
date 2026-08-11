@@ -137,6 +137,26 @@ the plan is done and what follows is all their call.
   showing the bell and blink text return at the GPU path's own levels. Prefer
   "change one thing and watch the defect disappear" over accumulating more
   observations of the defect. It converts "we observed X" into "X is caused by Y".
+- **Put the control INSIDE the capture.** The DECDWL corpus printed the same
+  text as an explicit single-width line *and* as a doubled one in one frame, so
+  the control read PAE=257 in the same capture the subject read 45232. A null
+  result then cannot pass as parity, because the frame proves the instrument was
+  working. Cheaper and stronger than any amount of after-the-fact argument.
+- **"Should we measure this?" is really "does this conclusion depend on a runtime
+  precondition nobody checked?"** Both by-reading verdicts this plan overturned
+  failed on preconditions, not mechanisms — the code readings were right, the
+  reachability wasn't tested. That test also says when NOT to measure: for scaled
+  fallback glyphs the precondition is font-dependent, so a null result would
+  prove nothing and would risk manufacturing a false `parity`. Measuring is not
+  automatically the safer choice.
+- **Fix the stale cell; don't add a rule for reading around it.** When a Method
+  column contradicted its own Evidence, the implementer proposed a precedence
+  clause ("Evidence wins"). That institutionalises the inconsistency and invites
+  readers to hunt for others. Correct the data.
+- **When a number has been wrong twice, mandate derivation over dictation — including
+  over your own.** I told the implementer to re-derive a count from the table
+  rather than take my arithmetic; my figure was wrong and its derived one was
+  right. A controller who dictates numbers becomes another unverified source.
 - **A printed command that nobody re-runs is a lie waiting to happen.** This has
   now happened **five** times, and twice the wrong numbers were the reassuring
   ones. The latest: the sole Critical's reproduce block used `pgrep | head -1`,
@@ -221,8 +241,9 @@ the plan is done and what follows is all their call.
 - Plan: `docs/superpowers/plans/2026-08-10-purecpu-parity-review.md` — the
   Global Constraints block at the top carries every generalised lesson
 - Progress ledger: `.superpowers/sdd/2026-08-10-purecpu-parity-review/progress.md`
-  — **authoritative on task completion**, and carries all deferred minors that
-  Task 8 and the final whole-branch review must triage
+  — **authoritative on task completion**, and carries the ~12 deferred minors
+  that a future whole-branch review should triage (Task 8 triaged its own; the
+  ledger records which were fixed and which were deliberately left, with reasons)
 - Per-task briefs/reports/reviews: same directory,
   `task-N-{brief,report,review,rereview*,fix-round-*}.md`
 - `docs/purecpu-review/parity-matrix.md` — the parity deliverable
@@ -246,8 +267,17 @@ the plan is done and what follows is all their call.
 - **Upstream PR wezterm/wezterm#8043** (OSC 52) is open. If it merges, this
   branch's `ef7b636` — the same fix as one commit — conflicts on the next
   rebase; dropping it is the right resolution.
-- The user has seen no review output yet beyond my summaries. Task 8 produces
-  the document they actually asked for.
+- **The user has still not read the deliverables** — only my summaries in
+  conversation. `docs/purecpu-review/README.md` exists and is finished; whether
+  it actually lands with them is untested, and their reaction is the one piece
+  of feedback this whole plan never got.
+- **Two rows still rest on code reading alone** (scaled fallback/bitmap glyphs,
+  subpixel antialiasing). Task 8's reviewer ruled both safe and gave reasons
+  worth keeping: subpixel AA has no runtime precondition, so the divergence
+  follows unconditionally; scaled glyphs depend on some installed font yielding
+  `glyph.scale != 1`, so a measurement could return a null result that proves
+  nothing — the exact mistake that produced Task 4's false `parity`. Do not
+  "just measure them" without answering that.
 
 ## 8. Staleness watch
 
@@ -258,7 +288,9 @@ the plan is done and what follows is all their call.
   handoff. Note `main` is upstream wezterm and legitimately runs ahead.
 - **Sibling worktrees / other workstreams may exist that this file cannot name** —
   anything started after the handoff commit is invisible here.
-- **Task 8 was in flight at this commit.** Its state is in the ledger, not here.
+- **Nothing was in flight at this commit** — the plan is closed and no subagent
+  is running. If you find uncommitted work in `tools/purecpu-parity/` or an
+  unreferenced `task-*.md`, it is from a session after this one, not this plan.
 - The `:20` X server and `marco` are ordinary user processes and may be gone.
   Verify with `DISPLAY=:20 XAUTHORITY=<path> xdpyinfo | grep dimensions`.
 - The scratchpad Xauthority path in §5 belongs to an earlier session; it was
