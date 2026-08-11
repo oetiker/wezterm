@@ -3,6 +3,8 @@ use crate::renderstate::VertexBuffer;
 use crate::selection::SelectionRange;
 use ::window::bitmaps::{BitmapImage, ImageTexture};
 use ::window::WindowOps;
+use mux::pane::PaneId;
+use std::collections::HashMap;
 use std::time::Instant;
 use termwiz::surface::SequenceNo;
 
@@ -31,8 +33,17 @@ pub struct PureCpuState {
     /// Last cursor position for tracking cursor movement
     pub last_cursor_y: Option<wezterm_term::StableRowIndex>,
     pub last_cursor_x: Option<usize>,
-    /// Last seqno for change detection
-    pub last_seqno: SequenceNo,
+    /// Last seqno for change detection, **per pane**.
+    ///
+    /// Each pane owns an independent `SequenceNo` counter (`TerminalState::seqno`,
+    /// starting at 1), so a single window-wide baseline is not merely imprecise —
+    /// it is wrong in both directions.  Comparing a busy background pane against
+    /// a quiet active pane's low seqno reports every row dirty every frame; the
+    /// reverse — a busy active pane (a TUI redrawing in place, so no viewport
+    /// scroll to force a full repaint) against a quiet background pane — makes
+    /// the background pane's next change compare below the baseline and never
+    /// repaint at all.  That second case is finding I1 surviving its own fix.
+    pub last_seqno_by_pane: HashMap<PaneId, SequenceNo>,
     /// Last selection range — force full repaint when it changes
     pub last_selection_range: Option<SelectionRange>,
     /// Last quantized cursor blink phase (true = visible) for
@@ -54,7 +65,7 @@ impl PureCpuState {
             last_resolved_viewport: None,
             last_cursor_y: None,
             last_cursor_x: None,
-            last_seqno: 0,
+            last_seqno_by_pane: HashMap::new(),
             last_selection_range: None,
             last_blink_visible: true,
         }
