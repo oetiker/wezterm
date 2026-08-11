@@ -122,7 +122,11 @@ pub fn painted_x_span(
         // Go all the way to the right edge if we're right-most.
         window_pixel_width as f32
     } else {
-        x + (cols as f32 * cw) + width_delta
+        // Association matters: render/pane.rs builds a rect of (x, width) and
+        // the right edge is `x + width`, so `cols*cw + width_delta` is summed
+        // FIRST and x is added last.  `(x + cols*cw) + width_delta` is a
+        // different f32 by up to an ulp, which is enough to flip a ceil.
+        x + ((cols as f32 * cw) + width_delta)
     };
 
     let x_i = x.floor() as i32;
@@ -344,14 +348,49 @@ mod tests {
         assert_eq!((s.x, s.width), (8, 14));
     }
 
-    /// The f32 arithmetic of `render/pane.rs`, in f64, as the oracle.
+    /// **Ground truth**: the `background_rect` of `render/pane.rs`, in the `f32`
+    /// the paint pass actually computes it in, as `(x, right)`.
     ///
     /// Transcribed from the `build_pane` copy at `render/pane.rs:606-646`, which
-    /// is an independent second copy of the same `background_rect` math (the
-    /// first is at :110-152).  `content_left` is the **unrounded**
-    /// `padding_left + border.left` the paint pass actually uses — taking it as
-    /// an `i32` here is what made this oracle structurally blind to the caller's
-    /// truncation.
+    /// is an independent second copy of the same math (the first is at
+    /// :110-152).  Term for term, **including association order**: the right
+    /// edge is `x + width`, and `width` is `(cols*cw) + width_delta`, so the
+    /// addition of `x` happens last.  `(x + cols*cw) + width_delta` is a
+    /// different `f32` and would make this a second approximation rather than
+    /// the reference.
+    ///
+    /// `content_left` is the **unrounded** `padding_left + border.left` the paint
+    /// pass uses — taking it as an `i32` is what made the old oracle structurally
+    /// blind to the caller's truncation.
+    fn painted_rect_reference_f32(
+        left_cells: i32,
+        cols: i32,
+        total_cols: i32,
+        content_left: f32,
+        cell_w: i32,
+        window_pixel_width: i32,
+    ) -> (f32, f32) {
+        let cw = cell_w as f32;
+        let cl = content_left;
+        let (x, width_delta) = if left_cells == 0 {
+            (0., cl + cw / 2.0)
+        } else {
+            (cl - cw / 2.0 + left_cells as f32 * cw, cw)
+        };
+        let width = if left_cells + cols >= total_cols {
+            window_pixel_width as f32 - x
+        } else {
+            cols as f32 * cw + width_delta
+        };
+        (x, x + width)
+    }
+
+    /// The same expression evaluated in `f64`, i.e. the **mathematically
+    /// intended** rect rather than the one that gets painted.
+    ///
+    /// This is NOT ground truth — see the module of assertions below.  It exists
+    /// only to bound how far the paint pass's `f32` accumulation has drifted from
+    /// the real value, which is a magnitude check, not a correctness one.
     fn painted_rect_reference(
         left_cells: i32,
         cols: i32,
@@ -382,12 +421,36 @@ mod tests {
         // space rather than trusting four hand-picked fixtures, all of which
         // happen to be numerically degenerate (see the report: the mutation the
         // brief proposed leaves three of them bit-identical).
-        // The fractional entries are the ones a `window_padding` expressed in
-        // cells, points or percent actually produces; every one of them is an
-        // exact binary fraction, so the f32 the implementation uses and the f64
-        // of this oracle are the same number and no epsilon slack is needed.
+        //
+        // TWO ORACLES, AND ONLY ONE OF THEM IS GROUND TRUTH.  What ends up on
+        // screen is the `f32` rect `render/pane.rs` computes — not the real
+        // number that expression denotes — so `painted_rect_reference_f32` is
+        // the reference and the superset assertion against it is STRICT.
+        // `painted_rect_reference` (f64) is a different approximation of the
+        // same expression; comparing against it needs slack, and getting that
+        // backwards would let a genuine 1 px miss through.  Note the corollary:
+        // because the span is computed from the same f32 value that is painted,
+        // f32 drift moves the paint and the span TOGETHER and cannot by itself
+        // cause a miss.  The f64 comparison is therefore a magnitude check on
+        // the paint pass's own accumulation, not a correctness check on this
+        // function.
+        //
+        // The padding axis carries three kinds of value on purpose:
+        //   integer      — what a pixel `window_padding` gives;
+        //   dyadic       — 4.5/5.25/5.75, exactly representable, so f32 and f64
+        //                  agree and the two oracles below coincide;
+        //   NON-dyadic   — 4.3/5.1/7.9/0.7/12.35, what a percent- or
+        //                  points-derived padding actually produces.  These are
+        //                  the representative case, and they are the only ones
+        //                  that can separate the f32 ground truth from the f64
+        //                  approximation.
+        let paddings: &[f64] = &[
+            0.0, 3.0, 4.0, 5.0, 12.0, // integer
+            4.5, 5.25, 5.75, // dyadic fractions
+            0.7, 4.3, 5.1, 7.9, 12.35, // NON-dyadic
+        ];
         for &cell_w in &[7, 8, 9, 10, 13] {
-            for &content_left in &[0.0f64, 3.0, 4.0, 4.5, 5.0, 5.25, 5.75, 12.0] {
+            for &content_left in paddings {
                 for &total_cols in &[30, 80, 81] {
                     let window_pixel_width =
                         total_cols * cell_w + (2.0 * content_left).round() as i32;
@@ -404,11 +467,21 @@ mod tests {
                                 cell_w,
                                 window_pixel_width,
                             );
+                            // GROUND TRUTH: the f32 rect the paint pass computes.
+                            let (px, pright) = painted_rect_reference_f32(
+                                left_cells,
+                                cols,
+                                total_cols,
+                                content_left as f32,
+                                cell_w,
+                                window_pixel_width,
+                            );
+                            // The mathematically intended rect, for drift only.
                             let (rx, rright) = painted_rect_reference(
                                 left_cells,
                                 cols,
                                 total_cols,
-                                content_left,
+                                content_left as f32 as f64,
                                 cell_w,
                                 window_pixel_width,
                             );
@@ -416,25 +489,41 @@ mod tests {
                                 "left={left_cells} cols={cols} total={total_cols} \
                                  content_left={content_left} cell_w={cell_w}"
                             );
+
+                            // --- STRICT, against ground truth -----------------
+                            // What is on screen is the f32 rect, so the superset
+                            // property is exact and takes no epsilon.
                             assert!(
-                                (s.x as f64) <= rx,
-                                "left edge {} is right of the painted {rx}: {ctx}",
+                                (s.x as f32) <= px,
+                                "left edge {} is right of the painted {px}: {ctx}",
                                 s.x
                             );
                             assert!(
-                                ((s.x + s.width) as f64) >= rright,
-                                "right edge {} is left of the painted {rright}: {ctx}",
+                                ((s.x + s.width) as f32) >= pright,
+                                "right edge {} is left of the painted {pright}: {ctx}",
                                 s.x + s.width
                             );
                             // and not wastefully wide: at most a pixel of slack
                             // on each side, which is all outward rounding needs.
                             assert!(
-                                (s.x as f64) > rx - 1.0
-                                    && ((s.x + s.width) as f64) < rright + 1.0,
+                                (s.x as f32) > px - 1.0
+                                    && ((s.x + s.width) as f32) < pright + 1.0,
                                 // This crate is edition 2018: an assert message
                                 // with no trailing argument is NOT a format
                                 // string, so pass ctx explicitly.
                                 "span is wider than outward rounding justifies: {}",
+                                ctx
+                            );
+
+                            // --- SLACK, against the f64 approximation ---------
+                            // Outward rounding alone can move an edge by up to
+                            // 1 px; 1.5 leaves room for representation drift and
+                            // still catches a floor/ceil flipped across an
+                            // integer boundary, which would cost ~2.
+                            assert!(
+                                (s.x as f64 - rx).abs() <= 1.5
+                                    && ((s.x + s.width) as f64 - rright).abs() <= 1.5,
+                                "span has drifted from the intended rect: {}",
                                 ctx
                             );
                         }
