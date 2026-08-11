@@ -29,6 +29,7 @@ for side in gl cpu; do
   launch "par-$CASE-$side" "$PARITY_OUT/$cfg" "$CORPUS"
   W=$(find_window "par-$CASE-$side")
   check_no_config_error "par-$CASE-$side"
+  check_bell_disabled "$PARITY_OUT/$cfg"
   pause 3
   printf '%s: ' "$side"
   sample_region "$W" "$GEOM" "$COUNT" "$INTERVAL"

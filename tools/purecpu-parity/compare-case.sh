@@ -28,12 +28,14 @@ kill_class "par-$CASE-gl"; kill_class "par-$CASE-cpu"
 launch "par-$CASE-gl" "$PARITY_OUT/opengl.lua" "$CORPUS"
 GL=$(find_window "par-$CASE-gl")
 check_no_config_error "par-$CASE-gl"
+check_bell_disabled "$PARITY_OUT/opengl.lua"
 capture_settled "$GL" "$PARITY_OUT/$CASE-gl.png" || echo "WARN: gl never settled"
 kill_class "par-$CASE-gl"
 
 launch "par-$CASE-cpu" "$PARITY_OUT/purecpu.lua" "$CORPUS"
 CPU=$(find_window "par-$CASE-cpu")
 check_no_config_error "par-$CASE-cpu"
+check_bell_disabled "$PARITY_OUT/purecpu.lua"
 capture_settled "$CPU" "$PARITY_OUT/$CASE-cpu.png" || echo "WARN: cpu never settled"
 kill_class "par-$CASE-cpu"
 
