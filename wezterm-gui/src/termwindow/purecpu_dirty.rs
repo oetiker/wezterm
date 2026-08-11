@@ -156,9 +156,11 @@ mod tests {
     }
 
     #[test]
-    fn cell_rect_rejects_columns_outside_the_pane() {
+    fn cell_rect_rejects_cells_outside_the_pane() {
         assert!(cell_rect(&split_right(), 2, -1).is_none());
         assert!(cell_rect(&split_right(), 2, 40).is_none());
+        assert!(cell_rect(&top_left(), -1, 0).is_none());
+        assert!(cell_rect(&split_bottom(), 12, 0).is_none());
     }
 
     #[test]
