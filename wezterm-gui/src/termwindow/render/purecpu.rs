@@ -597,6 +597,17 @@ impl crate::TermWindow {
                                     // that out_a is fg_a rather than tex_a.
                                     Some([0, 0, 0, 0]) => continue,
                                     None if out_a <= 0.0 => continue,
+                                    // Deliberate behaviour change, on a path no
+                                    // measured row covers: a covered pixel whose
+                                    // `fg_a` is 0 is now PAINTED under subpixel,
+                                    // where the old skip dropped it.  That is
+                                    // what GL does — the dual-source colour
+                                    // equation `dst = src*mask + dst*(1-mask)`
+                                    // never references `src.a` — and it is
+                                    // reachable, because `fg_a` is the
+                                    // blink/fade-eased mixed alpha, so fully
+                                    // faded text under an LCD render target is
+                                    // painted at full coverage on both arms.
                                     _ => {}
                                 }
 
@@ -753,6 +764,15 @@ fn blend_over_masked(
 /// | 2.0 IS_BG_IMAGE | none — `background.rs:562` allocates layer 0 | — |
 /// | 4.0 IS_GRAY_SCALE | none — every `set_grayscale` site is reached with `layer_num = 0` | — |
 ///
+/// Enumerated by **resolved argument, not by literal call text**: four helpers
+/// forward a `layer_num` parameter (`render/mod.rs:274,317,500`,
+/// `screen_line.rs:357`), so a grep for `allocate(1)` misses `borders.rs` and
+/// `box_model.rs:931` entirely — which is exactly how an earlier version of
+/// this table was wrong.  `populate_image_quad` (`render/mod.rs:448`, allocating
+/// at `:500`) is the fourth: it is parameterised too, but both of its callers
+/// pass 0 (`screen_line.rs:478`) and 2 (`:707`), so no image quad reaches
+/// sub-layer 1.
+///
 /// The IS_GLYPH mask is **linearised**, and this is the one place where
 /// PureCpu's "the atlas is already sRGB, leave it alone" rule does not hold.
 /// GL's atlas is an `SrgbTexture2d` (`renderstate.rs:113-116`,
@@ -772,6 +792,22 @@ fn blend_over_masked(
 /// Measured, not reasoned: with the raw bytes, a body pixel over the harness
 /// background read `(16,16,99)` against GL's `(16,16,49)` — precisely
 /// `linear_to_srgb` applied one time too many. See the Task 8 report.
+///
+/// **The linearised mask is quantised to 8 bits where GL carries it in float,
+/// and that costs at most 1 LSB — at any contrast.** `m8 = round(m*255)` gives
+/// `|m8/255 - m| <= 0.5/255` by construction, and the blend is linear in the
+/// mask, so the output error is `|src - dst| * dm <= 255 * 0.5/255 = 0.5` of a
+/// level. Verified exhaustively over every source, destination and attainable
+/// atlas byte: the worst observed difference is 1 LSB. This is why the subpixel
+/// rows show a raised `AE` at fuzz 0 (6489 against a 2458 baseline) while `PAE`
+/// sits at the noise floor and `AE` at 1% fuzz is 0 — those are sub-LSB
+/// differences, and there is no second mechanism hiding in them.
+///
+/// One consequence worth stating: atlas sRGB bytes `0..=6` all linearise to a
+/// mask of 0, so a faint glyph edge pixel GL keeps is dropped here. It is
+/// bounded by the same 0.5-level rule (the largest such GL mask is 0.46/255),
+/// because what low coverage loses is *relative* precision — which is precisely
+/// what does not matter when the absolute contribution is that small.
 #[inline]
 fn subpixel_mask(has_color: f32, tr: u8, tg: u8, tb: u8, ta: u8) -> Option<[u8; 4]> {
     #[inline]
