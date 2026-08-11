@@ -72,7 +72,9 @@ pub fn row_band(p: &PanePlacement, row_in_viewport: i32) -> Option<DirtyRect> {
 
 /// The horizontal extent of a pane's PAINTED background, in pixels.
 ///
-/// Mirrors `render/pane.rs:110-152`.  A pane's background is deliberately
+/// Mirrors the `background_rect` of `render/pane.rs`, which exists there twice
+/// — at :110-152 in `paint_pane` and again at :606-646 in `build_pane`, term for
+/// term identical.  A pane's background is deliberately
 /// oversized to fill out to the split edges, and the right-most pane is
 /// painted all the way to the window edge.  A dirty band narrower than this
 /// leaves the fringe — window padding, the half-cell split gutter, a trailing
@@ -84,54 +86,49 @@ pub struct PaneSpan {
     pub width: i32,
 }
 
-/// Halve a half-pixel value, rounding down (towards -inf).
-fn floor_half(v: i32) -> i32 {
-    v.div_euclid(2)
-}
-
-/// Halve a half-pixel value, rounding up (towards +inf).
-fn ceil_half(v: i32) -> i32 {
-    (v + 1).div_euclid(2)
-}
-
 /// Compute [`PaneSpan`] for a pane.
 ///
-/// `content_left` is `padding_left + border.left`, already truncated to an
-/// `i32` by the caller.  All arithmetic happens in *half-pixels* so that the
-/// `cell_width / 2.0` of the paint pass is exact for an odd `cell_w`; only the
-/// final conversion rounds, and it rounds **outward** — floor on the left edge,
-/// ceil on the right — so the span is always a superset of the painted rect.
-/// Over-covering costs a few repainted pixels; under-covering is the stale
-/// fringe this exists to prevent.
+/// `content_left` is `padding_left + border.left`, **unrounded** — the same
+/// `f32` the paint pass uses.  It must not be truncated by the caller: it feeds
+/// the *right* edge of the span (through `width_delta` for a left-most pane and
+/// through `x` for an interior one), so flooring it there shortens the span and
+/// leaves a stale column at the split gutter whenever `window_padding` is
+/// fractional, i.e. expressed in cells, points or percent.
+///
+/// The arithmetic is `f32`, term for term with `render/pane.rs`, so the value
+/// rounded here is bit-identical to the painted rect's rather than merely close
+/// to it.  Only the final conversion rounds, and it rounds **outward** — floor
+/// on the left edge, ceil on the right — so the span is always a superset of the
+/// painted rect.  Over-covering costs a few repainted pixels; under-covering is
+/// the stale fringe this exists to prevent.
 pub fn painted_x_span(
     left_cells: i32,
     cols: i32,
     total_cols: i32,
-    content_left: i32,
+    content_left: f32,
     cell_w: i32,
     window_pixel_width: i32,
 ) -> PaneSpan {
-    // `x` and `width_delta` of render/pane.rs, in half-pixels.
-    let (x2, width_delta2) = if left_cells == 0 {
-        (0, 2 * content_left + cell_w)
+    let cw = cell_w as f32;
+
+    // `x` and `width_delta` of render/pane.rs.
+    let (x, width_delta) = if left_cells == 0 {
+        (0., content_left + cw / 2.0)
     } else {
-        (
-            2 * content_left - cell_w + 2 * left_cells * cell_w,
-            2 * cell_w,
-        )
+        (content_left - cw / 2.0 + left_cells as f32 * cw, cw)
     };
 
-    let right2 = if left_cells + cols >= total_cols {
+    let right = if left_cells + cols >= total_cols {
         // Go all the way to the right edge if we're right-most.
-        2 * window_pixel_width
+        window_pixel_width as f32
     } else {
-        x2 + 2 * cols * cell_w + width_delta2
+        x + (cols as f32 * cw) + width_delta
     };
 
-    let x = floor_half(x2);
+    let x_i = x.floor() as i32;
     PaneSpan {
-        x,
-        width: (ceil_half(right2) - x).max(0),
+        x: x_i,
+        width: (right.ceil() as i32 - x_i).max(0),
     }
 }
 
@@ -282,7 +279,7 @@ mod tests {
     fn painted_span_of_a_lone_pane_is_the_whole_window() {
         // The ordinary no-splits case must reproduce today's x:0/width:fb_width
         // exactly, or this task is a repaint-coverage regression.
-        let s = painted_x_span(0, 80, 80, 5, 10, 810);
+        let s = painted_x_span(0, 80, 80, 5.0, 10, 810);
         assert_eq!((s.x, s.width), (0, 810));
     }
 
@@ -290,7 +287,7 @@ mod tests {
     fn painted_span_of_a_left_pane_starts_at_zero_and_covers_the_gutter() {
         // Left-most but NOT right-most: starts at 0, and runs half a cell past
         // its last column to meet the split divider.
-        let s = painted_x_span(0, 40, 80, 5, 10, 810);
+        let s = painted_x_span(0, 40, 80, 5.0, 10, 810);
         assert_eq!(s.x, 0);
         assert_eq!(s.width, 40 * 10 + 5 + 5, "must cover padding + half-cell gutter");
     }
@@ -299,14 +296,14 @@ mod tests {
     fn painted_span_of_a_right_pane_runs_to_the_window_edge() {
         // Right-most: starts half a cell LEFT of its first column, and runs all
         // the way to the window's right edge, not to cols*cell_w.
-        let s = painted_x_span(40, 40, 80, 5, 10, 810);
+        let s = painted_x_span(40, 40, 80, 5.0, 10, 810);
         assert_eq!(s.x, 5 - 5 + 400, "must start half a cell left of the pane");
         assert_eq!(s.x + s.width, 810, "right-most pane must reach the window edge");
     }
 
     #[test]
     fn painted_span_of_a_middle_pane_covers_both_gutters() {
-        let s = painted_x_span(20, 20, 80, 5, 10, 810);
+        let s = painted_x_span(20, 20, 80, 5.0, 10, 810);
         assert_eq!(s.x, 5 - 5 + 200);
         assert_eq!(s.width, 20 * 10 + 10);
     }
@@ -316,7 +313,7 @@ mod tests {
         // cell_w = 9 -> half a cell is 4.5.  The span must be a SUPERSET of the
         // painted rect, so the left edge floors and the width ceils; a span that
         // rounds inward leaves a stale column at the split.
-        let s = painted_x_span(10, 10, 30, 4, 9, 300);
+        let s = painted_x_span(10, 10, 30, 4.0, 9, 300);
         assert!(s.x <= 4 - 4 + 90, "left edge must not round rightward: {}", s.x);
         assert!(s.width >= 10 * 9 + 9, "width must not round short: {}", s.width);
         // Pinned exactly: painted rect is x=89.5, right=188.5, so the only
@@ -326,17 +323,45 @@ mod tests {
         assert_eq!((s.x, s.width), (89, 100));
     }
 
-    /// The f32 arithmetic of `render/pane.rs:110-152`, in f64, as the oracle.
+    #[test]
+    fn painted_span_does_not_truncate_a_fractional_content_left() {
+        // A `window_padding` in cells, points or percent gives a fractional
+        // padding_left.  It reaches the RIGHT edge of the span — through
+        // width_delta for a left-most pane, through x for an interior one — so
+        // truncating it to an i32 anywhere on that path ends the span short of
+        // the painted background and leaves a stale column at the split gutter.
+
+        // Left-most, not right-most: painted x = 0,
+        // right = 1*7 + (5.75 + 3.5) = 16.25 -> ceil 17.  Truncating 5.75 to 5
+        // gives 16, one pixel short of the paint.
+        let s = painted_x_span(0, 1, 30, 5.75, 7, 217);
+        assert_eq!((s.x, s.width), (0, 17));
+
+        // Interior: painted x = 4.5 - 3.5 + 7 = 8.0, right = 8 + 7 + 7 = 22.
+        // Truncating 4.5 to 4 gives x = 7 (a wasted pixel on the left) and a
+        // right edge of 21 (a stale pixel on the right).
+        let s = painted_x_span(1, 1, 30, 4.5, 7, 219);
+        assert_eq!((s.x, s.width), (8, 14));
+    }
+
+    /// The f32 arithmetic of `render/pane.rs`, in f64, as the oracle.
+    ///
+    /// Transcribed from the `build_pane` copy at `render/pane.rs:606-646`, which
+    /// is an independent second copy of the same `background_rect` math (the
+    /// first is at :110-152).  `content_left` is the **unrounded**
+    /// `padding_left + border.left` the paint pass actually uses — taking it as
+    /// an `i32` here is what made this oracle structurally blind to the caller's
+    /// truncation.
     fn painted_rect_reference(
         left_cells: i32,
         cols: i32,
         total_cols: i32,
-        content_left: i32,
+        content_left: f64,
         cell_w: i32,
         window_pixel_width: i32,
     ) -> (f64, f64) {
         let cw = cell_w as f64;
-        let cl = content_left as f64;
+        let cl = content_left;
         let (x, width_delta) = if left_cells == 0 {
             (0., cl + cw / 2.0)
         } else {
@@ -357,10 +382,15 @@ mod tests {
         // space rather than trusting four hand-picked fixtures, all of which
         // happen to be numerically degenerate (see the report: the mutation the
         // brief proposed leaves three of them bit-identical).
+        // The fractional entries are the ones a `window_padding` expressed in
+        // cells, points or percent actually produces; every one of them is an
+        // exact binary fraction, so the f32 the implementation uses and the f64
+        // of this oracle are the same number and no epsilon slack is needed.
         for &cell_w in &[7, 8, 9, 10, 13] {
-            for &content_left in &[0, 3, 4, 5, 12] {
+            for &content_left in &[0.0f64, 3.0, 4.0, 4.5, 5.0, 5.25, 5.75, 12.0] {
                 for &total_cols in &[30, 80, 81] {
-                    let window_pixel_width = total_cols * cell_w + 2 * content_left;
+                    let window_pixel_width =
+                        total_cols * cell_w + (2.0 * content_left).round() as i32;
                     for left_cells in 0..total_cols {
                         for &cols in &[1, 7, total_cols / 2, total_cols - left_cells] {
                             if cols <= 0 || left_cells + cols > total_cols {
@@ -370,7 +400,7 @@ mod tests {
                                 left_cells,
                                 cols,
                                 total_cols,
-                                content_left,
+                                content_left as f32,
                                 cell_w,
                                 window_pixel_width,
                             );
