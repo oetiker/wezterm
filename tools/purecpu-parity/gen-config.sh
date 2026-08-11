@@ -8,6 +8,9 @@
 #        DEFAULT_CURSOR_STYLE=<s>  (default SteadyBlock, matches Tasks 1-4)
 #        VISUAL_BELL=true|false    (default false; adds a 300ms/300ms fade
 #                                    visual_bell block when true, Task 6)
+#        RENDER_TARGET=<target>    (default unset = emit nothing; Task 8.
+#                                    One of Normal, Light, Mono,
+#                                    HorizontalLcd, VerticalLcd)
 #
 # The blink/animation defaults below are off (SteadyBlock, rates 0, fps 1)
 # because Tasks 1-4 measured a deliberately static terminal — that was the
@@ -75,6 +78,64 @@ DEFAULT_CURSOR_STYLE="${DEFAULT_CURSOR_STYLE:-SteadyBlock}"
 # bell's fade-mix path (render/mod.rs:233-258), which is otherwise never
 # emitted by this generator.
 VISUAL_BELL="${VISUAL_BELL:-false}"
+
+# (Task 8) RENDER_TARGET selects the antialiasing mode. Default unset emits
+# nothing at all, so every Tasks 1-7 case reproduces byte-for-byte.
+#
+# It emits TWO keys, and that pairing is the whole point of this knob. The two
+# halves of subpixel antialiasing are driven by different config fields, and
+# setting only the documented one produces a config that looks right and
+# measures nothing:
+#
+#   * `freetype_render_target` (global) is read in exactly ONE place in the
+#     whole tree -- termwindow/render/draw.rs:172-179, where it selects
+#     dual-source blending for the text sub-layer. It never reaches the
+#     rasteriser.
+#   * The per-channel LCD coverage in the atlas comes from
+#     `use_lcd_subpixel` in skrifa_rasterizer.rs:78-79, which is computed from
+#     the PER-FONT attribute `parsed.freetype_load_target` -- i.e. a key in
+#     the `wezterm.font { ... }` table, not the global key of the same name.
+#     The global `config.freetype_load_target` (config/src/config.rs:292) has
+#     no reader anywhere except draw.rs's fallback, because this fork's
+#     FreeType rasteriser was removed (rasterizer/mod.rs:45-55: every
+#     FontRasterizerSelection resolves to skrifa).
+#
+# So `freetype_render_target = 'HorizontalLcd'` on its own turns on
+# dual-source blending over a GRAYSCALE atlas, in both backends. That is a
+# real rendering change and the two backends would still agree -- which is
+# exactly the trap: the row would read as parity while never once exercising
+# a mask whose channels differ. Emitting the per-font attribute alongside it
+# is what puts per-channel data in the atlas.
+#
+# 'JetBrains Mono' is wezterm's own default font family
+# (config/src/font.rs:434), so naming it here changes the attribute and
+# nothing else about the scene.
+#
+# The single-table form of wezterm.font is required and not cosmetic. With two
+# arguments, `wezterm.font('family', { ... })`, the SECOND table is parsed as
+# `TextStyleAttributes` (config/src/lua.rs:436-456,552-554), which has only
+# bold/weight/stretch/style/italic/foreground -- no freetype fields. wezterm
+# then rejects the entire config with "`freetype_load_target` is not a valid
+# TextStyleAttributes field", falls back to defaults for every key including
+# front_end, and both windows run the same backend. Observed: it is what
+# check_no_config_error caught on the first attempt at this row. Only
+# `wezterm.font { family = ..., freetype_load_target = ... }` parses as
+# `LuaFontAttributes` (lua.rs:471-500), which carries them.
+RENDER_TARGET="${RENDER_TARGET:-}"
+if [ -n "$RENDER_TARGET" ]; then
+  case "$RENDER_TARGET" in
+    Normal|Light|Mono|HorizontalLcd|VerticalLcd) ;;
+    *)
+      echo "gen-config.sh: RENDER_TARGET=$RENDER_TARGET is not a" \
+           "FreeTypeLoadTarget variant (config/src/config.rs). wezterm" \
+           "rejects the whole config on an unknown enum value, both windows" \
+           "fall back to the default front_end, and the comparison silently" \
+           "measures a backend against itself and reports AE=0. Valid:" \
+           "Normal, Light, Mono, HorizontalLcd, VerticalLcd." >&2
+      exit 1
+      ;;
+  esac
+fi
 
 # (fix round 3, NEW-8) A non-zero CURSOR_BLINK_RATE with DEFAULT_CURSOR_STYLE
 # left at SteadyBlock is not a harmless no-op, it's a silent trap: wezterm
@@ -251,6 +312,10 @@ if [ -n "$WINDOW_DECORATIONS" ]; then
 fi
 if [ "$VISUAL_BELL" = "true" ]; then
   CONFIG_LINES+=("  visual_bell = { fade_in_duration_ms = 300, fade_out_duration_ms = 300 },")
+fi
+if [ -n "$RENDER_TARGET" ]; then
+  CONFIG_LINES+=("  freetype_render_target = '${RENDER_TARGET}',")
+  CONFIG_LINES+=("  font = wezterm.font { family = 'JetBrains Mono', freetype_load_target = '${RENDER_TARGET}' },")
 fi
 CONFIG_LINES+=(
   "  audible_bell = 'Disabled',"

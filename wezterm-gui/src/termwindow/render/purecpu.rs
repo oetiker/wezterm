@@ -266,8 +266,18 @@ impl crate::TermWindow {
         let half_w = fb_w as f32 / 2.0;
         let half_h = fb_h as f32 / 2.0;
 
+        // Selected once for the whole frame, exactly as GL does at
+        // draw.rs:172-179.
+        let use_subpixel = subpixel_enabled(
+            self.config.freetype_render_target,
+            self.config.freetype_load_target,
+        );
+
         for layer in render_state.layers.borrow().iter() {
             for idx in 0..3 {
+                // draw.rs:244 — dual-source blending is chosen per *vertex
+                // buffer*, not per quad, and only buffer 1 carries text.
+                let subpixel_aa = use_subpixel && idx == 1;
                 let vb = &layer.vb.borrow()[idx];
                 let (vertex_count, _index_count) = vb.vertex_index_count();
                 if vertex_count == 0 {
@@ -402,7 +412,24 @@ impl crate::TermWindow {
                                         continue;
                                     }
                                     let fi = (row_off + dx as usize) * 4;
-                                    blend_over(&mut state.frame_buffer, fi, sr8, sg8, sb8, sa8);
+                                    match subpixel_aa
+                                        .then(|| subpixel_mask(has_color, 0, 0, 0, 0))
+                                        .flatten()
+                                    {
+                                        // `colorMask = vec4(1.0)` — a straight
+                                        // replace, including alpha.  Identical
+                                        // to `blend_over` when sa8 == 255, and
+                                        // deliberately different when it is
+                                        // not; window borders (borders.rs) are
+                                        // the sub-layer-1 producer here.
+                                        Some([mr, mg, mb, ma]) => blend_over_masked(
+                                            &mut state.frame_buffer,
+                                            fi, sr8, sg8, sb8, sa8, mr, mg, mb, ma,
+                                        ),
+                                        None => blend_over(
+                                            &mut state.frame_buffer, fi, sr8, sg8, sb8, sa8,
+                                        ),
+                                    }
                                 }
                             }
                         }
@@ -493,7 +520,13 @@ impl crate::TermWindow {
                                     out_r = fg_r;
                                     out_g = fg_g;
                                     out_b = fg_b;
-                                    out_a = tex_a;
+                                    // glyph-frag.glsl:148-152: the shader
+                                    // overwrites color.a with the mask's alpha
+                                    // ONLY when subpixel_aa is off.  Under
+                                    // dual-source the source alpha stays fg_a
+                                    // and the coverage arrives through the
+                                    // mask instead.
+                                    out_a = if subpixel_aa { fg_a } else { tex_a };
 
                                     if apply_hsv {
                                         let (h, s, v) = rgb_to_hsv(out_r, out_g, out_b);
@@ -539,8 +572,32 @@ impl crate::TermWindow {
                                 }
                                 // tex_is_srgb with no HSV → already sRGB, no conversion
 
-                                if out_a <= 0.0 {
-                                    continue;
+                                // The atlas bytes are the shader's `colorMask`
+                                // verbatim; see `subpixel_mask`.  `None` here
+                                // means this sub-layer (or this branch) does
+                                // not run under dual-source blending, and the
+                                // pre-existing scalar path is kept bit-exact.
+                                let mask = subpixel_aa
+                                    .then(|| {
+                                        subpixel_mask(
+                                            has_color,
+                                            atlas_data[ai],
+                                            atlas_data[ai + 1],
+                                            atlas_data[ai + 2],
+                                            atlas_data[ai + 3],
+                                        )
+                                    })
+                                    .flatten();
+
+                                match mask {
+                                    // A wholly uncovered texel contributes
+                                    // nothing on any channel: dst = dst.  This
+                                    // replaces the `out_a <= 0.0` skip, which
+                                    // no longer discriminates for IS_GLYPH now
+                                    // that out_a is fg_a rather than tex_a.
+                                    Some([0, 0, 0, 0]) => continue,
+                                    None if out_a <= 0.0 => continue,
+                                    _ => {}
                                 }
 
                                 let fi = (fb_row_off + dx as usize) * 4;
@@ -548,7 +605,15 @@ impl crate::TermWindow {
                                 let sg = (out_g.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
                                 let sr = (out_r.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
                                 let sa = (out_a.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                                blend_over(&mut state.frame_buffer, fi, sr, sg, sb, sa);
+                                match mask {
+                                    Some([mr, mg, mb, ma]) => blend_over_masked(
+                                        &mut state.frame_buffer,
+                                        fi, sr, sg, sb, sa, mr, mg, mb, ma,
+                                    ),
+                                    None => {
+                                        blend_over(&mut state.frame_buffer, fi, sr, sg, sb, sa)
+                                    }
+                                }
                             }
                         }
                     }
@@ -622,6 +687,121 @@ fn blend_over(fb: &mut [u8], fi: usize, sr: u8, sg: u8, sb: u8, sa: u8) {
         fb[fi + 2] = (sr as f32 * sa_f + fb[fi + 2] as f32 * inv + 0.5) as u8;
         fb[fi + 3] = ((sa as f32 + fb[fi + 3] as f32 * inv).min(255.0) + 0.5) as u8;
     }
+}
+
+/// Per-channel alpha blend, reproducing GL's dual-source blending:
+///   dst = src * mask + dst * (1 - mask)
+/// applied independently per channel (`draw.rs:181-195`, selected for the text
+/// sub-layer at `draw.rs:244,263`).  `mask` is the per-channel coverage the LCD
+/// rasteriser stores in the atlas RGB (`skrifa_rasterizer.rs:672-703`); the
+/// scalar `blend_over` uses only the max-of-channels alpha in A, which is what
+/// made PureCpu fall back to grayscale antialiasing.
+///
+/// Note the alpha equation is *not* `blend_over`'s.  `alpha_blending` uses
+/// `source: One` (`dst.a = src.a + dst.a*(1-src.a)`) while dual-source uses
+/// `SourceOneColor` (`dst.a = src.a*mask.a + dst.a*(1-mask.a)`).  Mirroring GL
+/// is the point of this pass, so the divergence is reproduced, not smoothed
+/// over; it is pinned by
+/// `blend_over_masked_alpha_mirrors_dual_source_not_alpha_blending`.
+///
+/// fb is BGRA.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn blend_over_masked(
+    fb: &mut [u8],
+    fi: usize,
+    sr: u8,
+    sg: u8,
+    sb: u8,
+    sa: u8,
+    mr: u8,
+    mg: u8,
+    mb: u8,
+    ma: u8,
+) {
+    #[inline]
+    fn chan(s: u8, d: u8, m: u8) -> u8 {
+        if m == 255 {
+            return s;
+        }
+        if m == 0 {
+            return d;
+        }
+        let mf = m as f32 / 255.0;
+        (s as f32 * mf + d as f32 * (1.0 - mf) + 0.5) as u8
+    }
+    fb[fi] = chan(sb, fb[fi], mb);
+    fb[fi + 1] = chan(sg, fb[fi + 1], mg);
+    fb[fi + 2] = chan(sr, fb[fi + 2], mr);
+    fb[fi + 3] = chan(sa, fb[fi + 3], ma);
+}
+
+/// The `colorMask` (second fragment output) the glyph shader emits for a quad
+/// of this `has_color`, given the atlas texel it sampled — `None` when the
+/// branch has no producer in the sub-layer that runs under dual-source
+/// blending, so the caller keeps the ordinary `blend_over` path.
+///
+/// `subpixel_aa` is a property of the *sub-layer*, not of the quad
+/// (`draw.rs:239-244` switches the blend state for a whole vertex buffer), so
+/// the enumeration below is over "what can land in vertex buffer 1":
+///
+/// | has_color | producers in sub-layer 1 | shader |
+/// |---|---|---|
+/// | 0.0 IS_GLYPH | `screen_line.rs:642`, `box_model.rs:905`, `box_model.rs:931` (poly_quad sets `set_has_color(false)`) | `colorMask = texture(...)` |
+/// | 1.0 IS_COLOR_EMOJI | `screen_line.rs:642` / `box_model.rs:905` when `glyph.has_color` | `colorMask = color.aaaa` |
+/// | 3.0 IS_SOLID_COLOR | `borders.rs:25,39,53,67` (`filled_rectangle(layers, 1, ..)`) | `colorMask = vec4(1.0)` |
+/// | 2.0 IS_BG_IMAGE | none — `background.rs:562` allocates layer 0 | — |
+/// | 4.0 IS_GRAY_SCALE | none — every `set_grayscale` site is reached with `layer_num = 0` | — |
+///
+/// The IS_GLYPH mask is **linearised**, and this is the one place where
+/// PureCpu's "the atlas is already sRGB, leave it alone" rule does not hold.
+/// GL's atlas is an `SrgbTexture2d` (`renderstate.rs:113-116`,
+/// `SrgbFormat::U8U8U8U8`), so `texture()` returns RGB converted sRGB->linear
+/// while **alpha passes through unconverted**; the LCD rasteriser's sRGB
+/// encode (`skrifa_rasterizer.rs:687-689`) exists only to survive that
+/// round trip, and `linear_alpha` in A (`:674`) is deliberately not encoded.
+/// PureCpu's arm holds the raw bytes in a plain `ImageTexture`
+/// (`renderstate.rs:138`), so it must undo the encode itself.
+///
+/// For every *other* branch the round trip cancels and the raw bytes are
+/// right: colour-emoji and background-image colours are linearised on sample
+/// and re-encoded by `color = to_srgb(color)` at `glyph-frag.glsl:159`.
+/// `colorMask` is the one shader output that is **not** passed through
+/// `to_srgb`, which is exactly why the cancellation fails for the mask alone.
+///
+/// Measured, not reasoned: with the raw bytes, a body pixel over the harness
+/// background read `(16,16,99)` against GL's `(16,16,49)` — precisely
+/// `linear_to_srgb` applied one time too many. See the Task 8 report.
+#[inline]
+fn subpixel_mask(has_color: f32, tr: u8, tg: u8, tb: u8, ta: u8) -> Option<[u8; 4]> {
+    #[inline]
+    fn lin(v: u8) -> u8 {
+        (srgb_to_linear(v as f32 / 255.0) * 255.0 + 0.5) as u8
+    }
+    if has_color == 0.0 {
+        Some([lin(tr), lin(tg), lin(tb), ta])
+    } else if has_color == 1.0 {
+        Some([ta, ta, ta, ta])
+    } else if has_color == 3.0 {
+        Some([255, 255, 255, 255])
+    } else {
+        None
+    }
+}
+
+/// Whether the text sub-layer uses subpixel antialiasing, i.e. dual-source
+/// blending in GL.  Mirrors `draw.rs:172-179` exactly; if the two ever diverge
+/// the two backends disagree about the blend equation while agreeing about the
+/// atlas contents, which looks like a rendering bug rather than a config bug.
+#[inline]
+fn subpixel_enabled(
+    render_target: Option<config::FreeTypeLoadTarget>,
+    load_target: config::FreeTypeLoadTarget,
+) -> bool {
+    matches!(
+        render_target.unwrap_or(load_target),
+        config::FreeTypeLoadTarget::HorizontalLcd | config::FreeTypeLoadTarget::VerticalLcd
+    )
 }
 
 #[inline]
@@ -757,6 +937,104 @@ mod test {
         assert!(fb[0] > 60 && fb[0] < 68);
         assert!(fb[1] > 60 && fb[1] < 68);
         assert!(fb[2] > 60 && fb[2] < 68);
+    }
+
+    #[test]
+    fn blend_over_masked_blends_each_channel_by_its_own_coverage() {
+        // GL's dual-source blend: dst = src * mask + dst * (1 - mask), per
+        // channel.  A mask that differs per channel is the entire point of
+        // subpixel AA; PureCpu previously collapsed it to the max-alpha and
+        // rendered grayscale.
+        // fb is BGRA.
+        let mut fb = vec![0u8, 0, 0, 255];
+        blend_over_masked(&mut fb, 0, 200, 100, 50, 255, 255, 128, 0, 255);
+        assert_eq!(fb[2], 200, "red fully covered");
+        // 100 * (128/255) + 0 * (127/255) + 0.5 = 50.196 + 0.5 = 50.696 -> 50
+        assert_eq!(fb[1], 50, "green half covered: 100*128/255 rounds to 50");
+        assert_eq!(fb[0], 0, "blue not covered at all");
+        assert_eq!(fb[3], 255, "alpha fully covered, so it takes the source's");
+    }
+
+    #[test]
+    fn blend_over_masked_uniform_mask_matches_blend_over_on_color() {
+        // A mask equal on all three colour channels must agree with the scalar
+        // path there, so enabling subpixel cannot shift the *colour* of
+        // ordinary text.  Alpha is deliberately excluded: see
+        // `blend_over_masked_alpha_mirrors_dual_source_not_alpha_blending`.
+        for a in [0u8, 1, 64, 128, 254, 255] {
+            let mut fb1 = vec![10u8, 20, 30, 40];
+            let mut fb2 = vec![10u8, 20, 30, 40];
+            blend_over(&mut fb1, 0, 200, 100, 50, a);
+            blend_over_masked(&mut fb2, 0, 200, 100, 50, a, a, a, a, a);
+            assert_eq!(fb1[0..3], fb2[0..3], "colour mismatch at alpha {a}");
+        }
+    }
+
+    #[test]
+    fn blend_over_masked_alpha_mirrors_dual_source_not_alpha_blending() {
+        // The two GL blend states differ in the *alpha* equation, and this is
+        // the whole of the colour-emoji question in Task 8:
+        //   alpha_blending  (draw.rs:203)  source: One
+        //       dst.a = src.a + dst.a * (1 - src.a)
+        //   dual_source     (draw.rs:186)  source: SourceOneColor
+        //       dst.a = src.a * mask.a + dst.a * (1 - mask.a)
+        // So a uniform mask is NOT a no-op on alpha, and `blend_over_masked`
+        // must reproduce the dual-source form rather than agree with
+        // `blend_over`.  Pinned by hand at src.a = mask.a = 128, dst.a = 40:
+        //   blend_over:        128 + 40*(127/255) + 0.5   = 148.42 -> 148
+        //   blend_over_masked: 128*(128/255) + 40*(127/255) + 0.5 = 84.67 -> 84
+        let mut fb1 = vec![10u8, 20, 30, 40];
+        let mut fb2 = vec![10u8, 20, 30, 40];
+        blend_over(&mut fb1, 0, 200, 100, 50, 128);
+        blend_over_masked(&mut fb2, 0, 200, 100, 50, 128, 128, 128, 128, 128);
+        assert_eq!(fb1[3], 148, "alpha_blending's One-factor leading term");
+        assert_eq!(fb2[3], 84, "dual-source squares the source alpha");
+    }
+
+    #[test]
+    fn subpixel_mask_is_per_channel_for_glyphs_and_uniform_for_emoji() {
+        // IS_GLYPH: `colorMask = texture(...)` (glyph-frag.glsl:145) off an
+        // SrgbTexture2d, so RGB comes back LINEARISED and A does not.
+        // Hand-derived, with srgb_to_linear as the shader's sampler applies it:
+        //   10/255 = 0.039216 <= 0.04045 -> /12.92     = 0.003035 -> 0.774 -> 1
+        //   128/255 = 0.501961 -> (0.556961/1.055)^2.4 = 0.215825 -> 55.0  -> 55
+        //   255 -> 1.0 -> 255;  0 -> 0
+        // A is passed through: 40 stays 40, because sRGB textures never
+        // convert the alpha channel.
+        assert_eq!(subpixel_mask(0.0, 0, 10, 128, 40), Some([0, 1, 55, 40]));
+        assert_eq!(subpixel_mask(0.0, 255, 255, 255, 255), Some([255, 255, 255, 255]));
+        // IS_COLOR_EMOJI: `colorMask = color.aaaa` (glyph-frag.glsl:131) —
+        // the texel's alpha broadcast to all four channels, NOT its colour,
+        // and unconverted for the same reason.
+        assert_eq!(subpixel_mask(1.0, 10, 20, 30, 40), Some([40, 40, 40, 40]));
+        // IS_SOLID_COLOR: `colorMask = vec4(1.0)` (glyph-frag.glsl:117), i.e.
+        // a straight replace.  Reachable in sub-layer 1 via window borders
+        // (borders.rs:25,39,53,67 pass layer_num = 1).
+        assert_eq!(subpixel_mask(3.0, 10, 20, 30, 40), Some([255, 255, 255, 255]));
+        // IS_BG_IMAGE (2.0) and IS_GRAY_SCALE (4.0) have no producer in
+        // sub-layer 1 — background.rs:562 allocates layer 0 and every
+        // `set_grayscale` site (box_model.rs:1048,1063,1078,1093) is reached
+        // with layer_num = 0 — so they never see the dual-source blend.
+        assert_eq!(subpixel_mask(2.0, 10, 20, 30, 40), None);
+        assert_eq!(subpixel_mask(4.0, 10, 20, 30, 40), None);
+    }
+
+    #[test]
+    fn subpixel_enabled_matches_the_gl_selection_expression() {
+        use config::FreeTypeLoadTarget as T;
+        // Mirrors draw.rs:172-179 exactly: render_target overrides
+        // load_target, and only the two Lcd variants select subpixel.
+        assert!(subpixel_enabled(Some(T::HorizontalLcd), T::Normal));
+        assert!(subpixel_enabled(Some(T::VerticalLcd), T::Normal));
+        assert!(!subpixel_enabled(Some(T::Normal), T::HorizontalLcd));
+        assert!(!subpixel_enabled(Some(T::Light), T::VerticalLcd));
+        assert!(!subpixel_enabled(Some(T::Mono), T::HorizontalLcd));
+        // Unset render_target falls back to load_target.
+        assert!(subpixel_enabled(None, T::HorizontalLcd));
+        assert!(subpixel_enabled(None, T::VerticalLcd));
+        assert!(!subpixel_enabled(None, T::Normal));
+        assert!(!subpixel_enabled(None, T::Light));
+        assert!(!subpixel_enabled(None, T::Mono));
     }
 
     #[test]
