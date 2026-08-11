@@ -1,5 +1,6 @@
 use crate::quad::{Vertex, VERTICES_PER_CELL};
 use crate::renderstate::VertexBuffer;
+use crate::termwindow::render::purecpu_sampler;
 use crate::selection::SelectionRange;
 use ::window::bitmaps::{BitmapImage, ImageTexture};
 use ::window::WindowOps;
@@ -300,11 +301,40 @@ impl crate::TermWindow {
                     let fg_b = fg[2] * (1.0 - mix_value) + alt[2] * mix_value;
                     let fg_a = fg[3] * (1.0 - mix_value) + alt[3] * mix_value;
 
-                    // Screen destination rect (clip-space to pixels)
-                    let dest_x = (tl.position[0] + half_w) as i32;
-                    let dest_y = (tl.position[1] + half_h) as i32;
-                    let dest_x2 = (br.position[0] + half_w) as i32;
-                    let dest_y2 = (br.position[1] + half_h) as i32;
+                    // Screen destination rect (clip-space to pixels) and atlas
+                    // rect (normalized tex coords to texels), both kept as
+                    // floats: the sampler interpolates texcoords across the
+                    // true quad, and the coverage rule needs the unrounded
+                    // edge.  Truncating the destination displaced sub-pixel
+                    // quads a whole pixel left/up (M1, the fancy tab bar's
+                    // bit-exact 1px shift); truncating the source lost up to a
+                    // texel of the extent.
+                    let dest_f = [
+                        tl.position[0] + half_w,
+                        tl.position[1] + half_h,
+                        br.position[0] + half_w,
+                        br.position[1] + half_h,
+                    ];
+                    let tex_f = [
+                        tl.tex[0] * atlas_w as f32,
+                        tl.tex[1] * atlas_h as f32,
+                        br.tex[0] * atlas_w as f32,
+                        br.tex[1] * atlas_h as f32,
+                    ];
+
+                    // `has_color == 2.0` (IS_BG_IMAGE) stays on the pre-Task-7
+                    // path — truncated rect, 1:1 crop — because background
+                    // image is out of scope for this pass and GL samples that
+                    // branch with a linear sampler, not Nearest.  See the
+                    // `purecpu_sampler` module doc.
+                    let quad = purecpu_sampler::Quad::new(
+                        has_color == 2.0,
+                        dest_f,
+                        tex_f,
+                        atlas_w as i32,
+                        atlas_h as i32,
+                    );
+                    let [dest_x, dest_y, dest_x2, dest_y2] = quad.dest_rect();
 
                     let dest_w = dest_x2 - dest_x;
                     let dest_h = dest_y2 - dest_y;
@@ -332,14 +362,6 @@ impl crate::TermWindow {
                     }
 
                     quads_blitted += 1;
-
-                    // Atlas pixel rect from normalized tex coords
-                    let tex_px_x = (tl.tex[0] * atlas_w as f32) as i32;
-                    let tex_px_y = (tl.tex[1] * atlas_h as f32) as i32;
-                    let tex_px_x2 = (br.tex[0] * atlas_w as f32) as i32;
-                    let tex_px_y2 = (br.tex[1] * atlas_h as f32) as i32;
-                    let tex_w = tex_px_x2 - tex_px_x;
-                    let tex_h = tex_px_y2 - tex_px_y;
 
                     let state = self.purecpu_state.as_mut().unwrap();
 
@@ -387,42 +409,36 @@ impl crate::TermWindow {
                         continue;
                     }
 
-                    // For textured quads: blit 1:1 from atlas to dest,
-                    // clipped to each dirty region individually.
-                    let blit_w = tex_w.min(dest_w);
-                    let blit_h = tex_h.min(dest_h);
-
-                    if blit_w <= 0 || blit_h <= 0 {
+                    // Textured quads: sample the atlas across the full
+                    // destination rect.  The old code blitted 1:1 and cropped
+                    // to min(tex, dest), so any quad drawn at a size other than
+                    // its sprite's was cropped rather than scaled (finding I5)
+                    // — non-native inline images, DECDWL/DECDHL, and scaled
+                    // bitmap glyphs.  `blit_end` still crops for IS_BG_IMAGE,
+                    // and still drops the quad when that crop is empty.
+                    let Some((blit_x2, blit_y2)) = quad.blit_end() else {
                         continue;
-                    }
+                    };
 
                     for clip in &clip_rects {
                         let [cx1, cy1, cx2, cy2] = *clip;
 
-                        // Clipped row/col ranges relative to dest origin
-                        let row_start = (cy1 - dest_y).max(0);
-                        let row_end = (cy2 - dest_y).min(blit_h);
-                        let col_start = (cx1 - dest_x).max(0);
-                        let col_end = (cx2 - dest_x).min(blit_w);
+                        // Clipped row/col ranges, in destination pixels.
+                        let row_start = cy1.max(dest_y).max(0);
+                        let row_end = cy2.min(blit_y2).min(fb_h as i32);
+                        let col_start = cx1.max(dest_x).max(0);
+                        let col_end = cx2.min(blit_x2).min(fb_w as i32);
 
-                        for row in row_start..row_end {
-                            let dy = dest_y + row;
-                            if dy < 0 || dy >= fb_h as i32 {
-                                continue;
-                            }
-                            let atlas_row = tex_px_y + row;
+                        for dy in row_start..row_end {
+                            let atlas_row = quad.texel_y(dy);
                             if atlas_row < 0 || atlas_row >= atlas_h as i32 {
                                 continue;
                             }
                             let fb_row_off = dy as usize * fb_w;
                             let atlas_row_off = atlas_row as usize * atlas_stride;
 
-                            for col in col_start..col_end {
-                                let dx = dest_x + col;
-                                if dx < 0 || dx >= fb_w as i32 {
-                                    continue;
-                                }
-                                let atlas_col = tex_px_x + col;
+                            for dx in col_start..col_end {
+                                let atlas_col = quad.texel_x(dx);
                                 if atlas_col < 0 || atlas_col >= atlas_w as i32 {
                                     continue;
                                 }

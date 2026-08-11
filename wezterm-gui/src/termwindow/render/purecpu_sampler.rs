@@ -27,8 +27,7 @@
 //! texcoord interpolation decides the tie.  A 1-texel diff there is interpolation
 //! precision, not a sampler bug; triage it that way.
 //!
-//! Nothing calls this yet: Task 7 routes the blit loop through it.  The
-//! `dead_code` allows below are for that gap and come off with the wiring.
+//! Task 7 routes the blit loop through this module, via [`Quad`].
 
 /// First destination pixel covered by a quad edge, under GL's rule that a pixel
 /// is covered when its centre lies inside the primitive.
@@ -36,7 +35,6 @@
 /// Pixel `x` is covered when `edge0 <= x + 0.5`, so the first covered pixel is
 /// `ceil(edge - 0.5)`.  This replaces the truncating `as i32` that displaced
 /// sub-pixel-positioned quads a whole pixel left/up (M1).
-#[allow(dead_code)]
 #[inline]
 pub fn cover_start(edge: f32) -> i32 {
     (edge - 0.5).ceil() as i32
@@ -47,7 +45,6 @@ pub fn cover_start(edge: f32) -> i32 {
 /// Delegates rather than repeating the expression: the two names exist because
 /// the call sites mean different things, but there is only one coverage rule
 /// and a second copy of it would be free to drift.
-#[allow(dead_code)]
 #[inline]
 pub fn cover_end(edge: f32) -> i32 {
     cover_start(edge)
@@ -57,7 +54,6 @@ pub fn cover_end(edge: f32) -> i32 {
 ///
 /// `src_limit` is the atlas dimension in texels; sampling clamps to
 /// `[0, src_limit - 1]`, because `src_limit` itself is one texel outside it.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub struct Axis {
     src_origin: f32,
@@ -67,7 +63,6 @@ pub struct Axis {
     src_limit: i32,
 }
 
-#[allow(dead_code)]
 impl Axis {
     pub fn new(
         src_origin: f32,
@@ -117,6 +112,159 @@ impl Axis {
             return 0;
         }
         (idx as i32).clamp(0, (self.src_limit - 1).max(0))
+    }
+}
+
+/// One axis of a quad: the coverage rule and the source mapping, joined.
+///
+/// Until Task 7 these two halves had never been used together — `cover_start`/
+/// `cover_end` decide *which* destination pixels a quad touches, `Axis::texel`
+/// decides *what* each of them reads, and every test drove `texel` with a
+/// hand-written pixel range.  Joining them at each call site would put an
+/// off-by-one (`start..=end`) somewhere no unit test can see, so the join lives
+/// here, once, and `covered_texels` tests it directly.
+#[derive(Clone, Copy, Debug)]
+pub struct Span {
+    /// First destination pixel the quad covers.
+    pub start: i32,
+    /// One past the last: the range is half-open, `start..end`, never `..=`.
+    pub end: i32,
+    axis: Axis,
+}
+
+impl Span {
+    pub fn new(
+        src_origin: f32,
+        src_extent: f32,
+        dest_edge0: f32,
+        dest_edge1: f32,
+        src_limit: i32,
+    ) -> Self {
+        Self {
+            start: cover_start(dest_edge0),
+            end: cover_end(dest_edge1),
+            // The Axis interpolates across the *true* float quad, not across
+            // the rounded pixel range.  Feeding it `start`/`end - start` here
+            // would reintroduce exactly the half-pixel displacement that M1 is
+            // about, and it would do so invisibly: every 1:1 case still passes.
+            axis: Axis::new(
+                src_origin,
+                src_extent,
+                dest_edge0,
+                dest_edge1 - dest_edge0,
+                src_limit,
+            ),
+        }
+    }
+
+    #[inline]
+    pub fn texel(&self, dest_pixel: i32) -> i32 {
+        self.axis.texel(dest_pixel)
+    }
+
+    /// The texel each covered pixel reads — the joined path, in one call.
+    #[cfg(test)]
+    fn covered_texels(&self) -> Vec<i32> {
+        (self.start..self.end).map(|p| self.texel(p)).collect()
+    }
+}
+
+/// A textured quad's destination rect and per-pixel source mapping.
+///
+/// This is the whole of what Task 7 changed about the blit loop, hoisted out of
+/// `purecpu.rs` so it can be tested without a framebuffer.
+///
+/// Two rules live here, not one.  Ordinary textured quads — glyphs, colour
+/// emoji, grayscale, solid colour — get the coverage rule and nearest-neighbour
+/// resampling.  `bg_image` (`has_color == 2.0`) instead keeps the pre-Task-7
+/// arithmetic *exactly*: a truncated destination rect and a 1:1 atlas copy
+/// cropped to `min(tex, dest)`.  Background image is out of scope for this pass
+/// by the user's own scope decision (see the module doc), and "out of scope"
+/// means leave it alone, not pretend it is not there.  `legacy_bg_image_quads_
+/// are_untouched` holds that rule to an independent transcription of the old
+/// code.
+pub struct Quad {
+    bg_image: bool,
+    /// Destination edges in framebuffer pixels: `[x, y, x2, y2]`, unrounded.
+    dest_f: [f32; 4],
+    /// Atlas edges in texels: `[x, y, x2, y2]`, unrounded.  `x2 < x` for a
+    /// mirrored background tile.
+    tex_f: [f32; 4],
+    x: Span,
+    y: Span,
+}
+
+impl Quad {
+    pub fn new(
+        bg_image: bool,
+        dest_f: [f32; 4],
+        tex_f: [f32; 4],
+        atlas_w: i32,
+        atlas_h: i32,
+    ) -> Self {
+        let [fx, fy, fx2, fy2] = dest_f;
+        let [tfx, tfy, tfx2, tfy2] = tex_f;
+        Self {
+            bg_image,
+            dest_f,
+            tex_f,
+            x: Span::new(tfx, tfx2 - tfx, fx, fx2, atlas_w),
+            y: Span::new(tfy, tfy2 - tfy, fy, fy2, atlas_h),
+        }
+    }
+
+    /// The integer destination rect, `[x, y, x2, y2]`, half-open in both axes.
+    pub fn dest_rect(&self) -> [i32; 4] {
+        if self.bg_image {
+            let [fx, fy, fx2, fy2] = self.dest_f;
+            [fx as i32, fy as i32, fx2 as i32, fy2 as i32]
+        } else {
+            [self.x.start, self.y.start, self.x.end, self.y.end]
+        }
+    }
+
+    /// One past the last destination pixel the blit writes, per axis.
+    ///
+    /// `None` means the quad writes nothing and the caller must skip it.  A
+    /// sampled quad always covers its whole destination rect, so the `None` and
+    /// the crop it comes from exist only for `bg_image` — including the
+    /// mirrored-tile case, where the negative source extent makes `blit_w`
+    /// negative and the tile is dropped, exactly as it is today.
+    pub fn blit_end(&self) -> Option<(i32, i32)> {
+        let [dest_x, dest_y, dest_x2, dest_y2] = self.dest_rect();
+        if !self.bg_image {
+            return Some((dest_x2, dest_y2));
+        }
+        let [tfx, tfy, tfx2, tfy2] = self.tex_f;
+        let blit_w = (tfx2 as i32 - tfx as i32).min(dest_x2 - dest_x);
+        let blit_h = (tfy2 as i32 - tfy as i32).min(dest_y2 - dest_y);
+        if blit_w <= 0 || blit_h <= 0 {
+            return None;
+        }
+        Some((dest_x + blit_w, dest_y + blit_h))
+    }
+
+    /// The atlas column a destination pixel reads.
+    ///
+    /// Sampled quads come back clamped into the atlas; `bg_image` does not,
+    /// because the old code did not — its caller bounds-checks and skips.
+    #[inline]
+    pub fn texel_x(&self, dest_pixel: i32) -> i32 {
+        if self.bg_image {
+            self.tex_f[0] as i32 + (dest_pixel - self.dest_f[0] as i32)
+        } else {
+            self.x.texel(dest_pixel)
+        }
+    }
+
+    /// The atlas row a destination pixel reads.  See [`Quad::texel_x`].
+    #[inline]
+    pub fn texel_y(&self, dest_pixel: i32) -> i32 {
+        if self.bg_image {
+            self.tex_f[1] as i32 + (dest_pixel - self.dest_f[1] as i32)
+        } else {
+            self.y.texel(dest_pixel)
+        }
     }
 }
 
@@ -262,6 +410,199 @@ mod tests {
         // ...and it stays inside the atlas when the origin does not.
         assert_eq!(Axis::new(9000.0, 4.0, 5.0, 0.0, 4096).texel(5), 4095);
         assert_eq!(Axis::new(-3.0, 4.0, 5.0, 0.0, 4096).texel(5), 0);
+    }
+
+    /// Walks a `Quad` exactly the way `purecpu.rs`'s blit loop walks it on a
+    /// full repaint (clip rect == destination rect), yielding
+    /// `(dest_x, dest_y, atlas_col, atlas_row)` per written pixel.
+    fn walk(q: &Quad) -> Option<([i32; 4], Vec<(i32, i32, i32, i32)>)> {
+        let rect = q.dest_rect();
+        let [dx0, dy0, dx1, dy1] = rect;
+        if dx1 - dx0 <= 0 || dy1 - dy0 <= 0 {
+            return None;
+        }
+        let (end_x, end_y) = q.blit_end()?;
+        let mut out = Vec::new();
+        for dy in dy0..end_y {
+            for dx in dx0..end_x {
+                out.push((dx, dy, q.texel_x(dx), q.texel_y(dy)));
+            }
+        }
+        Some((rect, out))
+    }
+
+    /// The pre-Task-7 blit arithmetic, transcribed from `purecpu.rs` as it
+    /// stood at b7936ac (`:303-307` rect, `:337-342` source, `:392-425` crop
+    /// and 1:1 walk).
+    ///
+    /// Deliberately written in the *old code's* shape and not delegating to
+    /// anything in this module, so it keeps saying what the old code said no
+    /// matter what `Quad` grows into.
+    fn legacy_oracle(
+        dest_f: [f32; 4],
+        tex_f: [f32; 4],
+    ) -> Option<([i32; 4], Vec<(i32, i32, i32, i32)>)> {
+        let [fx, fy, fx2, fy2] = dest_f;
+        let [tfx, tfy, tfx2, tfy2] = tex_f;
+        let dest_x = fx as i32;
+        let dest_y = fy as i32;
+        let dest_x2 = fx2 as i32;
+        let dest_y2 = fy2 as i32;
+        let dest_w = dest_x2 - dest_x;
+        let dest_h = dest_y2 - dest_y;
+        if dest_w <= 0 || dest_h <= 0 {
+            return None;
+        }
+        let tex_px_x = tfx as i32;
+        let tex_px_y = tfy as i32;
+        let tex_w = tfx2 as i32 - tex_px_x;
+        let tex_h = tfy2 as i32 - tex_px_y;
+        let blit_w = tex_w.min(dest_w);
+        let blit_h = tex_h.min(dest_h);
+        if blit_w <= 0 || blit_h <= 0 {
+            return None;
+        }
+        let mut out = Vec::new();
+        for row in 0..blit_h {
+            for col in 0..blit_w {
+                out.push((dest_x + col, dest_y + row, tex_px_x + col, tex_px_y + row));
+            }
+        }
+        Some(([dest_x, dest_y, dest_x2, dest_y2], out))
+    }
+
+    /// The five geometries the oracle is exercised over: `(name, dest, tex)`.
+    /// Every shape the crop rule can meet — 1:1, sub-pixel, magnified,
+    /// minified, mirrored.
+    const BG_CASES: [(&str, [f32; 4], [f32; 4]); 5] = [
+        ("integral 1:1", [10.0, 20.0, 30.0, 40.0], [100.0, 200.0, 120.0, 220.0]),
+        ("sub-pixel origin", [10.6, 20.6, 30.6, 40.6], [100.0, 200.0, 120.0, 220.0]),
+        ("magnified 1:4", [0.0, 0.0, 40.0, 40.0], [0.0, 0.0, 10.0, 10.0]),
+        ("minified 4:1", [0.0, 0.0, 5.0, 5.0], [0.0, 0.0, 20.0, 20.0]),
+        ("mirrored tile", [0.0, 0.0, 10.0, 10.0], [110.0, 0.0, 100.0, 10.0]),
+    ];
+
+    #[test]
+    fn span_joins_coverage_to_sampling() {
+        // THE seam test.  `cover_start`/`cover_end` and `Axis::texel` had never
+        // been used together: every other test in this module drives `texel`
+        // with a hand-written pixel range, so an off-by-one in the join
+        // (`start..=end`) or an Axis built from the *rounded* range rather than
+        // the float quad is invisible to all of them.  This drives the joined
+        // path: float edges in, texels out.
+
+        // 2:1 minification at a quarter-pixel destination origin.  Minification
+        // is where a fractional origin has leverage: at 2:1 a quarter of a
+        // destination pixel is half a texel, enough to move every sample across
+        // a boundary.  (At 2:1 *magnification* it is an eighth of a texel and
+        // every sample floors identically — a vacuous test.)
+        //   start = ceil(100.25 - 0.5) = 100,  end = ceil(105.25 - 0.5) = 105
+        //   s(p)  = 0 + ((p + 0.5 - 100.25) / 5) * 10 = 2p - 199.5
+        //   p = 100..104  ->  0.5, 2.5, 4.5, 6.5, 8.5  ->  floor  ->  0,2,4,6,8
+        let a = Span::new(0.0, 10.0, 100.25, 105.25, 4096);
+        assert_eq!((a.start, a.end), (100, 105));
+        assert_eq!(a.covered_texels(), vec![0, 2, 4, 6, 8]);
+
+        // The M1 case: an edge whose fraction is past the pixel centre, so the
+        // coverage rule and truncation disagree about the first pixel.
+        //   start = ceil(99.7 - 0.5) = 100, and 99.7 as i32 = 99.
+        //   s(p)  = ((p + 0.5 - 99.7) / 5) * 10 = 2p - 198.4
+        //   p = 100..104  ->  1.6, 3.6, 5.6, 7.6, 9.6  ->  floor  ->  1,3,5,7,9
+        let b = Span::new(0.0, 10.0, 99.7, 104.7, 4096);
+        assert_eq!((b.start, b.end), (100, 105));
+        assert_ne!(b.start, 99.7_f32 as i32, "truncation would start a pixel left");
+        assert_eq!(b.covered_texels(), vec![1, 3, 5, 7, 9]);
+
+        // The other direction, so the seam is pinned under magnification too.
+        //   start = ceil(10.0) = 10,  end = ceil(20.0) = 20
+        //   s(p)  = ((p + 0.5 - 10.5) / 10) * 5 = (p - 10) / 2
+        let c = Span::new(0.0, 5.0, 10.5, 20.5, 4096);
+        assert_eq!((c.start, c.end), (10, 20));
+        assert_eq!(c.covered_texels(), vec![0, 0, 1, 1, 2, 2, 3, 3, 4, 4]);
+
+        // A 1:1 span still walks the source one texel per pixel, start to end:
+        // this is the property the four bit-identical parity rows rest on, now
+        // asserted through the join rather than through `texel` alone.
+        let d = Span::new(64.0, 10.0, 100.0, 110.0, 4096);
+        assert_eq!((d.start, d.end), (100, 110));
+        assert_eq!(d.covered_texels(), (64..74).collect::<Vec<i32>>());
+    }
+
+    #[test]
+    fn legacy_bg_image_quads_are_untouched() {
+        // `has_color == 2.0` (IS_BG_IMAGE) is out of scope for this pass, which
+        // means byte-identical output, not "close enough": GL samples that
+        // branch with a *linear* sampler, so routing it through a nearest one
+        // would both expand scope and manufacture parity diffs that look like
+        // sampler defects.  Asserting "I did not touch it" is worth nothing;
+        // this holds it to an independent transcription of the old code.
+        for (name, dest_f, tex_f) in BG_CASES {
+            let got = walk(&Quad::new(true, dest_f, tex_f, 4096, 4096));
+            let want = legacy_oracle(dest_f, tex_f);
+            assert_eq!(
+                got.as_ref().map(|(r, w)| (*r, w.len())),
+                want.as_ref().map(|(r, w)| (*r, w.len())),
+                "bg-image rect/extent moved for {name}"
+            );
+            assert_eq!(got, want, "bg-image sampling moved for {name}");
+        }
+
+        // ...and the converse error — leaving an ordinary textured quad on the
+        // crop path — would make these agree.  Every case but the 1:1 one must
+        // now differ, because that is exactly what I5 and M1 are.
+        for (name, dest_f, tex_f) in BG_CASES {
+            if name == "integral 1:1" {
+                // The identity property: a 1:1 quad at integral coordinates
+                // must still select the very texels the old blit did, so this
+                // case is *expected* to agree and cannot carry the assertion.
+                assert_eq!(
+                    walk(&Quad::new(false, dest_f, tex_f, 4096, 4096)),
+                    legacy_oracle(dest_f, tex_f),
+                    "the 1:1 identity moved"
+                );
+                continue;
+            }
+            assert_ne!(
+                walk(&Quad::new(false, dest_f, tex_f, 4096, 4096)),
+                legacy_oracle(dest_f, tex_f),
+                "{name} is still being cropped rather than scaled"
+            );
+        }
+
+        // Pinned values, so the pair above cannot both be wrong the same way.
+        // Sub-pixel origin: truncation gives 10, the coverage rule ceil(10.1)
+        // gives 11 — the whole-pixel displacement M1 names.
+        let (dest_f, tex_f) = (BG_CASES[1].1, BG_CASES[1].2);
+        assert_eq!(Quad::new(true, dest_f, tex_f, 4096, 4096).dest_rect(), [10, 20, 30, 40]);
+        assert_eq!(Quad::new(false, dest_f, tex_f, 4096, 4096).dest_rect(), [11, 21, 31, 41]);
+        // Magnified 1:4: same rect either way, but the crop stops after 10 of
+        // the 40 destination pixels while the sampler covers all 40.
+        let (dest_f, tex_f) = (BG_CASES[2].1, BG_CASES[2].2);
+        assert_eq!(Quad::new(true, dest_f, tex_f, 4096, 4096).blit_end(), Some((10, 10)));
+        assert_eq!(Quad::new(false, dest_f, tex_f, 4096, 4096).blit_end(), Some((40, 40)));
+    }
+
+    #[test]
+    fn mirrored_tiles_are_still_dropped_because_they_are_background_images() {
+        // `BackgroundRepeat::Mirror` swaps the texcoords
+        // (`background.rs:572-577`), so a mirrored tile arrives with a negative
+        // source extent.  Today `blit_w <= 0` drops such a quad entirely; the
+        // sampler would draw it, walking the source backwards.  That is a real,
+        // user-visible behaviour change — and it is NOT reachable from this
+        // task, because those two swaps are immediately followed by
+        // `set_is_background_image()` (`background.rs:580`), the only producer
+        // of `has_color == 2.0` in the tree, and this task keeps that branch on
+        // the crop path.  So the mirrored tile stays dropped:
+        let (_, dest_f, tex_f) = BG_CASES[4];
+        assert_eq!(Quad::new(true, dest_f, tex_f, 4096, 4096).blit_end(), None);
+
+        // The change is nonetheless real, and this pins what it would do if a
+        // later task routes background images through the sampler:
+        //   s(p) = 110 + ((p + 0.5 - 0) / 10) * (100 - 110) = 109.5 - p
+        let sampled = Quad::new(false, dest_f, tex_f, 4096, 4096);
+        assert_eq!(sampled.blit_end(), Some((10, 10)));
+        let cols: Vec<i32> = (0..10).map(|x| sampled.texel_x(x)).collect();
+        assert_eq!(cols, vec![109, 108, 107, 106, 105, 104, 103, 102, 101, 100]);
     }
 
     #[test]
