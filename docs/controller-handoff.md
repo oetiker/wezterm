@@ -10,7 +10,7 @@
 > not blank page. On merge into another branch, rewrite that branch's handoff
 > to the merged reality — do not merge or preserve this text.
 
-Handoff commit: written at `bb52ba3`   Date: 2026-08-11   Reason: context budget
+Handoff commit: written at `bb52ba3`, refreshed after Task 6 (see `git log bb52ba3..HEAD`)   Date: 2026-08-11   Reason: context budget
 Worktree / branch: `/scratch/oetiker/wezterm` (primary checkout) @ `update-optimization-rebased`
 Trunk at time of writing: `main` @ 05343b3 — **reader: if trunk has moved, §2 is provisionally stale; if trunk now contains this branch's HEAD, this file is a tombstone** (`git merge-base --is-ancestor HEAD main`). `main` here is upstream wezterm and legitimately runs ahead of this branch by ordinary upstream commits; that is NOT a merge signal.
 Sibling worktrees: `/scratch/oetiker/claude-worktrees/wezterm-osc52-upstream` @ `osc52-x11-fix` — the two-commit upstream PR (wezterm/wezterm#8043), unrelated; leave it alone until that PR resolves. This line cannot see worktrees created later; check yourself.
@@ -41,10 +41,16 @@ B is a strict *prefix* of C, so C stays available afterwards with tests in place
 
 Two load-bearing facts, both verified in code rather than assumed:
 
-- **The GPU samples the atlas `Nearest`** for glyphs, emoji and images
-  (`render/draw.rs:215-218`); `Linear` is only for the window background
-  attachment (out of scope). So the missing resampler is nearest-neighbour and
-  **bit-exact parity on scaled quads is reachable**, not approximate.
+- **The GPU samples the atlas `Nearest`** for glyphs, colour emoji and grayscale
+  quads (`render/draw.rs:215-218`, and glium's `Clamp` really is
+  `GL_CLAMP_TO_EDGE`, checked). So the missing resampler is nearest-neighbour and
+  **bit-exact parity on those quads is reachable**, not approximate — with the
+  caveat in §2 about exact-ratio minification.
+  **Correction, established by Task 6's review:** `Linear` serves the
+  `has_color == 2.0` background-image branch, and **PureCpu does draw that
+  branch** (`purecpu.rs:440`) — earlier versions of this handoff and the sampler's
+  module doc both said it does not. It stays out of scope, but "out of scope"
+  means *leave it alone*, not *it isn't there*. See §2's rulings.
 - **The LCD subpixel data is already in the atlas** — per-channel sRGB coverage
   in R/G/B with max-alpha in A (`skrifa_rasterizer.rs:695-701`). PureCpu's
   `IS_GLYPH` branch reads only `tex_a`. So subpixel AA is a compositing fix, not
@@ -74,10 +80,24 @@ authoritative on task state — trust it and `git log` over anything here.
   - Two findings were recorded, not fixed: **no `painted_y_span`** (the vertical
     mirror of what Task 4 fixed on x) and **viewport-scroll `force_full` is still
     active-pane-only**. See §5 and §7.
-- **Task 6 — IN FLIGHT at this commit.** Dispatched to subagent `task6-impl`
-  (agent name `task6-impl-2`) against brief `task-6-brief.md`. **See §3.1 — it
-  needs a specific kind of check on arrival, and it may already have landed.**
-- **Tasks 7–14 — not started.** Suite is at 54 tests, 0 failed, 0 ignored.
+- **Task 6 — landed at `e3d2c07`, reviewed Approved with minors, FIX ROUND 1 IN
+  FLIGHT** with `task6-impl-2` (resumed) against `task-6-fix1-brief.md`. Suite
+  54 → 63. **See §3.1 — it may already have landed.** The unit is
+  `render/purecpu_sampler.rs`; no caller by design.
+- **Tasks 7–14 — not started.** Suite is at 63 tests, 0 failed, 0 ignored.
+
+**Two rulings from Task 6's review that Task 7 must inherit — do not
+re-litigate, do read the reasoning in the ledger:**
+- **Task 7 must NOT route `has_color == 2.0` (the background-image branch,
+  `purecpu.rs:440`) through the sampler.** GL bilinearly filters that branch, and
+  background image is out of scope by the user's own scope decision. Routing it
+  is silent scope expansion *and* manufactures parity diffs that look like
+  sampler bugs. The module doc claimed PureCpu "does not draw" that branch; it
+  does, and that claim is being corrected in fix round 1.
+- **Exact-ratio minification (2:1, 3:1, …) is the expected home of 1-texel parity
+  diffs**, because every sample lands precisely on a texel boundary where
+  hardware interpolation precision decides the tie. Triage a diff there as
+  interpolation precision, not as a sampler defect.
 
 **Task order was changed once** (Task 5 before Task 4) and that is done and
 absorbed; tasks are otherwise in plan order. The plan document was never
@@ -85,24 +105,36 @@ rewritten — only the order changed.
 
 ## 3. Do this next
 
-1. **Deal with Task 6 first — and check the worktree, do not infer from
-   silence.** An idle notification is not a report (§4). Three signatures, three
-   opposite remedies: clean tree + commit → finished silently, go read
-   `task-6-report.md`; dirty tree + no build running → stalled, run the gates and
-   commit for it; dirty tree + a live `cargo` → deadlocked on a pending build,
-   `SendMessage` the *same* agent to resume, never re-dispatch. Note other users'
-   `cargo`/`rustc` processes are routinely visible on this box — check the command
-   line before concluding one is ours (the `mdmost-semantic-selection` worktree
-   was running its own `cargo test` throughout this session).
-2. **Task 6 is a pure unit — its review is cheap and should still happen.** No
-   runtime work is needed for it. The one thing to re-derive rather than read is
-   the **mutation table**: for each row, did the mutant perturb the value *that*
-   test reads? Everything else is a code read.
-3. **Then Task 7** (wire the sampler into the quad loop). Keep the 6/7 split —
-   units are deliberately separated from their integrations so a reviewer can
-   reject the arithmetic without rejecting the wiring. Task 7 is where the four
-   bit-identical parity rows are at risk; `identity_when_source_and_dest_extents_match`
-   is the property that protects them.
+1. **Deal with Task 6's fix round first — and check the worktree, do not infer
+   from silence.** An idle notification is not a report (§4). Three signatures,
+   three opposite remedies: clean tree + commit → finished silently, go read the
+   "Fix round 1" section of `task-6-report.md`; dirty tree + no build running →
+   stalled, run the gates and commit for it; dirty tree + a live `cargo` →
+   deadlocked on a pending build, `SendMessage` the *same* agent to resume, never
+   re-dispatch. Note other users' `cargo`/`rustc` processes are routinely visible
+   on this box — check the command line before concluding one is ours (the
+   `mdmost-semantic-selection` worktree ran its own `cargo test` throughout this
+   session).
+2. **Re-derive the fix round's two mutant results rather than reading them:**
+   with the strengthened identity axis (`Axis::new(64.0, 10.0, 100.25, 10.0, 4096)`),
+   both M10 (identity special-cased) and M5 (`+ 0.5` dropped) must fail *on the
+   identity test itself* at `63 → 64`. That is the whole point of the round — it
+   converts three single-test guards into two-test guards.
+3. **Then Task 7** (wire the sampler into the quad loop, plan line 1133). Keep
+   the 6/7 split — units are deliberately separated from their integrations so a
+   reviewer can reject the arithmetic without rejecting the wiring. Task 7's brief
+   **must** require:
+   - the two inherited rulings in §2 (no `has_color == 2.0` routing; exact-ratio
+     minification triage);
+   - a **composition test for the seam**. `cover_start`/`cover_end` and `texel`
+     have never been used together — every Task 6 test drives `texel` with a
+     hand-written pixel range. An off-by-one in how Task 7 joins them (iterating
+     `cover_start..=cover_end` instead of `..`) is invisible to the current suite.
+     This is the largest known gap, and it is precisely what Task 7 writes;
+   - awareness that **mirrored background tiles** (negative `src_extent`) go from
+     *silently dropped* to *drawn* — correct, but a behaviour change nobody has
+     written down.
+   Task 7 is where the four bit-identical parity rows are at risk.
 4. **Do not run a review and an implementation concurrently in this worktree.**
    Both edit the tree and build; they will corrupt each other. One at a time.
 5. **Nothing needs the user until Task 14**, with one exception now queued: the
@@ -171,6 +203,28 @@ Carried forward from the prior sessions where still true, plus this one's.
   they are internally consistent). Keep running the scan — it has paid for itself
   every time it found something, and a clean result costs ten minutes. Do not
   generalise either way.
+- **A test that asserts no value discriminates almost nothing.** Task 6's
+  `degenerate_extents_do_not_panic` is `let _ = a.texel(5)`, so deleting the guard
+  it exists to protect left the plan's entire eight-test suite green while the
+  function returned **three different answers** depending on which unwritten
+  language rule caught it (guard → 10; `NaN → 0`; `inf → i32::MAX → 4095`). Pin
+  values, not the absence of a panic.
+- **Ask "which single test is the only guard on X?" — the answer is usually
+  alarming.** Task 6's review found the half-texel `+ 0.5` guarded by
+  `minifies_two_to_one` alone, `dest_origin` guarded by the identity test alone,
+  and the identity test unable to kill its own named mutant. All three collapsed
+  into **one added assertion** with a sub-pixel origin. Single-test guards are
+  invisible until someone enumerates them; enumerate them.
+- **A reviewer that RUNS its proposed fix is worth several that argue for one.**
+  Task 6's review did not merely claim the identity test could be strengthened —
+  it wrote the axis, ran both mutants against it, and pasted the `63 → 64`
+  failures. That is the standard to brief reviewers toward.
+- **Verify library semantics, not just your own code.** The same review checked
+  that glium's `SamplerWrapFunction::Clamp` maps to `GL_CLAMP_TO_EDGE` rather than
+  legacy `GL_CLAMP` (which blends toward a border colour), and that
+  `to_texture_coords` uses exact sprite edges rather than the very common
+  `(i+0.5)/w` half-texel inset. Either could have made the whole unit
+  confidently wrong with every test agreeing.
 - **Verify runtime preconditions; a static trace is not an observation.** The
   project's dominant failure mode is a measurement reporting a result the
   instrument or corpus could not actually see. Every verdict must answer *"could
@@ -381,7 +435,7 @@ matter most, plus this session's additions:
 - The Noto Color Emoji `glyph.scale = 0.159` result is font-installation
   dependent. A font change invalidates it and Task 7's verification would silently
   become a null result.
-- The suite was **54 tests** at this commit. Use the delta, not the absolute
+- The suite was **63 tests** after Task 6 (54 before it). Use the delta, not the absolute
   number, when grading later tasks.
 - Line numbers in §6 were accurate at this commit and drift with every edit to
   `mod.rs`. Grep, don't trust them.
