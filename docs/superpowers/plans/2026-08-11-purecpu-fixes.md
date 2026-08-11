@@ -1132,6 +1132,43 @@ git commit -m "feat(purecpu): add the nearest-neighbour atlas sampler, with test
 
 ### Task 7: I5 + M1 — route every textured quad through the sampler
 
+> **Landed as `773b845`, reviewed, fix round `a0ee332`. Two things the review
+> established that this task's text never anticipated — read them before touching
+> the blit loop again:**
+>
+> **1. An accepted, GL-correct scope expansion: every solid-colour quad changed
+> geometry.** `dest_rect()` replaced the truncating `as i32` for *all* quads, not
+> just textured ones, so `has_color == 3.0` moved onto the coverage rule too. That
+> branch's sole producer is `filled_rectangle` (`render/mod.rs:267`, 12 call
+> sites): cell backgrounds, cursor, selection, borders, split dividers, tab bar.
+> This is **correct** — the coverage rule is what GL's rasteriser does — and it is
+> visible in Task 7's own numbers (`cursor` 1095 → 958, `preguard` 2622 → 2458).
+> Thin rects at fractional heights now appear or vanish exactly as GL decides,
+> which is the intended consequence, not a defect. **Accepted, not accidental.**
+>
+> Two caveats on it, the second of which the review got wrong:
+>
+> - Nothing holds it. No test covers a solid quad's geometry.
+> - The review argued adjacent solid quads cannot seam because cell `k` ends at
+>   `cover_end(e)` and cell `k+1` starts at `cover_start(e)` for the same edge
+>   `e`. **They do not carry the same `e`.** `screen_line.rs:231-251` builds a
+>   span's right edge as `(left + i*cw) + (w*cw)` and the next span's left edge as
+>   `left + ((i+w)*cw)` — different association order, so they may differ by an
+>   ulp, and an ulp across a pixel centre is a 1px seam. This is the project's
+>   documented float trap (see `pane.rs`'s `x + ((cols*cw) + width_delta)`).
+>   Exposure is *lower* than before: truncation's cliff sat at integers, exactly
+>   where edges land for integral `cell_width`; the coverage rule's cliff sits at
+>   half-integers, maximally far from them. Only fractional `cell_width` is
+>   exposed, and only at cluster boundaries. **Unmeasured. A frame with fractional
+>   cell widths and per-cell background colours is what would settle it.**
+>
+> **2. Nothing in the suite executes the blit loop.** Proven twice, independently:
+> an unconditional `panic!` as the first statement inside `for clip in
+> &clip_rects` leaves the suite at 69 passed, exit 0. `walk()` in
+> `purecpu_sampler.rs` is a *transcription* of the loop, not the loop. Every
+> correctness claim about that loop — including the review's own closed-form
+> equivalence proof — is a claim about code that was read, not run. Task 15.
+
 **Files:**
 - Modify: `wezterm-gui/src/termwindow/render/purecpu.rs:257-267` (destination rect), `:290-296` (source rect), `:344-382` (the blit loop)
 
@@ -1756,6 +1793,8 @@ cd /scratch/oetiker/wezterm && cargo test -j4 -p wezterm-font 2>&1 | tail -10
 
 Expected: everything green, and materially more tests than the 29 + 1 the review found — the review's point was that a green suite said nothing because `purecpu.rs`'s tests did not touch the rasterising path. Tasks 3, 6 and 8 changed that; confirm the count reflects it.
 
+**But do not report that the point is closed.** Task 7's review proved the blit loop itself is still executed by no test — a `panic!` inside it leaves the suite green. The units feeding the loop are tested; the loop is not. Either Task 15 has landed by the time you write this up, in which case say so and cite the two mutants it kills, or it has not, in which case **the honest sentence is that the rasterising path is tested at its edges and unexecuted at its centre.**
+
 - [ ] **Step 8: Commit**
 
 ```bash
@@ -1781,3 +1820,44 @@ git commit -m "docs(purecpu): update the review deliverables to the post-fix bin
 - Whether a font yielding `glyph.scale != 1` exists on this machine (Task 1 Step 8). If not, that matrix row stays unverified and says so.
 - Whether M2 survives Task 4 at all (Task 11 Step 2).
 - Whether the shader-equivalence rewrite (spec §3 option C) becomes worthwhile now that the sampler and dirty units have tests.
+
+---
+
+### Task 15: A framebuffer harness for the blit loop — added by Task 7's review
+
+**Status: proposed, not authorised.** Added by the controller after Task 7's
+review; the user has not yet ruled on whether it belongs in this pass.
+
+**Why.** `call_draw_purecpu` is executed by no test. An unconditional `panic!` on
+the first line of its clip loop leaves the suite green (69 passed, exit 0), so the
+clip arithmetic, the `has_color` dispatch, the solid-colour fill and the blend are
+all unreached. The units around it are well tested — `purecpu_dirty`,
+`purecpu_sampler` — and the loop that consumes them is not. Every parity number in
+this pass is whole-frame image comparison, which is evidence but not an assertion,
+and it costs a display, a binary and a corpus to obtain.
+
+**Shape.** Give `call_draw_purecpu` a seam taking
+`(&mut fb, fb_w, fb_h, &atlas, &[Vertex], &[dirty_rect])` so a test can drive it
+with a 16x16 framebuffer and a hand-built atlas, then re-point `walk()` at the
+real loop so it stops being a second implementation free to drift from the first.
+
+**What it immediately unlocks, in priority order:**
+
+1. **The three cases `legacy_oracle` structurally cannot reach**, all worked on
+   paper in the review's Ruling 1 and none executed: a negative destination
+   origin, a partially off-screen quad, an empty clip intersection.
+2. **The solid-quad seam question** (Task 7's note above) — a fractional
+   `cell_width` with per-cell background colours, asserted rather than
+   photographed. This is the cheaper answer to it; the alternative costs a capture
+   on `:20`.
+3. **Task 7 review Finding 3, deferred until this exists:** `tex_f` and
+   `Quad::new` now run *before* the `clip_rects.is_empty()` bail, so on an
+   incremental repaint every non-overlapping quad pays for a `Quad` it discards —
+   a regression in the one dimension this module exists to optimise. The fix is to
+   build the `Quad` after the clip test, which means deriving the destination rect
+   without it; **do not duplicate the coverage rule at the call site to achieve
+   that** — hoist it into an associated function so there is still exactly one
+   copy. Restructuring this loop is only safe once something executes it.
+
+**Verification.** Both mutants that survive today must die: `cy2.min(blit_y2)` ->
+`cy2.min(blit_y2 + 1)`, and an unconditional `panic!` in the clip loop.
