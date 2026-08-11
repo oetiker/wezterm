@@ -6,7 +6,7 @@ use ::window::WindowOps;
 use std::time::Instant;
 use termwiz::surface::SequenceNo;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirtyRect {
     pub x: i32,
     pub y: i32,

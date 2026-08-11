@@ -78,6 +78,7 @@ mod mouseevent;
 pub mod palette;
 pub mod paneselect;
 mod prevcursor;
+mod purecpu_dirty;
 pub mod render;
 pub mod resize;
 mod selection;
