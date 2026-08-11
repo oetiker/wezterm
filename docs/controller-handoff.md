@@ -10,7 +10,7 @@
 > not blank page. On merge into another branch, rewrite that branch's handoff
 > to the merged reality — do not merge or preserve this text.
 
-Handoff commit: c5cc8ab   Date: 2026-08-11   Reason: context budget
+Handoff commit: see git log for this file (written at c5cc8ab, amended after Task 2 review landed)   Date: 2026-08-11   Reason: context budget
 Worktree / branch: `/scratch/oetiker/wezterm` (primary checkout) @ `update-optimization-rebased`
 Trunk at time of writing: `main` @ 05343b3 — **reader: if trunk has moved, §2 is provisionally stale; if trunk now contains this branch's HEAD, this file is a tombstone** (`git merge-base --is-ancestor HEAD main`). `main` here is upstream wezterm and legitimately runs ahead of this branch by ordinary upstream commits; that is NOT a merge signal.
 Sibling worktrees: `/scratch/oetiker/claude-worktrees/wezterm-osc52-upstream` @ `osc52-x11-fix` — the two-commit upstream PR (wezterm/wezterm#8043), unrelated; leave it alone until that PR resolves. This line cannot see worktrees created later; check yourself.
@@ -73,9 +73,15 @@ authoritative on task state — trust it and `git log` over anything here.
   hits, no instrumentation added. That closes spec §10's first open question and
   means Task 7's resampler can be verified against a real trigger instead of a
   null result. Corpus: `tools/purecpu-parity/corpus/scaled-glyph.sh`.
-- **Task 2 — implemented, NOT reviewed** (`c5cc8ab`). The atlas ceiling
-  (`PURECPU_MAX_TEXTURE_SIZE = 8192`) plus a `bail!` on the PureCpu arm, with
-  2 unit tests passing. **The review never completed** — see §3.
+- **Task 2 — complete** (`4c5488b..c5cc8ab`, review clean, 2 deferred minors).
+  The atlas ceiling (`PURECPU_MAX_TEXTURE_SIZE = 8192`) plus a `bail!` on the
+  PureCpu arm. **C1 is confirmed fixed at runtime, not by argument:** peak RSS
+  **637 MiB against a pre-fix 4170 MiB**, and the `AllowImage::Scale` fallback
+  fired **168 times** (`Not enough texture space … max 8192 … will retry render
+  with Scale(2)/Scale(4)`). No crash; the sixel gradient still renders, degraded
+  rather than blank. That settles the implementer's self-flagged static-trace
+  weak point — the review's only Critical finding is closed with an observation
+  behind it.
 - **Tasks 3–14 — not started.**
 
 **No renderer behaviour beyond C1 has changed yet.** Everything else in the plan
@@ -92,26 +98,20 @@ person's terminal. The constraint had been written at the wrong layer. See §5.
 
 ## 3. Do this next
 
-1. **Re-dispatch the Task 2 review. It is the only thing in flight and its state
-   is gone.** The reviewer was mid-run at rollover and never wrote
-   `.superpowers/sdd/2026-08-11-purecpu-fixes/task-2-review.md`; in-process
-   subagents do not survive a session. The diff package already exists at
-   `.superpowers/sdd/2026-08-11-purecpu-fixes/review-4c5488b..c5cc8ab.diff`, so
-   re-dispatch is cheap. **The core of that review is a runtime check, not a
-   code read:** the implementer verified only by *static trace* that the new
-   `bail!` reaches the `AllowImage::Scale` downscale-and-retry fallback at
-   `paint.rs:70-92`, and flagged that itself as its weakest point. Have the
-   reviewer run C1's reproduce block from `findings.md` against the fixed
-   binary, sample **max** RSS across matching processes (that block's own
-   comment warns `pgrep | head -1` picks the parent and once understated the
-   finding by three orders of magnitude), and **abort if RSS exceeds 6 GiB**
-   (pre-fix peak was 4170 MiB; the box has ~25 GiB shared with other people).
-   Post-fix this run is bounded, which is the whole point of doing it.
-2. **Then continue the plan from Task 3**, in order. Tasks 3/6 (the units) are
-   deliberately split from Tasks 4/7 (their integrations) so a reviewer can
-   reject the arithmetic without rejecting the wiring.
+1. **Start at Task 3.** Nothing is in flight and nothing is outstanding — Task 2's
+   review landed clean just after this file was first written (§2). Read the
+   ledger first to confirm, then dispatch Task 3's implementer.
+2. **Tasks 3/6 (the units) are deliberately split from Tasks 4/7 (their
+   integrations)** so a reviewer can reject the geometry or the sampling
+   arithmetic without rejecting the wiring. Keep that split; do not merge them
+   to save a round.
 3. **Nothing needs the user until Task 14.** They chose straight-through
    execution with a single review at the end. Do not check in between tasks.
+4. **Carry the runtime-verification bar forward.** Task 2's review was worth far
+   more than a code read because it *ran* the thing: it turned "the fallback
+   should be reached" into "it fired 168 times and peak RSS was 637 MiB". Every
+   later task has an equivalent — Task 7 has the six no-drift rows, Task 10 has
+   the idle-CPU measurement and the `purecpu_force_full_repaint` control.
 
 ## 4. Lessons & traps  ← the irreplaceable part
 
@@ -257,8 +257,8 @@ ones that matter most:
 
 ## 7. Open questions / pending decisions
 
-- **Does the C1 bail actually reach the `AllowImage::Scale` fallback at
-  runtime?** Argued statically, never observed. §3.1 is how to settle it.
+- ~~Does the C1 bail reach the `AllowImage::Scale` fallback at runtime?~~
+  **Settled: yes, observed 168 times, peak RSS 637 MiB.** See §2.
 - **Does M2 survive Task 4?** Deferred on purpose (Task 11). Its attribution to
   a specific rect overlap was tested and eliminated twice; Task 4 rewrites the
   dirty-rect geometry that is the suspected source, so M2 may simply not exist
@@ -281,10 +281,11 @@ ones that matter most:
   handoff. Note `main` is upstream wezterm and legitimately runs ahead.
 - **Sibling worktrees / other workstreams may exist that this file cannot name** —
   anything started after the handoff commit is invisible here.
-- **One thing WAS in flight at this commit**: the Task 2 review (§3.1). Its
-  subagent did not survive rollover and wrote no file. If you find
-  `task-2-review.md` present, a session after this one produced it — trust the
-  file and the ledger over this paragraph.
+- **Nothing was in flight when this file was finalised.** An earlier draft said
+  the Task 2 review was abandoned mid-run; that reviewer then completed and
+  wrote `task-2-review.md` (Approved). §2, §3 and §7 were corrected before this
+  commit. The ledger records both the abandonment and the landing, in order —
+  read it if the two ever appear to disagree.
 - Task state in §2 reflects the ledger at this commit. **The ledger is
   authoritative; read it rather than trusting §2.**
 - The `:20` X server and its Xauthority are ordinary user processes/files and may
