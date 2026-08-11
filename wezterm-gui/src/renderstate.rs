@@ -19,6 +19,21 @@ use wgpu::util::DeviceExt;
 
 const INDICES_PER_CELL: usize = 6;
 
+/// Maximum atlas side length for the PureCpu renderer.
+///
+/// The Glium arm bails when the requested size exceeds the GPU's
+/// max_texture_size, and that bail is what drives the caller into its
+/// AllowImage::Scale(2) downscale-and-retry fallback.  The PureCpu arm had no
+/// equivalent, so the atlas side was chosen from the decoded pixel width of an
+/// inline image — i.e. from anything that reaches the tty.  A 1527-byte sixel
+/// reached 32768, which is 4 GiB of *touched* memory (Atlas::new writes the
+/// whole rect), and the next doubling is 16 GiB.
+///
+/// 8192 costs 256 MiB at RGBA and matches the smallest max_texture_size we are
+/// likely to meet on the GL side, so PureCpu and OpenGL fall back at
+/// comparable points.
+pub const PURECPU_MAX_TEXTURE_SIZE: usize = 8192;
+
 #[derive(Clone)]
 pub enum RenderContext {
     Glium(Rc<GliumContext>),
@@ -112,6 +127,14 @@ impl RenderContext {
             }
             Self::PureCpu => {
                 use ::window::bitmaps::ImageTexture;
+                if size > PURECPU_MAX_TEXTURE_SIZE {
+                    anyhow::bail!(
+                        "Cannot use a texture of size {} as it is larger \
+                         than the max {} supported by the PureCpu renderer",
+                        size,
+                        PURECPU_MAX_TEXTURE_SIZE
+                    );
+                }
                 let texture: Rc<dyn Texture2d> = Rc::new(ImageTexture::new(size, size));
                 Ok(texture)
             }
@@ -804,5 +827,39 @@ impl RenderState {
 
         *glyph_cache = new_glyph_cache;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn purecpu_atlas_rejects_oversize() {
+        let ctx = RenderContext::PureCpu;
+        // 32768 is the size a 17000x64 sixel drives the atlas to; it costs
+        // 4 GiB of touched memory, so this must be refused rather than
+        // allocated.  Do NOT change this test to allocate the buffer.
+        // Rc<dyn Texture2d> isn't Debug, so expect_err()/unwrap_err() (which
+        // require T: Debug) don't compile here; match instead.
+        let err = match ctx.allocate_texture_atlas(32768) {
+            Ok(_) => panic!("32768 must be refused"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("larger than the max"),
+            "unexpected error text: {err}"
+        );
+    }
+
+    #[test]
+    fn purecpu_atlas_accepts_ordinary_sizes() {
+        // Proves the ceiling refuses rather than blanket-rejecting.  Uses a
+        // small size deliberately: allocating PURECPU_MAX_TEXTURE_SIZE here
+        // would touch 256 MiB on every test run for no extra coverage, and
+        // this box is shared.
+        let ctx = RenderContext::PureCpu;
+        assert!(ctx.allocate_texture_atlas(1024).is_ok());
+        assert!(PURECPU_MAX_TEXTURE_SIZE >= 4096, "ceiling too low for ordinary use");
     }
 }
