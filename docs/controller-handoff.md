@@ -1,4 +1,4 @@
-# Controller Handoff — PureCpu parity review (wezterm fork)
+# Controller Handoff — PureCpu fix pass (wezterm fork)
 
 > Starter pack for the next controller session. This handoff lives in ONE
 > worktree — run `git worktree list` first and confirm this is the workstream
@@ -10,274 +10,267 @@
 > not blank page. On merge into another branch, rewrite that branch's handoff
 > to the merged reality — do not merge or preserve this text.
 
-Handoff commit: c057c04   Date: 2026-08-11   Reason: plan complete
+Handoff commit: c5cc8ab   Date: 2026-08-11   Reason: context budget
 Worktree / branch: `/scratch/oetiker/wezterm` (primary checkout) @ `update-optimization-rebased`
-Trunk at time of writing: `main` @ 05343b3 — **reader: if trunk has moved, §2 is provisionally stale; if trunk now contains this branch's HEAD, this file is a tombstone** (`git merge-base --is-ancestor HEAD main`). `main` here is upstream wezterm and runs ahead of this branch by ordinary upstream commits; that is normal and is NOT a merge signal.
-Sibling worktrees: `/scratch/oetiker/claude-worktrees/wezterm-osc52-upstream` @ `osc52-x11-fix` — the two-commit upstream PR (wezterm/wezterm#8043), unrelated to this review; leave it alone until that PR resolves. This line cannot see worktrees created later; check yourself.
+Trunk at time of writing: `main` @ 05343b3 — **reader: if trunk has moved, §2 is provisionally stale; if trunk now contains this branch's HEAD, this file is a tombstone** (`git merge-base --is-ancestor HEAD main`). `main` here is upstream wezterm and legitimately runs ahead of this branch by ordinary upstream commits; that is NOT a merge signal.
+Sibling worktrees: `/scratch/oetiker/claude-worktrees/wezterm-osc52-upstream` @ `osc52-x11-fix` — the two-commit upstream PR (wezterm/wezterm#8043), unrelated; leave it alone until that PR resolves. This line cannot see worktrees created later; check yourself.
 
 ## 1. Mission
 
-The user's fork carries two large unreviewed changes on top of upstream
-`e723cf5`: a pure-Rust font stack (skrifa/harfrust/fontdb) and a new `PureCpu`
-software renderer for GPU-less operation. The job is to **review the patch and
-establish where PureCpu falls short of the GPU backend** — producing a defect
-findings list and an evidence-backed parity matrix, *not* fixes. The user
-decides what gets fixed after reading both.
+The predecessor session **reviewed** this fork's PureCpu software renderer
+against the GPU backend and produced documents only (`docs/purecpu-review/`).
+This session is the **fix pass**: repair everything that review found, so
+`front_end = "PureCpu"` on a GPU-less Linux/X11 box loses as little as possible
+against `front_end = "OpenGL"`.
 
-The mental model that matters: PureCpu is not a separate pipeline. It consumes
-the **same layer/quad stream** the GPU path emits, from the **same single glyph
-atlas**. So parity gaps are not "missing features" — they are places where the
-hand-written rasteriser cannot reproduce what the GPU's fixed function does.
-**Three** root causes now explain nearly every confirmed parity defect: no
-texture rescaling (`purecpu.rs:346` blits 1:1 and crops), the idle-skip
-(`termwindow/mod.rs:1436-1447` returns early, so nothing time-driven repaints),
-and the raw-vs-resolved cursor shape (`mod.rs:1383`). The most severe defect in
-the whole review is none of those: the atlas has no size ceiling, so a ~1.5 KB
-sixel sequence allocates 4 GiB (findings C1), and that arm is fork-introduced.
+Scope was set by the user in brainstorming: **all 18 findings** (C1, I1–I5,
+M1–M7, L1–L5), **plus** subpixel-antialiased text and the scaled fallback/bitmap
+glyph row — two things the review had ruled outside its own findings list. The
+five `known gap` rows (background image, opacity, blur/HSB tint) stay **out of
+scope**: they were never examined, so they are investigation work, not repair.
 
-Scope is narrow by decision: personal fork, Linux/X11 only, no macOS/Windows/
-Wayland, no upstreamability. Background image and transparency are out of scope.
+The structural decision that shapes the code (spec §3): **option B — point fixes
+plus two extracted units.** Three of the four root causes are *absences* (no
+resampler, no pane origin in the dirty rect, no per-channel coverage), and an
+absence fixed inline is invisible to the next reader. So a `dirty` unit and a
+`sampler` unit get extracted and tested; everything else stays a point fix. The
+user pushed back hard on this and asked why not option C (a full
+shader-equivalence rewrite of the quad loop) — **that argument is settled and
+written down in spec §3; do not relitigate it, but do read it**, because the
+reasoning is the honest kind: C restructures the site of only 5 of 18 findings,
+and it spends its risk exactly where the code is already bit-identical to the
+GPU. B is a strict *prefix* of C, so C stays available afterwards with tests in
+place.
+
+Two facts discovered while designing, both load-bearing and both verified in
+code rather than assumed:
+
+- **The GPU samples the atlas `Nearest`** for glyphs, emoji and images
+  (`render/draw.rs:215-218`); `Linear` is used only for the window background
+  attachment (`glyph-frag.glsl:121`), which is out of scope. So the missing
+  resampler is nearest-neighbour, and **bit-exact parity on scaled quads is
+  reachable** rather than approximate.
+- **The LCD subpixel data is already in the atlas** — per-channel sRGB coverage
+  in R/G/B with max-alpha in A (`skrifa_rasterizer.rs:695-701`). PureCpu's
+  `IS_GLYPH` branch reads only `tex_a` and throws the rest away. So subpixel AA
+  is a compositing fix (a per-channel `blend_over` mirroring GL's dual-source
+  blend), not new rasterisation.
 
 ## 2. Where we are now
 
-As of handoff commit c057c04 (re-derive merge/push state — see §8):
+As of handoff commit c5cc8ab (re-derive merge/push state — see §8):
 
-**All eight tasks are complete.** Each was implemented by a subagent, reviewed
-by a second, and fix-looped to a clean re-review. The ledger is authoritative.
+**Execution mode: subagent-driven development**, at the user's explicit request.
+The ledger at `.superpowers/sdd/2026-08-11-purecpu-fixes/progress.md` is
+authoritative on task state — trust it and `git log` over anything here.
 
-- **Tasks 1–3** — static audit, harness, noise-floor gate: PROCEED for the
-  terminal body (PAE=257 = 1 LSB), **STOP for the tab strip**, which therefore
-  has no calibrated noise floor to grade against.
-- **Task 4 (inline images)** — 4 fix rounds. Sixel, iTerm2 and animated GIF all
-  `degraded`.
-- **Task 5 (chrome)** — 2 fix rounds. Fancy tab bar `degraded` (two classes: 37
-  columns a clean 1px shift, 99 columns sub-pixel divergence ~77 LSB); retro tab
-  bar, window buttons, rounded corners, split dividers all `parity`.
-- **Task 6 (cursor/animation)** — 2 fix rounds. Cursor static `parity` (block,
-  bar and underline all cell-bit-identical); cursor blink `missing` for
-  config-driven blink, with the app-driven DECSCUSR path separately `degraded`;
-  blink-attribute text `missing`; visual bell `missing`. Established the third
-  root cause.
-- **Task 7 (defect findings)** — 1 fix round, closed clean. `findings.md`:
-  1 Critical, 5 Important, 7 Medium, 5 Low, plus seven documented non-findings.
-  Ids were **renumbered** during the fix round (now C1 / I1–I5 / M1–M7 / L1–L5);
-  ledger lines written before that use the old scheme.
-- **Task 8 (consolidation)** — 2 fix rounds, closed clean. Produced
-  `docs/purecpu-review/README.md`, the summary the user actually asked for.
+- **Task 1 — complete** (`415b6c0..4c5488b`, review clean after 1 fix round).
+  Harness prerequisites: the `check_bell_disabled` guard wired into all five
+  wezterm-launch sites, `wezterm-gui-prefix` preserved as the pre-fix reference
+  binary, and the scaled-glyph font question **answered YES from runtime
+  evidence** — Noto Color Emoji yields `glyph.scale = 0.159`, seen through
+  wezterm's own `log::trace!` at `glyphcache.rs`'s `scale != 1.0` branch, 4/4
+  hits, no instrumentation added. That closes spec §10's first open question and
+  means Task 7's resampler can be verified against a real trigger instead of a
+  null result. Corpus: `tools/purecpu-parity/corpus/scaled-glyph.sh`.
+- **Task 2 — implemented, NOT reviewed** (`c5cc8ab`). The atlas ceiling
+  (`PURECPU_MAX_TEXTURE_SIZE = 8192`) plus a `bail!` on the PureCpu arm, with
+  2 unit tests passing. **The review never completed** — see §3.
+- **Tasks 3–14 — not started.**
 
-**THE PLAN IS COMPLETE.** All eight tasks closed, each implemented by one
-subagent, reviewed by an independent second, and fix-looped to a clean
-re-review. Deliverables: `docs/purecpu-review/{README,parity-matrix,findings,
-noise-floor}.md` plus the `tools/purecpu-parity/` harness. Matrix: 21 rows
-(14 measured / 2 by-reading / 5 out-of-scope; 6 `parity`, 7 `degraded`,
-3 `missing`, 5 `known gap`). Findings: 18 defects (1 Critical, 5 Important,
-7 Medium, 5 Low) plus 7 documented non-findings.
+**No renderer behaviour beyond C1 has changed yet.** Everything else in the plan
+— the two units, the pane-walk, the resampler, subpixel, the animation dirty
+rects — is untouched code.
 
-Task 8 also carried an authorised addendum: **DECDWL/DECDHL was measured**,
-because two by-reading verdicts had already been overturned by measurement and
-a third was about to ship unmeasured. It **confirmed** the prediction (body
-PAE=45232 against a 257 gate; GL lays down exactly 2.01x the ink) — the first
-by-reading prediction in the plan that measurement upheld — and turned up an
-unpredicted sub-case: the DECDHL *bottom* half is not drawn at all.
-
-Task 7 produced findings the parity harness was structurally blind to: **dirty
-tracking consults only the active pane** (other panes of a split never repaint
-until something forces a full repaint), and **dirty-rect geometry omits
-`pos.top`/`pos.left`** (even the active pane freezes when not at the window's
-top-left). For a user of this fork these may matter more than the matrix does.
-The blindness is **not** that captures were settled — Task 4 added a
-non-settling sampler. It is that every case put the content under test in a
-single full-width pane, where both offsets are zero and the active pane is the
-only one with live output (`findings.md:244-245`). A corpus can be blind along
-an axis nobody thought to vary, not only along the axis a tool cannot see.
-
-The wide-sixel label-row anomaly the plan carried since Task 4 is **diagnosed**:
-PureCpu composites cell 0's glyph pixels twice (a coverage model predicts all 87
-differing pixels within 1.91 LSB). The *mechanism* that can do it is in the code
-by construction; the specific route was attributed, then **tested and
-eliminated** across two deliberate reproductions. The remaining evidence needed
-is an instrumented dump of `dirty_pixel_rects` at the frame that produced it.
+**One incident worth knowing about, because it shaped the constraints.** The
+first Task 1 implementer caused an **audible bell in the user's own terminal**
+and was killed mid-run (nothing committed, no report). The cause is not
+recoverable — it was in-process and stopped before its transcript flushed — but
+every config on disk carried `audible_bell = 'Disabled'`, so wezterm was not the
+source: the BEL arrived through the **subagent's stdout**, which lands in a real
+person's terminal. The constraint had been written at the wrong layer. See §5.
 
 ## 3. Do this next
 
-**Nothing is in flight. Do not start work here without asking the user first** —
-the plan is done and what follows is all their call.
-
-1. **The user has still read none of it.** Point them at
-   `docs/purecpu-review/README.md` and let them drive. Lead with the two things
-   they'd act on: findings C1 (a ~1.5 KB sixel sequence allocates 4 GiB, on a
-   fork-introduced arm) and I1/I2 (split panes stop repainting).
-2. **Nothing has been fixed — by design.** The plan produced documents only.
-   What gets fixed, and in what order, has never been put to the user. If they
-   ask, the cheap high-value ones are C1 (a bounds check on one arm) and the 1:1
-   blit (nearest-neighbour scaling in one loop would address inline images,
-   double-width/height lines and scaled bitmap emoji together). **Fixing means a
-   new plan — the constraints in §5 assume a read-only source tree.**
-3. A whole-branch review pass — the fork's patch as a whole, beyond the
-   PureCpu/font/X11 scope Task 7 covered — remains undone. The ledger's ~12
-   deferred minors are its natural input.
+1. **Re-dispatch the Task 2 review. It is the only thing in flight and its state
+   is gone.** The reviewer was mid-run at rollover and never wrote
+   `.superpowers/sdd/2026-08-11-purecpu-fixes/task-2-review.md`; in-process
+   subagents do not survive a session. The diff package already exists at
+   `.superpowers/sdd/2026-08-11-purecpu-fixes/review-4c5488b..c5cc8ab.diff`, so
+   re-dispatch is cheap. **The core of that review is a runtime check, not a
+   code read:** the implementer verified only by *static trace* that the new
+   `bail!` reaches the `AllowImage::Scale` downscale-and-retry fallback at
+   `paint.rs:70-92`, and flagged that itself as its weakest point. Have the
+   reviewer run C1's reproduce block from `findings.md` against the fixed
+   binary, sample **max** RSS across matching processes (that block's own
+   comment warns `pgrep | head -1` picks the parent and once understated the
+   finding by three orders of magnitude), and **abort if RSS exceeds 6 GiB**
+   (pre-fix peak was 4170 MiB; the box has ~25 GiB shared with other people).
+   Post-fix this run is bounded, which is the whole point of doing it.
+2. **Then continue the plan from Task 3**, in order. Tasks 3/6 (the units) are
+   deliberately split from Tasks 4/7 (their integrations) so a reviewer can
+   reject the arithmetic without rejecting the wiring.
+3. **Nothing needs the user until Task 14.** They chose straight-through
+   execution with a single review at the end. Do not check in between tasks.
 
 ## 4. Lessons & traps  ← the irreplaceable part
 
-- **The dominant failure mode of this entire plan is a silent false verdict** —
-  a measurement reporting a result the instrument or corpus could not actually
-  see. It has now appeared eight or nine distinct ways: a corpus requesting
-  images at native size so the crop was a no-op; `capture_settled` defining
-  success as "nothing changed" and so structurally excluding animation; a split
-  divider never on screen; a blink rate with a non-blinking cursor shape; two
-  blank captures; a rejected config that took down `front_end` so both windows
-  ran the same backend; and — Task 6's inversion — a **false `missing`**, where a
-  flat sample sequence is exactly what a window that never rendered also
-  produces. **Every verdict must answer "could this run have failed, and what
-  would that have looked like?"** Put it in every dispatch; it is what earns the
-  review rounds.
-- **The control experiment is the strongest instrument this plan found.** Task
-  6's reviewer settled three verdicts at once by setting
-  `purecpu_force_full_repaint = true` on an otherwise identical config and
-  showing the bell and blink text return at the GPU path's own levels. Prefer
-  "change one thing and watch the defect disappear" over accumulating more
-  observations of the defect. It converts "we observed X" into "X is caused by Y".
-- **Put the control INSIDE the capture.** The DECDWL corpus printed the same
-  text as an explicit single-width line *and* as a doubled one in one frame, so
-  the control read PAE=257 in the same capture the subject read 45232. A null
-  result then cannot pass as parity, because the frame proves the instrument was
-  working. Cheaper and stronger than any amount of after-the-fact argument.
-- **"Should we measure this?" is really "does this conclusion depend on a runtime
-  precondition nobody checked?"** Both by-reading verdicts this plan overturned
-  failed on preconditions, not mechanisms — the code readings were right, the
-  reachability wasn't tested. That test also says when NOT to measure: for scaled
-  fallback glyphs the precondition is font-dependent, so a null result would
-  prove nothing and would risk manufacturing a false `parity`. Measuring is not
-  automatically the safer choice.
-- **Fix the stale cell; don't add a rule for reading around it.** When a Method
-  column contradicted its own Evidence, the implementer proposed a precedence
-  clause ("Evidence wins"). That institutionalises the inconsistency and invites
-  readers to hunt for others. Correct the data.
-- **When a number has been wrong twice, mandate derivation over dictation — including
-  over your own.** I told the implementer to re-derive a count from the table
-  rather than take my arithmetic; my figure was wrong and its derived one was
-  right. A controller who dictates numbers becomes another unverified source.
-- **A printed command that nobody re-runs is a lie waiting to happen.** This has
-  now happened **five** times, and twice the wrong numbers were the reassuring
-  ones. The latest: the sole Critical's reproduce block used `pgrep | head -1`,
-  selecting the parent process, so it printed 4 MiB for a 4 GiB finding. Make
-  both implementer and reviewer copy commands out of the *rendered* file and run
-  them. Any env var the command needs goes IN the command.
-- **A fix can create the very failure it repaired.** Task 6's I1 fix promoted a
-  probe to load-bearing evidence while a section elsewhere still said the probe
-  "is not itself matrix evidence" — the document then contradicted itself, with
-  no runnable command behind its new numbers. Scope re-reviews to include "what
-  did the repair break?", not only "was the finding addressed?".
-- **Findings can be right about the phenomenon and wrong about its geometry.**
-  Task 7's M2 measured a real double-composite but binned it in 8-px bins on
-  10-px cells, concluding "two cells" and building an attribution on it. Check
-  that a measurement's *bins* align with the thing being measured.
-- **The plan's own text can be wrong, and a good implementer will follow it off a
-  cliff.** Five times now (FUZZ=3, the native-size corpus, Task 6's brief steps,
-  the `sed`-edited config, Task 7's `cargo test -p wezterm-gui --lib` against a
-  binary crate). When a review objects to a *plan-mandated* choice, the plan is
-  usually what needs fixing. Scan each brief against the Global Constraints
-  **before** dispatching and resolve conflicts in the dispatch itself.
-- **Amend the plan's Global Constraints when a lesson generalises.** Rules added
-  there are inherited by every later task for free — the cheapest leverage the
-  controller has. Latest addition: *grade a row against its own named feature,
-  not the mechanism behind it* (which is why animated GIF is `degraded` while
-  cursor blink is `missing`, despite one shared root cause).
+Carried forward from the review session where still true, plus this session's.
+
+- **A subagent's stdout lands in the human's real terminal.** This is the one
+  that actually bit. Guarding wezterm's `audible_bell` config was the wrong
+  layer: the exposure is *any* `0x07` byte in *any* command output. The rules
+  that hold, now in the plan's Global Constraints: redirect every
+  harness/build/wezterm command to a log file and Read it; never
+  `cat`/`head`/`tail` a binary file (`out/*.png`, `*.xwd` are full of BEL);
+  never run a corpus script directly (`corpus/cursor.sh` rings the bell by
+  design); and put the guard in place *before* the first wezterm launch.
+  Redirection is the durable rule because it does not depend on any config being
+  correct at the moment a command runs — which is precisely the assumption that
+  failed.
+- **When the user interjects, answer on the next turn — not two tool calls
+  later.** During the bell incident the user said "I am hearing the bell", then
+  had to say "you did not immediately pickup my comment". Both times I was
+  working on the wrong layer while they were telling me something that would
+  have corrected it. A user interjection outranks whatever is mid-flight.
+- **An idle notification is NOT proof a subagent is dead.** A reviewer went idle
+  and wrote nothing; I concluded it had died, then found a `cargo` build it had
+  launched still running. Check for live processes (`ps` for cargo/wezterm)
+  before concluding an agent failed — and prefer nudging it by message over
+  re-dispatching, since its context is intact.
+- **Verify runtime preconditions; a static trace is not an observation.** Both
+  by-reading verdicts the predecessor review overturned failed on preconditions,
+  not mechanisms. Task 2 reproduced the same shape: the fallback argument is
+  type-level and probably right, and it still needs to be watched firing. This
+  is the project's dominant failure mode — a measurement reporting a result the
+  instrument or corpus could not actually see, now seen in **nine or ten**
+  distinct ways. Every verdict must answer *"could this run have failed, and
+  what would that have looked like?"*
+- **The plan's own text can be wrong, and a good implementer will follow it off
+  a cliff.** This has now happened **eight** times across the two sessions.
+  Three more in this one: the brief named `corpus/text.sh`, which does not exist
+  (real file: `corpus/plain.sh`); `check_bell_disabled "$CONFIG"` referenced a
+  variable that does not exist; and the C1 test used `expect_err`, which needs
+  `T: Debug` that `Rc<dyn Texture2d>` does not have. All three were caught and
+  worked around by implementers — but only because they were told to flag
+  deviations. Keep asking for that.
+- **The pre-flight scan of your own plan pays for itself.** Before Task 1 I
+  found four defects in my own plan, two of them serious: the M7 test would have
+  **passed before the fix** (a vacuous TDD cycle), and the M6 test asserted
+  arithmetic inside the test rather than production code. Both are now real
+  tests against real defects — an unclamped `x0` that slices backwards and
+  panics, and an extracted `clamp_band`. Run that scan; do not assume a plan you
+  just wrote is sound.
+- **Reviewers earn their cost — again.** Task 1's reviewer found the one
+  wezterm-launch site (`focus-probe.sh:37,39`) that neither my brief nor the
+  implementer's own sweep caught. Every review across all three sessions has
+  found at least one Critical or Important defect. Do not skip or downgrade
+  them, especially not near the end.
+- **The control experiment is the strongest instrument this project has.**
+  Prefer "change one thing and watch the defect disappear" over accumulating
+  observations of the defect. For Task 10 the control already exists:
+  `purecpu_force_full_repaint = true` is the known-good ceiling.
+- **Put the control INSIDE the capture.** The DECDWL corpus printed the doubled
+  and single-width line in one frame, so the control read `PAE = 257` in the
+  same capture the subject read 45232. A null result then cannot pass as
+  success. Cheaper and stronger than any after-the-fact argument.
 - **Ask implementers to flag their own weak points.** Every task that did so
-  closed faster, and the self-flagged items were repeatedly where the real
-  findings were. Task 7 listed seven; the reviewer's Critical was adjacent to two.
+  closed faster and the self-flagged item was repeatedly where the real finding
+  was — Task 2's implementer flagged its static-trace argument itself, which is
+  exactly what §3.1 now exists to settle.
 - **Subagents terminate on idle and their inline replies are frequently lost.**
-  Always require the full report in a file and only a short summary inline. This
-  held for every dispatch across two sessions.
-- **Resuming the same implementer for fix rounds and the same reviewer for scoped
-  re-reviews works well** — they keep their probe scripts and prior reasoning,
-  and reviewers verified their own findings honestly rather than rubber-stamping.
-  Hold an idle implementer in reserve for its own fix round rather than spending
-  it on the next task.
-- **Reviewers here earn their cost.** Every single review across both sessions
-  found at least one Critical or Important defect that would have shipped a wrong
-  claim into a deliverable. Do not skip or downgrade them near the end.
+  Always require the full report in a file and only a short summary inline.
+  Held across three sessions.
+- **Hold an idle implementer in reserve** for its own fix round rather than
+  spending it on the next task; resuming it keeps its context and its probe
+  scripts.
+- **`pkill` as a literal string in a Bash tool command kills the call with exit
+  144 before anything runs.** Content-independent, 100% reproducible, cost the
+  Task 1 implementer significant time. Use `pgrep` and `kill -TERM`.
 - `timeout N cat </dev/null` does **not** wait (cat hits EOF); use
   `timeout N tail -f /dev/null` — `pause` in `lib.sh` does this.
 - **Focus state is a confound in any two-window X comparison.** Sequential
-  capture is mandatory; an unfocused wezterm draws a hollow cursor.
-- Captures are deterministic once focus is held constant (AE=0 for a backend
-  against itself), so any non-zero self-diff means the *method* is wrong.
+  capture is mandatory; an unfocused wezterm draws a hollow cursor, injecting a
+  full character cell of difference that survives 12% fuzz. `focus-probe.sh` is
+  the one deliberate exception — it launches both at once *on purpose*.
 - **llvmpipe is the reference and it works** — this GPU-less Xvnc box resolves
   OpenGL to Mesa llvmpipe 4.5, which is the only reason a GPU reference exists.
 - `local a="$1" b="...$a..."` fails under `set -u`; split multi-variable `local`.
 
 ## 5. Don'ts & constraints
 
+The plan's Global Constraints block is the authoritative copy — read it. The
+ones that matter most:
+
 - **Never touch X displays `:10`–`:14`** — other users on this shared machine.
   All testing is on `:20`. Xauthority:
   `/tmp/claude-1003/-scratch-oetiker-wezterm/659fab62-7b17-4059-a502-42815bcb9732/scratchpad/Xauthority-20`
-  (session-scoped, but still alive at this commit; if gone, recreate per the
-  plan's "Environment setup" section and restart Xvnc).
-- **Never more than 4 cores.**
-- **Never run the 65536-atlas case** — 16 GiB on a shared ~25 GiB box. The 32768
-  case (4 GiB) is already measured; the next step is arithmetic, not execution.
-- **This plan produces documents, not fixes.** All Rust source is read-only.
-  Harness scripts under `tools/purecpu-parity/` *may* be fixed — that
-  distinction was ruled on explicitly and matters.
-- **Never raise `FUZZ`, and never grade a case against another case's number.**
-  Grade against a stated basis.
-- Do not rebuild wezterm; `/scratch/oetiker/wezterm-builds/wezterm-gui-rebased`
-  is the artifact under test and matches this branch.
-- Shared harness files (`lib.sh`, `gen-config.sh`, `compare-case.sh`,
-  `sample-case.sh`) are load-bearing for Tasks 1–6's committed results: any
-  change must keep default output byte-identical, verified.
-- Verdict column holds a **bare token** (`parity` / `degraded` / `missing` /
-  `known gap`); caveats go in Evidence. The matrix table is **6 cells per row** —
-  a literal `|` inside a cell silently breaks this and has done so twice.
-- Background image, opacity and blur/HSB tint are **settled as out of scope**.
+  (session-scoped, alive at this commit; if gone, recreate per the review plan's
+  "Environment setup" and restart Xvnc).
+- **Nothing you run may emit raw bytes to the terminal.** See §4. This is a
+  shared-machine courtesy rule with the same standing as the display rule.
+- **Never more than 4 cores**, including cargo (`-j4`).
+- **Never run the 65536-atlas case** — 16 GiB on a shared ~25 GiB box.
+- **Shared harness files** (`lib.sh`, `gen-config.sh`, `compare-case.sh`,
+  `sample-case.sh`, `focus-probe.sh`) are load-bearing for the review's
+  committed numbers: any change must keep default output byte-identical,
+  verified.
+- **Never raise `FUZZ`**, and never grade a case against another case's number.
+- **Every config comes from `gen-config.sh`.** If it refuses a combination you
+  need, extend it rather than hand-writing around it — a hand-written config is
+  the only way the bell guard can fire, and the only way a rejected config can
+  silently make both windows use the same backend and report a triumphant
+  `AE = 0`.
+- **The OpenGL path must come out bit-identical.** Two fixes touch shared code
+  (C1 in `renderstate.rs`, the pane iteration in `mod.rs`). Verified in Task 14,
+  not assumed.
+- **Background image, opacity and blur/HSB tint are settled as out of scope.**
+- Verdict column in the matrix holds a **bare token**; the table is **6 cells per
+  row** and a literal `|` in a cell silently breaks it — twice already.
 - Do not commit `mise.toml` (untracked, intentional); `out/` and `.superpowers/`
   stay gitignored — the ledger is deliberately local-only.
 
 ## 6. Where the detail lives
 
-- Change history: `git log c057c04..HEAD`
-- Spec: `docs/superpowers/specs/2026-08-10-purecpu-parity-review-design.md`
-- Plan: `docs/superpowers/plans/2026-08-10-purecpu-parity-review.md` — the
-  Global Constraints block at the top carries every generalised lesson
-- Progress ledger: `.superpowers/sdd/2026-08-10-purecpu-parity-review/progress.md`
-  — **authoritative on task completion**, and carries the ~12 deferred minors
-  that a future whole-branch review should triage (Task 8 triaged its own; the
-  ledger records which were fixed and which were deliberately left, with reasons)
-- Per-task briefs/reports/reviews: same directory,
-  `task-N-{brief,report,review,rereview*,fix-round-*}.md`
-- `docs/purecpu-review/parity-matrix.md` — the parity deliverable
-- `docs/purecpu-review/findings.md` — the defect deliverable (C1/I1–I5/M1–M7/L1–L5)
-- `docs/purecpu-review/noise-floor.md` — gate reasoning, thresholds, limits
-- `wezterm-gui/src/termwindow/render/purecpu.rs:346` — the 1:1 blit
-- `wezterm-gui/src/termwindow/mod.rs:1436-1447` — the idle-skip
-- `wezterm-gui/src/termwindow/mod.rs:1383` — raw-vs-resolved cursor shape
-- `wezterm-gui/src/renderstate.rs:78-118` — the unbounded atlas arm (findings C1)
+- Change history: `git log c5cc8ab..HEAD`
+- **Spec:** `docs/superpowers/specs/2026-08-11-purecpu-fixes-design.md` — §3
+  carries the settled B-vs-C argument
+- **Plan:** `docs/superpowers/plans/2026-08-11-purecpu-fixes.md` — 14 tasks; the
+  Global Constraints block at the top binds every task
+- **Ledger:** `.superpowers/sdd/2026-08-11-purecpu-fixes/progress.md` —
+  **authoritative on task state**. The sibling directory
+  `.superpowers/sdd/2026-08-10-purecpu-parity-review/` belongs to the review
+  plan; do not write to it.
+- Per-task briefs/reports/reviews and diff packages: same directory,
+  `task-N-{brief,report,review}.md`, `review-<base>..<head>.diff`
+- **The review this repairs:** `docs/purecpu-review/{README,parity-matrix,findings,noise-floor}.md`
+- `wezterm-gui/src/termwindow/render/purecpu.rs:152-528` — the 376-line quad
+  loop, no test coverage; `:346` the 1:1 blit; `:529` `blend_over`
+- `wezterm-gui/src/termwindow/mod.rs:1300-1375` — dirty rects, active pane only,
+  no `pos.top`/`pos.left`; `:1383` raw cursor shape; `:1436-1447` the idle skip
+- `wezterm-gui/src/termwindow/render/draw.rs:215-218` — the GPU's Nearest sampler
+- `wezterm-font/src/rasterizer/skrifa_rasterizer.rs:695-701` — per-channel LCD
+  coverage already in the atlas
+- Binaries: `/scratch/oetiker/wezterm-builds/wezterm-gui-prefix` (pre-fix
+  reference, do not overwrite), `wezterm-gui-rebased` (original), and
+  `wezterm-gui-fixed` (built by later tasks). Harness selects via `WEZTERM_BIN`.
 
 ## 7. Open questions / pending decisions
 
-- **Does any of this get fixed, and in what order?** Not part of this plan. The
-  user has not been asked. Worth knowing when they are: adding nearest-neighbour
-  scaling to the one blit loop would address inline images, double-width/height
-  lines and scaled bitmap emoji together; and C1 (the 4 GiB allocation) is a
-  bounds check on one arm.
-- **The wide-sixel double-composite's route** is undetermined — see §2. The only
-  thing that will settle it is an instrumented `dirty_pixel_rects` dump, which
-  needs a source edit this plan forbids.
-- **Upstream PR wezterm/wezterm#8043** (OSC 52) is open. If it merges, this
-  branch's `ef7b636` — the same fix as one commit — conflicts on the next
-  rebase; dropping it is the right resolution.
-- **The user has still not read the deliverables** — only my summaries in
-  conversation. `docs/purecpu-review/README.md` exists and is finished; whether
-  it actually lands with them is untested, and their reaction is the one piece
-  of feedback this whole plan never got.
-- **Two rows still rest on code reading alone** (scaled fallback/bitmap glyphs,
-  subpixel antialiasing). Task 8's reviewer ruled both safe and gave reasons
-  worth keeping: subpixel AA has no runtime precondition, so the divergence
-  follows unconditionally; scaled glyphs depend on some installed font yielding
-  `glyph.scale != 1`, so a measurement could return a null result that proves
-  nothing — the exact mistake that produced Task 4's false `parity`. Do not
-  "just measure them" without answering that.
+- **Does the C1 bail actually reach the `AllowImage::Scale` fallback at
+  runtime?** Argued statically, never observed. §3.1 is how to settle it.
+- **Does M2 survive Task 4?** Deferred on purpose (Task 11). Its attribution to
+  a specific rect overlap was tested and eliminated twice; Task 4 rewrites the
+  dirty-rect geometry that is the suspected source, so M2 may simply not exist
+  afterwards. Re-measure before fixing.
+- **Is option C worthwhile after this pass?** Spec §3 says: revisit once the
+  sampler and dirty units have tests, which is what makes a rewrite safe.
+- **The user has still not read `docs/purecpu-review/README.md`** — only
+  summaries in conversation. Their reaction remains the one piece of feedback
+  this workstream has never had.
+- **M3/M4/M5 will be fixed blind** — their triggers were never reproduced
+  (`fontTools` unavailable). The plan requires the report to say "panic site
+  guarded", not "fixed". Hold that line.
 
 ## 8. Staleness watch
 
@@ -288,14 +281,16 @@ the plan is done and what follows is all their call.
   handoff. Note `main` is upstream wezterm and legitimately runs ahead.
 - **Sibling worktrees / other workstreams may exist that this file cannot name** —
   anything started after the handoff commit is invisible here.
-- **Nothing was in flight at this commit** — the plan is closed and no subagent
-  is running. If you find uncommitted work in `tools/purecpu-parity/` or an
-  unreferenced `task-*.md`, it is from a session after this one, not this plan.
-- The `:20` X server and `marco` are ordinary user processes and may be gone.
-  Verify with `DISPLAY=:20 XAUTHORITY=<path> xdpyinfo | grep dimensions`.
-- The scratchpad Xauthority path in §5 belongs to an earlier session; it was
-  still present at this commit, but its absence is expected eventually.
-- Task counts in §2 reflect the ledger at this commit. The ledger is append-only
-  and authoritative — read it rather than trusting §2.
-- Task 7's finding ids were renumbered mid-task; older ledger lines use the old
-  scheme. Cite `findings.md`'s current headings, not the ledger's ids.
+- **One thing WAS in flight at this commit**: the Task 2 review (§3.1). Its
+  subagent did not survive rollover and wrote no file. If you find
+  `task-2-review.md` present, a session after this one produced it — trust the
+  file and the ledger over this paragraph.
+- Task state in §2 reflects the ledger at this commit. **The ledger is
+  authoritative; read it rather than trusting §2.**
+- The `:20` X server and its Xauthority are ordinary user processes/files and may
+  be gone. Verify with
+  `DISPLAY=:20 XAUTHORITY=<path> xdpyinfo | grep dimensions`.
+- The Noto Color Emoji `glyph.scale = 0.159` result is font-installation
+  dependent. It was observed on this machine at this commit; a font change
+  invalidates it and Task 7's verification would silently become a null result
+  again.
