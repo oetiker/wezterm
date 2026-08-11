@@ -35,8 +35,10 @@ declare -A CFG=( [gl]="$GL_CFG" [cpu]="$CPU_CFG" )
 probe_run() {  # probe_run <tag> <first backend> <second backend>
   local tag="$1" first="$2" second="$3"
   launch "par-$first"  "${CFG[$first]}"  "$CORPUS"
+  check_bell_disabled "${CFG[$first]}"
   pause 4
   launch "par-$second" "${CFG[$second]}" "$CORPUS"
+  check_bell_disabled "${CFG[$second]}"
   pause 4
 
   local idf ids
