@@ -10,299 +10,312 @@
 > not blank page. On merge into another branch, rewrite that branch's handoff
 > to the merged reality — do not merge or preserve this text.
 
-Handoff commit: see git log for this file (written at c5cc8ab, amended after Task 2 review landed)   Date: 2026-08-11   Reason: context budget
+Handoff commit: see git log for this file (written at `ed7ba9e`)   Date: 2026-08-11   Reason: context budget
 Worktree / branch: `/scratch/oetiker/wezterm` (primary checkout) @ `update-optimization-rebased`
 Trunk at time of writing: `main` @ 05343b3 — **reader: if trunk has moved, §2 is provisionally stale; if trunk now contains this branch's HEAD, this file is a tombstone** (`git merge-base --is-ancestor HEAD main`). `main` here is upstream wezterm and legitimately runs ahead of this branch by ordinary upstream commits; that is NOT a merge signal.
 Sibling worktrees: `/scratch/oetiker/claude-worktrees/wezterm-osc52-upstream` @ `osc52-x11-fix` — the two-commit upstream PR (wezterm/wezterm#8043), unrelated; leave it alone until that PR resolves. This line cannot see worktrees created later; check yourself.
 
 ## 1. Mission
 
-The predecessor session **reviewed** this fork's PureCpu software renderer
-against the GPU backend and produced documents only (`docs/purecpu-review/`).
-This session is the **fix pass**: repair everything that review found, so
+A predecessor session **reviewed** this fork's PureCpu software renderer against
+the GPU backend and produced documents only (`docs/purecpu-review/`). This
+session is the **fix pass**: repair everything that review found, so
 `front_end = "PureCpu"` on a GPU-less Linux/X11 box loses as little as possible
 against `front_end = "OpenGL"`.
 
-Scope was set by the user in brainstorming: **all 18 findings** (C1, I1–I5,
-M1–M7, L1–L5), **plus** subpixel-antialiased text and the scaled fallback/bitmap
-glyph row — two things the review had ruled outside its own findings list. The
-five `known gap` rows (background image, opacity, blur/HSB tint) stay **out of
-scope**: they were never examined, so they are investigation work, not repair.
+Scope, set by the user in brainstorming: **all 18 findings** (C1, I1–I5, M1–M7,
+L1–L5), **plus** subpixel-antialiased text and the scaled fallback/bitmap glyph
+row. The five `known gap` rows (background image, opacity, blur/HSB tint) stay
+**out of scope** — never examined, so they are investigation, not repair.
 
 The structural decision that shapes the code (spec §3): **option B — point fixes
 plus two extracted units.** Three of the four root causes are *absences* (no
 resampler, no pane origin in the dirty rect, no per-channel coverage), and an
 absence fixed inline is invisible to the next reader. So a `dirty` unit and a
 `sampler` unit get extracted and tested; everything else stays a point fix. The
-user pushed back hard on this and asked why not option C (a full
-shader-equivalence rewrite of the quad loop) — **that argument is settled and
-written down in spec §3; do not relitigate it, but do read it**, because the
-reasoning is the honest kind: C restructures the site of only 5 of 18 findings,
-and it spends its risk exactly where the code is already bit-identical to the
-GPU. B is a strict *prefix* of C, so C stays available afterwards with tests in
-place.
+user pushed back hard and asked why not option C (a full shader-equivalence
+rewrite of the quad loop) — **that argument is settled in spec §3; do not
+relitigate it, but do read it**: C restructures the site of only 5 of 18
+findings and spends its risk where the code is already bit-identical to the GPU.
+B is a strict *prefix* of C, so C stays available afterwards with tests in place.
 
-Two facts discovered while designing, both load-bearing and both verified in
-code rather than assumed:
+Two load-bearing facts, both verified in code rather than assumed:
 
 - **The GPU samples the atlas `Nearest`** for glyphs, emoji and images
-  (`render/draw.rs:215-218`); `Linear` is used only for the window background
-  attachment (`glyph-frag.glsl:121`), which is out of scope. So the missing
-  resampler is nearest-neighbour, and **bit-exact parity on scaled quads is
-  reachable** rather than approximate.
+  (`render/draw.rs:215-218`); `Linear` is only for the window background
+  attachment (out of scope). So the missing resampler is nearest-neighbour and
+  **bit-exact parity on scaled quads is reachable**, not approximate.
 - **The LCD subpixel data is already in the atlas** — per-channel sRGB coverage
   in R/G/B with max-alpha in A (`skrifa_rasterizer.rs:695-701`). PureCpu's
-  `IS_GLYPH` branch reads only `tex_a` and throws the rest away. So subpixel AA
-  is a compositing fix (a per-channel `blend_over` mirroring GL's dual-source
-  blend), not new rasterisation.
+  `IS_GLYPH` branch reads only `tex_a`. So subpixel AA is a compositing fix, not
+  new rasterisation.
 
 ## 2. Where we are now
 
-As of handoff commit c5cc8ab (re-derive merge/push state — see §8):
+As of handoff commit `ed7ba9e` (re-derive merge/push state — see §8):
 
 **Execution mode: subagent-driven development**, at the user's explicit request.
 The ledger at `.superpowers/sdd/2026-08-11-purecpu-fixes/progress.md` is
 authoritative on task state — trust it and `git log` over anything here.
 
-- **Task 1 — complete** (`415b6c0..4c5488b`, review clean after 1 fix round).
-  Harness prerequisites: the `check_bell_disabled` guard wired into all five
-  wezterm-launch sites, `wezterm-gui-prefix` preserved as the pre-fix reference
-  binary, and the scaled-glyph font question **answered YES from runtime
-  evidence** — Noto Color Emoji yields `glyph.scale = 0.159`, seen through
-  wezterm's own `log::trace!` at `glyphcache.rs`'s `scale != 1.0` branch, 4/4
-  hits, no instrumentation added. That closes spec §10's first open question and
-  means Task 7's resampler can be verified against a real trigger instead of a
-  null result. Corpus: `tools/purecpu-parity/corpus/scaled-glyph.sh`.
-- **Task 2 — complete** (`4c5488b..c5cc8ab`, review clean, 2 deferred minors).
-  The atlas ceiling (`PURECPU_MAX_TEXTURE_SIZE = 8192`) plus a `bail!` on the
-  PureCpu arm. **C1 is confirmed fixed at runtime, not by argument:** peak RSS
-  **637 MiB against a pre-fix 4170 MiB**, and the `AllowImage::Scale` fallback
-  fired **168 times** (`Not enough texture space … max 8192 … will retry render
-  with Scale(2)/Scale(4)`). No crash; the sixel gradient still renders, degraded
-  rather than blank. That settles the implementer's self-flagged static-trace
-  weak point — the review's only Critical finding is closed with an observation
-  behind it.
-- **Tasks 3–14 — not started.**
+- **Tasks 1, 2, 3, 5 — complete**, each reviewed clean or Approved-with-minors
+  with all minors closed.
+  - Task 1: harness prerequisites, bell guard, and the scaled-glyph font
+    question answered YES from runtime evidence (Noto Color Emoji,
+    `glyph.scale = 0.159`).
+  - Task 2: the atlas ceiling. **C1 confirmed fixed at runtime**, not by
+    argument: peak RSS 637 MiB against a pre-fix 4170 MiB, `AllowImage::Scale`
+    fallback observed firing (I re-derived 172 where the reviewer said 168).
+  - Task 3: the `dirty` unit (`purecpu_dirty.rs`) — `PanePlacement`,
+    `pane_placement`, `row_band`, `cell_rect`, 8 tests, no callers by design.
+  - Task 5: M6 + M7. `clear_rect` made total, `clamp_band` extracted, present
+    loop routed through it, plus a straddle test and saturating arithmetic in
+    `collect_clip_rects`/`coalesce_to_bands`.
+- **Task 4 — IN FLIGHT at this commit.** Dispatched to subagent `task4-impl`
+  (agent name `task4-impl-2`) against brief
+  `.superpowers/sdd/2026-08-11-purecpu-fixes/task-4-brief.md`. **See §3.1 — it
+  needs a specific kind of check on arrival, and it may already have landed.**
+- **Tasks 6–14 — not started.** Suite is at 46 tests, 0 failed, 0 ignored.
 
-**No renderer behaviour beyond C1 has changed yet.** Everything else in the plan
-— the two units, the pane-walk, the resampler, subpixel, the animation dirty
-rects — is untouched code.
-
-**One incident worth knowing about, because it shaped the constraints.** The
-first Task 1 implementer caused an **audible bell in the user's own terminal**
-and was killed mid-run (nothing committed, no report). The cause is not
-recoverable — it was in-process and stopped before its transcript flushed — but
-every config on disk carried `audible_bell = 'Disabled'`, so wezterm was not the
-source: the BEL arrived through the **subagent's stdout**, which lands in a real
-person's terminal. The constraint had been written at the wrong layer. See §5.
+**I changed the task order.** Task 5 now runs *before* Task 4. Task 4 is what
+first makes an out-of-framebuffer rect reachable (its origins come from
+`PositionedPane`, the mux's view of the tab, which is not synchronised to the
+framebuffer size), and Task 5 is what makes `clear_rect` total. They touch
+disjoint files, so the swap was free and it removes the window in which a panic
+is reachable in committed code. The plan document was not rewritten — the tasks
+are unchanged, only their order.
 
 ## 3. Do this next
 
-1. **Start at Task 3.** Nothing is in flight and nothing is outstanding — Task 2's
-   review landed clean just after this file was first written (§2). Read the
-   ledger first to confirm, then dispatch Task 3's implementer.
-2. **Tasks 3/6 (the units) are deliberately split from Tasks 4/7 (their
-   integrations)** so a reviewer can reject the geometry or the sampling
-   arithmetic without rejecting the wiring. Keep that split; do not merge them
-   to save a round.
-3. **Nothing needs the user until Task 14.** They chose straight-through
+1. **Deal with Task 4 first — and check the worktree, do not infer from
+   silence.** An idle notification is not a report (§4). Three signatures,
+   three opposite remedies: clean tree + commit → finished silently, go read
+   `task-4-report.md`; dirty tree + no build running → stalled, run the gates
+   and commit for it; dirty tree + a live `cargo` → deadlocked on a pending
+   build, `SendMessage` the *same* agent to resume, never re-dispatch. Note
+   other users' `cargo`/`rustc` processes are routinely visible on this box —
+   check the command line before concluding one is ours.
+2. **Task 4's report needs its §D runtime evidence re-derived, not read.** It is
+   the first task in this pass whose core claim (a non-active pane repaints)
+   cannot be shown by a unit test. Confirm the control capture from
+   `wezterm-gui-prefix` actually shows the defect; if the pre-fix and fixed
+   captures look the same, the corpus did not exercise the defect and the pass
+   is a null result wearing a green hat.
+3. **Then Task 6** (the `sampler` unit), and keep the 6/7 split — units are
+   deliberately separated from their integrations so a reviewer can reject the
+   arithmetic without rejecting the wiring.
+4. **Nothing needs the user until Task 14.** They chose straight-through
    execution with a single review at the end. Do not check in between tasks.
-4. **Carry the runtime-verification bar forward.** Task 2's review was worth far
-   more than a code read because it *ran* the thing: it turned "the fallback
-   should be reached" into "it fired 168 times and peak RSS was 637 MiB". Every
-   later task has an equivalent — Task 7 has the six no-drift rows, Task 10 has
-   the idle-CPU measurement and the `purecpu_force_full_repaint` control.
 
 ## 4. Lessons & traps  ← the irreplaceable part
 
-Carried forward from the review session where still true, plus this session's.
+Carried forward from the prior sessions where still true, plus this one's.
 
-- **A subagent's stdout lands in the human's real terminal.** This is the one
-  that actually bit. Guarding wezterm's `audible_bell` config was the wrong
-  layer: the exposure is *any* `0x07` byte in *any* command output. The rules
-  that hold, now in the plan's Global Constraints: redirect every
-  harness/build/wezterm command to a log file and Read it; never
-  `cat`/`head`/`tail` a binary file (`out/*.png`, `*.xwd` are full of BEL);
-  never run a corpus script directly (`corpus/cursor.sh` rings the bell by
-  design); and put the guard in place *before* the first wezterm launch.
-  Redirection is the durable rule because it does not depend on any config being
-  correct at the moment a command runs — which is precisely the assumption that
-  failed.
+- **A subagent's stdout lands in the human's real terminal.** The one that
+  actually bit. Guarding wezterm's `audible_bell` config was the wrong layer:
+  the exposure is *any* `0x07` byte in *any* command output. The rules that
+  hold: redirect every harness/build/wezterm command to a log file and Read it;
+  never `cat`/`head`/`tail` a binary file (`out/*.png`, `*.xwd` are full of
+  BEL); never run a corpus script directly (`corpus/cursor.sh` rings the bell by
+  design); guard first, before the first wezterm launch. Redirection is the
+  durable rule because it does not depend on any config being correct at the
+  moment a command runs — precisely the assumption that failed.
 - **When the user interjects, answer on the next turn — not two tool calls
-  later.** During the bell incident the user said "I am hearing the bell", then
-  had to say "you did not immediately pickup my comment". Both times I was
-  working on the wrong layer while they were telling me something that would
-  have corrected it. A user interjection outranks whatever is mid-flight.
-- **An idle notification is not a report.** Never conclude "done" or "stalled"
-  from silence — inspect the tree. This happened here: a reviewer went idle
-  having written nothing, I concluded it had died, and then found the `cargo`
-  build it had launched still running. It later finished and delivered a clean
-  review. Three signatures, three opposite remedies:
-  - clean tree + commit present → **finished silently**; go read the commit.
-  - dirty tree + no build process → **stalled**; run the gates and commit for it.
-  - dirty tree + a live build → **deadlocked on a pending build** (it ended its
-    turn while cargo ran and will never see the result).
-  **Deadlocked ≠ lost:** the edits are still in the worktree. `SendMessage` the
-  same agent to resume — do not re-dispatch, never restart from scratch.
-- **Put `timeout: 600000` on every long Bash call in a dispatch prompt, and tell
-  the agent never to end a turn while a background shell is live.** The cause of
-  the deadlock above is the subagent ending its turn, not the timeout: on
-  timeout Claude Code backgrounds the command rather than killing it, the agent
-  ends its turn anyway, and the background shell dies with the turn
-  (anthropics/claude-code#50572, closed "not planned"). Banning backgrounding
-  does not help — it just converts this into a synchronous timeout. Have the
-  agent poll `BashOutput` until the command exits. Release builds of this crate
-  are long enough to hit this every time.
-- **Never take a resumed agent's gate result on its word — re-derive it against
-  the commit.** A resumed subagent can report a *stale* log from before its last
-  edits as a fresh green run, and the loop cannot tell (obra/superpowers#2113).
-  Task 2's runtime verification came from a resumed reviewer, so it was
-  re-derived independently: binary built 11:48:50 and artifacts written
-  11:49–11:54, so not stale; `grep -c` gives **172** fallback firings where the
-  reviewer reported 168 (86 `Scale(2)` + 86 `Scale(4)`); peak RSS `653304 kB`
-  matches its 637 MiB exactly; and `identify` gives stddev 3222 over 188 colours
-  on the screenshot, so it is genuinely not blank. Conservative in the one place
-  it was off. **Do this for every load-bearing claim** — the check cost one
-  command.
-- **Verify a subagent's arithmetic, not its adjectives.** "All green" is a
-  claim; the count, the delta, and what accounts for it are the evidence.
-- **State process constraints as actions, not prohibitions.** "Don't pipe the
-  gate" gets ignored; "run it bare, wait for it in the same turn, read the
-  output as it comes" lands. Same shape as the bell rule that finally worked:
-  "redirect every command to a log file and Read it" beat "don't ring the bell".
-- **Verify runtime preconditions; a static trace is not an observation.** Both
-  by-reading verdicts the predecessor review overturned failed on preconditions,
-  not mechanisms. Task 2 reproduced the same shape: the fallback argument is
-  type-level and probably right, and it still needs to be watched firing. This
-  is the project's dominant failure mode — a measurement reporting a result the
-  instrument or corpus could not actually see, now seen in **nine or ten**
-  distinct ways. Every verdict must answer *"could this run have failed, and
-  what would that have looked like?"*
+  later.** A user interjection outranks whatever is mid-flight.
+- **Mutation testing is this pass's highest-yield instrument, and it caught
+  something in every task that used it.** A suite that has only ever been seen
+  going green proves the code compiles, not that the assertions discriminate.
+  Task 3 shipped 8 tests that all passed first try; three of my mutations died
+  correctly and a *fourth* — deleting `cell_rect`'s entire row guard — survived,
+  which the reviewer found and I re-derived. Make every new test watch a mutant
+  die before you accept it.
+- **But check that the mutant actually perturbs the value the target test
+  reads.** I specified a mutation (`x0.clamp(0, fb_w - 1)`) to validate Task 5's
+  new straddle test; the implementer ran it and showed it does not touch that
+  test's input at all — the failure came from a *pre-existing* test. Had it
+  simply obeyed, the new test would have looked justified for the wrong reason.
+  A mutation that goes red somewhere is not evidence about the test you are
+  validating.
 - **The plan's own text can be wrong, and a good implementer will follow it off
-  a cliff.** This has now happened **eight** times across the two sessions.
-  Three more in this one: the brief named `corpus/text.sh`, which does not exist
-  (real file: `corpus/plain.sh`); `check_bell_disabled "$CONFIG"` referenced a
-  variable that does not exist; and the C1 test used `expect_err`, which needs
-  `T: Debug` that `Rc<dyn Texture2d>` does not have. All three were caught and
-  worked around by implementers — but only because they were told to flag
-  deviations. Keep asking for that.
-- **The pre-flight scan of your own plan pays for itself.** Before Task 1 I
-  found four defects in my own plan, two of them serious: the M7 test would have
-  **passed before the fix** (a vacuous TDD cycle), and the M6 test asserted
-  arithmetic inside the test rather than production code. Both are now real
-  tests against real defects — an unclamped `x0` that slices backwards and
-  panics, and an extracted `clamp_band`. Run that scan; do not assume a plan you
-  just wrote is sound.
-- **Reviewers earn their cost — again.** Task 1's reviewer found the one
-  wezterm-launch site (`focus-probe.sh:37,39`) that neither my brief nor the
-  implementer's own sweep caught. Every review across all three sessions has
-  found at least one Critical or Important defect. Do not skip or downgrade
-  them, especially not near the end.
+  a cliff.** Now **ten** times across three sessions. Three in this session:
+  - Task 5's red gate was **unobservable as written** — it added all six tests
+    at once and then expected to see both a runtime panic *and* a compile
+    failure, which cannot both happen. Following it literally would have filed a
+    compile error as the red gate and never witnessed M7. Splitting it into two
+    stages is what produced the actual panic.
+  - Task 5's prose said the negative-extent half of M7 "silently skips the row".
+    It **panics** in debug (`attempt to multiply with overflow`). `findings.md`
+    had this right; the *plan* lost the distinction and a test comment inherited
+    it.
+  - Task 4's Step 1 code **narrows repaint coverage** (see §5).
+  Run a pre-flight scan of every task's plan text against the tree before
+  dispatching. It has paid for itself every single time.
+- **Ask implementers to flag their own weak points — it has been where the real
+  finding was on every task so far.** Task 3's implementer named mutation
+  testing as the check it had not run (correct, and the hole was there). Task
+  5's named the untested call site (I re-derived it by reading; it was faithful).
+  Task 2's named its static-trace argument, which is exactly what the runtime
+  verification then settled.
+- **Verify runtime preconditions; a static trace is not an observation.** The
+  project's dominant failure mode is a measurement reporting a result the
+  instrument or corpus could not actually see — now seen **ten** distinct ways.
+  Every verdict must answer *"could this run have failed, and what would that
+  have looked like?"*
+- **Never take a resumed agent's gate result on its word — re-derive it against
+  the commit.** A resumed subagent can report a stale pre-edit log as a fresh
+  green run (obra/superpowers#2113). Generalise it: re-derive every load-bearing
+  claim. It has cost one command each time and corrected a real error twice.
+- **An idle notification is not a report.** Never conclude "done" or "stalled"
+  from silence — inspect the tree. See §3.1 for the three signatures.
+  **Deadlocked ≠ lost:** the edits are still in the worktree; `SendMessage` the
+  same agent to resume.
+- **Put `timeout: 600000` on every long Bash call in a dispatch prompt, and tell
+  the agent never to end a turn while a background shell is live.** The cause is
+  the subagent ending its turn, not the timeout: Claude Code backgrounds the
+  command rather than killing it, the agent ends its turn anyway, and the shell
+  dies with the turn (anthropics/claude-code#50572, closed "not planned").
+  Banning backgrounding just converts this into a synchronous timeout.
+- **State process constraints as actions, not prohibitions.** "Don't pipe the
+  gate" gets ignored; "redirect every command to a log file and Read it" lands.
+- **Reviewers earn their cost — every review in this pass has found at least one
+  real defect.** Task 5's ran 85,800 `clear_rect` calls plus an exhaustive
+  invariant sweep, which is what let it call a branch *dead* rather than assert
+  it. Do not skip or downgrade them, especially near the end.
+- **Reviewers are also wrong sometimes — verify their arithmetic too.** Task 5's
+  claimed a specific wrong fix "passes the committed suite"; it did not. I
+  passed that claim through to the implementer unchecked and the implementer
+  caught it. Both directions need checking.
 - **The control experiment is the strongest instrument this project has.**
   Prefer "change one thing and watch the defect disappear" over accumulating
-  observations of the defect. For Task 10 the control already exists:
-  `purecpu_force_full_repaint = true` is the known-good ceiling.
-- **Put the control INSIDE the capture.** The DECDWL corpus printed the doubled
-  and single-width line in one frame, so the control read `PAE = 257` in the
-  same capture the subject read 45232. A null result then cannot pass as
-  success. Cheaper and stronger than any after-the-fact argument.
-- **Ask implementers to flag their own weak points.** Every task that did so
-  closed faster and the self-flagged item was repeatedly where the real finding
-  was — Task 2's implementer flagged its static-trace argument itself, which is
-  exactly what §3.1 now exists to settle.
+  observations of the defect. **Put the control INSIDE the capture** so a null
+  result cannot pass as success.
 - **Subagents terminate on idle and their inline replies are frequently lost.**
   Always require the full report in a file and only a short summary inline.
-  Held across three sessions.
-- **Hold an idle implementer in reserve** for its own fix round rather than
-  spending it on the next task; resuming it keeps its context and its probe
-  scripts.
+  Held across four sessions.
+- **Hold an idle implementer in reserve for its own fix round** rather than
+  spending it on the next task; resuming keeps its context and probe scripts.
+  Used for both Task 3 and Task 5 fix rounds; both landed in one turn.
 - **`pkill` as a literal string in a Bash tool command kills the call with exit
-  144 before anything runs.** Content-independent, 100% reproducible, cost the
-  Task 1 implementer significant time. Use `pgrep` and `kill -TERM`.
+  144 before anything runs.** Content-independent, 100% reproducible. Use
+  `pgrep` and `kill -TERM`.
 - `timeout N cat </dev/null` does **not** wait (cat hits EOF); use
   `timeout N tail -f /dev/null` — `pause` in `lib.sh` does this.
 - **Focus state is a confound in any two-window X comparison.** Sequential
   capture is mandatory; an unfocused wezterm draws a hollow cursor, injecting a
   full character cell of difference that survives 12% fuzz. `focus-probe.sh` is
-  the one deliberate exception — it launches both at once *on purpose*.
+  the one deliberate exception.
 - **llvmpipe is the reference and it works** — this GPU-less Xvnc box resolves
-  OpenGL to Mesa llvmpipe 4.5, which is the only reason a GPU reference exists.
+  OpenGL to Mesa llvmpipe 4.5, the only reason a GPU reference exists.
 - `local a="$1" b="...$a..."` fails under `set -u`; split multi-variable `local`.
+- **Harness trivia worth keeping:** the test module in `render/purecpu.rs` is
+  `mod test` (**singular**); `purecpu_dirty.rs` uses `mod tests`. A brief that
+  greps for `mod tests` in `purecpu.rs` will silently miss.
 
 ## 5. Don'ts & constraints
 
-The plan's Global Constraints block is the authoritative copy — read it. The
-ones that matter most:
+The plan's Global Constraints block is authoritative — read it. The ones that
+matter most, plus this session's additions:
 
+- **Task 4 must NOT use plain `row_band` for its dirty bands.** This is the
+  single most important carried decision. `row_band` is exactly `cols * cell_w`
+  wide; today's code emits `x: 0, width: fb_width`; the pane's *painted*
+  background is wider than the former (`render/pane.rs:110-152` oversizes by
+  half a cell into the split gutter, runs the right-most pane to
+  `dimensions.pixel_width`, and starts at `x = 0` when `pos.left == 0`). So the
+  plan's code silently **narrows** repaint coverage — stale window padding, a
+  stale half-cell gutter, and clipped-but-uncleared glyph overhang past the last
+  column, on ordinary text frames. The brief (`task-4-brief.md` §A) specifies a
+  tested `painted_x_span` + `row_band_painted` in the unit, rounding **outward**
+  so the band is always a superset of the painted rect. In the ordinary
+  single-pane case this reproduces today's `x: 0, width: pixel_width` exactly.
+  **Keep `row_band`** — it is still right for anything scoped to the text area
+  and Task 3's tests cover it.
+- **Task 9's bell fade inherits this too.** Any animation that changes a pane
+  *background* inside an incremental frame must cover the painted extent or go
+  through `force_full`. Note `force_full` is currently set for config/shape/quad
+  generation changes, viewport scroll, selection change, `Exposed`, scroll info
+  and tab-bar changes — **not** focus change.
 - **Never touch X displays `:10`–`:14`** — other users on this shared machine.
-  All testing is on `:20`. Xauthority:
+  All testing on `:20`. Xauthority:
   `/tmp/claude-1003/-scratch-oetiker-wezterm/659fab62-7b17-4059-a502-42815bcb9732/scratchpad/Xauthority-20`
-  (session-scoped, alive at this commit; if gone, recreate per the review plan's
-  "Environment setup" and restart Xvnc).
-- **Nothing you run may emit raw bytes to the terminal.** See §4. This is a
-  shared-machine courtesy rule with the same standing as the display rule.
+  (belongs to a *previous* session's scratchpad but is still alive and is what
+  the running Xvnc authenticates against — do not "fix" the path to the current
+  session; verify with `xdpyinfo` instead).
+- **Nothing you run may emit raw bytes to the terminal.** See §4. Same standing
+  as the display rule.
 - **Never more than 4 cores**, including cargo (`-j4`).
 - **Never run the 65536-atlas case** — 16 GiB on a shared ~25 GiB box.
 - **Shared harness files** (`lib.sh`, `gen-config.sh`, `compare-case.sh`,
   `sample-case.sh`, `focus-probe.sh`) are load-bearing for the review's
-  committed numbers: any change must keep default output byte-identical,
-  verified.
+  committed numbers: any change must keep default output byte-identical.
 - **Never raise `FUZZ`**, and never grade a case against another case's number.
 - **Every config comes from `gen-config.sh`.** If it refuses a combination you
-  need, extend it rather than hand-writing around it — a hand-written config is
-  the only way the bell guard can fire, and the only way a rejected config can
-  silently make both windows use the same backend and report a triumphant
-  `AE = 0`.
-- **The OpenGL path must come out bit-identical.** Two fixes touch shared code
-  (C1 in `renderstate.rs`, the pane iteration in `mod.rs`). Verified in Task 14,
-  not assumed.
+  need, extend it — a hand-written config is the only way the bell guard can
+  fire, and the only way a rejected config can silently make both windows use
+  the same backend and report a triumphant `AE = 0`.
+- **The OpenGL path must come out bit-identical.** Verified in Task 14, not
+  assumed. Note the Task 5 review established that `clear_rect` is **not** on
+  the full-repaint path (only the incremental branch), one less shared surface
+  than I had assumed.
 - **Background image, opacity and blur/HSB tint are settled as out of scope.**
 - Verdict column in the matrix holds a **bare token**; the table is **6 cells per
   row** and a literal `|` in a cell silently breaks it — twice already.
 - Do not commit `mise.toml` (untracked, intentional); `out/` and `.superpowers/`
   stay gitignored — the ledger is deliberately local-only.
+- **Never overwrite `/scratch/oetiker/wezterm-builds/wezterm-gui-prefix`** — the
+  pre-fix reference binary, and not reproducible now that fixes have landed.
 
 ## 6. Where the detail lives
 
-- Change history: `git log c5cc8ab..HEAD`
+- Change history: `git log ed7ba9e..HEAD`
 - **Spec:** `docs/superpowers/specs/2026-08-11-purecpu-fixes-design.md` — §3
   carries the settled B-vs-C argument
-- **Plan:** `docs/superpowers/plans/2026-08-11-purecpu-fixes.md` — 14 tasks; the
-  Global Constraints block at the top binds every task
+- **Plan:** `docs/superpowers/plans/2026-08-11-purecpu-fixes.md` — 14 tasks;
+  Global Constraints at the top bind every task. **Its Task 4 code is wrong —
+  see §5.**
 - **Ledger:** `.superpowers/sdd/2026-08-11-purecpu-fixes/progress.md` —
-  **authoritative on task state**. The sibling directory
-  `.superpowers/sdd/2026-08-10-purecpu-parity-review/` belongs to the review
-  plan; do not write to it.
+  **authoritative on task state**, and it now carries the full reasoning behind
+  each review finding and controller decision, not just status lines. The
+  sibling `.superpowers/sdd/2026-08-10-purecpu-parity-review/` belongs to the
+  review plan; do not write to it.
 - Per-task briefs/reports/reviews and diff packages: same directory,
   `task-N-{brief,report,review}.md`, `review-<base>..<head>.diff`
 - **The review this repairs:** `docs/purecpu-review/{README,parity-matrix,findings,noise-floor}.md`
-- `wezterm-gui/src/termwindow/render/purecpu.rs:152-528` — the 376-line quad
-  loop, no test coverage; `:346` the 1:1 blit; `:529` `blend_over`
-- `wezterm-gui/src/termwindow/mod.rs:1300-1375` — dirty rects, active pane only,
-  no `pos.top`/`pos.left`; `:1383` raw cursor shape; `:1436-1447` the idle skip
+- `wezterm-gui/src/termwindow/purecpu_dirty.rs` — the dirty unit (Task 3)
+- `wezterm-gui/src/termwindow/render/purecpu.rs` — `clear_rect`/`clamp_band` now
+  total (Task 5); `:152-528` the 376-line quad loop; `:529` `blend_over`
+- `wezterm-gui/src/termwindow/mod.rs:1272-1375` — the dirty-rect block Task 4
+  rewrites; `:1377-1400` cursor blink (Task 8); `:1436-1447` the idle skip
+- `wezterm-gui/src/termwindow/render/pane.rs:110-152` — the painted background
+  extent rules Task 4 must mirror
 - `wezterm-gui/src/termwindow/render/draw.rs:215-218` — the GPU's Nearest sampler
 - `wezterm-font/src/rasterizer/skrifa_rasterizer.rs:695-701` — per-channel LCD
   coverage already in the atlas
 - Binaries: `/scratch/oetiker/wezterm-builds/wezterm-gui-prefix` (pre-fix
-  reference, do not overwrite), `wezterm-gui-rebased` (original), and
-  `wezterm-gui-fixed` (built by later tasks). Harness selects via `WEZTERM_BIN`.
+  reference, **never overwrite**), `wezterm-gui-rebased`, `wezterm-gui-fixed`
+  (rebuilt by later tasks). Harness selects via `WEZTERM_BIN`.
 
 ## 7. Open questions / pending decisions
 
 - ~~Does the C1 bail reach the `AllowImage::Scale` fallback at runtime?~~
-  **Settled: yes, observed 168 times, peak RSS 637 MiB.** See §2.
+  **Settled: yes, observed; peak RSS 637 MiB.**
 - **Does M2 survive Task 4?** Deferred on purpose (Task 11). Its attribution to
   a specific rect overlap was tested and eliminated twice; Task 4 rewrites the
   dirty-rect geometry that is the suspected source, so M2 may simply not exist
   afterwards. Re-measure before fixing.
-- **Is option C worthwhile after this pass?** Spec §3 says: revisit once the
-  sampler and dirty units have tests, which is what makes a rewrite safe.
+- **Is option C worthwhile after this pass?** Spec §3: revisit once the sampler
+  and dirty units have tests, which is what makes a rewrite safe.
 - **The user has still not read `docs/purecpu-review/README.md`** — only
   summaries in conversation. Their reaction remains the one piece of feedback
   this workstream has never had.
 - **M3/M4/M5 will be fixed blind** — their triggers were never reproduced
   (`fontTools` unavailable). The plan requires the report to say "panic site
   guarded", not "fixed". Hold that line.
+- **Should focus change force a full repaint?** `inactive_pane_hsb` recolours
+  panes on focus change, and no `force_full` trigger covers it. It is not a
+  regression from this pass (a focus change produces no dirty rows today
+  either), so it is unlisted-finding territory rather than in scope — but it is
+  real. Decide explicitly rather than letting Task 9 discover it.
 
 ## 8. Staleness watch
 
@@ -313,11 +326,10 @@ ones that matter most:
   handoff. Note `main` is upstream wezterm and legitimately runs ahead.
 - **Sibling worktrees / other workstreams may exist that this file cannot name** —
   anything started after the handoff commit is invisible here.
-- **Nothing was in flight when this file was finalised.** An earlier draft said
-  the Task 2 review was abandoned mid-run; that reviewer then completed and
-  wrote `task-2-review.md` (Approved). §2, §3 and §7 were corrected before this
-  commit. The ledger records both the abandonment and the landing, in order —
-  read it if the two ever appear to disagree.
+- **Task 4 was in flight when this was written.** By the time you read this it
+  has almost certainly resolved one way or another. `git log ed7ba9e..HEAD` and
+  the ledger are the truth; §2 is not. If its commit is absent and the tree is
+  dirty, read §3.1 before doing anything.
 - Task state in §2 reflects the ledger at this commit. **The ledger is
   authoritative; read it rather than trusting §2.**
 - The `:20` X server and its Xauthority are ordinary user processes/files and may
@@ -325,5 +337,6 @@ ones that matter most:
   `DISPLAY=:20 XAUTHORITY=<path> xdpyinfo | grep dimensions`.
 - The Noto Color Emoji `glyph.scale = 0.159` result is font-installation
   dependent. It was observed on this machine at this commit; a font change
-  invalidates it and Task 7's verification would silently become a null result
-  again.
+  invalidates it and Task 7's verification would silently become a null result.
+- The suite was 46 tests at this commit. Task 4 adds to it; use the delta, not
+  the absolute number, when grading later tasks.
