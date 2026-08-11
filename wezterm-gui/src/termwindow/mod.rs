@@ -1296,7 +1296,12 @@ impl TermWindow {
             };
             let border = self.get_os_border();
             let content_top = (top_bar_height + padding_top + border.top.get() as f32) as i32;
-            let content_left = (padding_left + border.left.get() as f32) as i32;
+            // Kept UNROUNDED for painted_x_span: it feeds the right edge of the
+            // span, so truncating it here leaves a stale column at the split
+            // gutter with a fractional window_padding.  pane_placement still
+            // wants the floored pixel origin, which is the safe direction there.
+            let content_left_px = padding_left + border.left.get() as f32;
+            let content_left = content_left_px as i32;
             let total_cols = self.terminal_size.cols as i32;
             let window_pixel_width = self.dimensions.pixel_width as i32;
 
@@ -1335,7 +1340,7 @@ impl TermWindow {
                     pos.left as i32,
                     pos.width as i32,
                     total_cols,
-                    content_left,
+                    content_left_px,
                     cell_w,
                     window_pixel_width,
                 );
