@@ -100,6 +100,24 @@ check_no_config_error() {
   return 0
 }
 
+# Fail closed if a config could let wezterm ring the system bell.  This box is
+# shared and :20 is not ours alone; a sampling run with the default
+# AudibleBell::SystemBeep beeps for the whole six seconds.  gen-config.sh always
+# emits the Disabled line, so this only ever fires on a hand-written config —
+# which is exactly the case that has no other guard.
+check_bell_disabled() {
+  local cfg="$1"
+  if [ ! -r "$cfg" ]; then
+    echo "check_bell_disabled: config not readable: $cfg" >&2
+    return 1
+  fi
+  if ! grep -q "audible_bell *= *'Disabled'" "$cfg"; then
+    echo "check_bell_disabled: $cfg does not disable the audible bell." >&2
+    echo "  Every config in this work must come from gen-config.sh." >&2
+    return 1
+  fi
+}
+
 capture_settled() {  # capture_settled <winid> <outfile>
   #
   # (fix round 2, Task 4 NEW-3) capture_settled defines "settled" as two
