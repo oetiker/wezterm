@@ -203,9 +203,14 @@ mod tests {
     }
 
     #[test]
-    fn purecpu_atlas_accepts_ceiling() {
+    fn purecpu_atlas_accepts_ordinary_sizes() {
+        // Proves the ceiling refuses rather than blanket-rejecting.  Uses a
+        // small size deliberately: allocating PURECPU_MAX_TEXTURE_SIZE here
+        // would touch 256 MiB on every test run for no extra coverage, and
+        // this box is shared.
         let ctx = RenderContext::PureCpu;
-        assert!(ctx.allocate_texture_atlas(PURECPU_MAX_TEXTURE_SIZE).is_ok());
+        assert!(ctx.allocate_texture_atlas(1024).is_ok());
+        assert!(PURECPU_MAX_TEXTURE_SIZE >= 4096, "ceiling too low for ordinary use");
     }
 }
 ```
@@ -728,54 +733,93 @@ Add to the existing `mod tests` in `purecpu.rs`:
 
 ```rust
     #[test]
-    fn clear_rect_clamps_instead_of_skipping_the_last_row() {
-        // M7: when the computed row end ran past the framebuffer, the row was
-        // skipped entirely, leaving stale pixels in a region the caller
-        // believes it cleared.
+    fn clear_rect_survives_a_rect_entirely_right_of_the_framebuffer() {
+        // M7, the sharp end: x0 is NOT clamped to fb_w while x1 IS, so a rect
+        // starting past the right edge yields x0 > x1 and the fill slices
+        // fb[40..16] — a panic, not a skipped row.  A stray dirty rect from a
+        // resize race takes the process down.
         let fb_w = 4usize;
         let fb_h = 3usize;
         let mut fb = vec![0xFFu8; fb_w * fb_h * 4];
-        // A rect wider than the framebuffer, covering the last row.
-        let rect = DirtyRect { x: 2, y: 2, width: 10, height: 1 };
+        let rect = DirtyRect { x: 10, y: 0, width: 2, height: 1 };
         clear_rect(&mut fb, fb_w, fb_h, &rect);
-        // Row 2, columns 2..4 must be zeroed.
-        for x in 2..4 {
-            let i = (2 * fb_w + x) * 4;
-            assert_eq!(&fb[i..i + 4], &[0, 0, 0, 0], "pixel ({x},2) not cleared");
-        }
-        // Columns 0..2 of row 2 must be untouched.
-        let i = (2 * fb_w) * 4;
-        assert_eq!(&fb[i..i + 4], &[0xFF, 0xFF, 0xFF, 0xFF]);
+        // Nothing is on screen, so nothing may be cleared.
+        assert!(fb.iter().all(|&b| b == 0xFF), "off-screen rect touched pixels");
     }
 
     #[test]
-    fn coalesce_to_bands_result_can_be_clamped_to_the_framebuffer() {
-        // M6: a band extending past the bottom was dropped, so its rows were
-        // never presented.  The band itself is legitimate; only the tail is
-        // out of range.
-        let rects = vec![DirtyRect { x: 0, y: 90, width: 100, height: 20 }];
-        let bands = coalesce_to_bands(&rects, 100);
-        assert_eq!(bands.len(), 1);
-        let b = &bands[0];
-        let screen_height = 100i32;
-        let clamped_h = (b.y + b.height).min(screen_height) - b.y;
-        assert_eq!(clamped_h, 10, "the visible 10 rows must survive clamping");
+    fn clear_rect_survives_a_negative_extent() {
+        // The other half of M7: (rect.x + rect.width) is cast to usize AFTER
+        // .min(), so a negative sum wraps to a huge x1 rather than clamping to
+        // zero.  The `row_end <= fb.len()` guard then silently skips the row —
+        // which is the "silently not drawn" symptom the finding names.
+        let fb_w = 4usize;
+        let fb_h = 3usize;
+        let mut fb = vec![0xFFu8; fb_w * fb_h * 4];
+        let rect = DirtyRect { x: -10, y: 0, width: 2, height: 1 };
+        clear_rect(&mut fb, fb_w, fb_h, &rect);
+        assert!(fb.iter().all(|&b| b == 0xFF), "off-screen rect touched pixels");
+    }
+
+    #[test]
+    fn clamp_band_keeps_the_visible_rows_of_an_overhanging_band() {
+        // M6: a band whose tail ran past the bottom was dropped WHOLE, so
+        // every row in it went unpresented — including the visible ones.
+        assert_eq!(clamp_band(90, 20, 100), Some((90, 10)));
+    }
+
+    #[test]
+    fn clamp_band_passes_a_fully_visible_band_through() {
+        assert_eq!(clamp_band(10, 20, 100), Some((10, 20)));
+    }
+
+    #[test]
+    fn clamp_band_rejects_a_band_entirely_below_the_screen() {
+        assert_eq!(clamp_band(100, 20, 100), None);
+        assert_eq!(clamp_band(120, 20, 100), None);
+    }
+
+    #[test]
+    fn clamp_band_clips_a_negative_origin_to_zero() {
+        // A negative band origin must present from row 0, not at a negative
+        // offset — the old code did `band.y.max(0)` for the slice but passed
+        // the unclamped `band.y` as the destination, so the two disagreed.
+        assert_eq!(clamp_band(-5, 20, 100), Some((0, 15)));
     }
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
 ```bash
-cd /scratch/oetiker/wezterm && cargo test -j4 -p wezterm-gui --bin wezterm-gui clear_rect_clamps coalesce_to_bands_result -- --nocapture
+cd /scratch/oetiker/wezterm && cargo test -j4 -p wezterm-gui --bin wezterm-gui clear_rect_survives clamp_band -- --nocapture
 ```
 
-Expected: `clear_rect_clamps_instead_of_skipping_the_last_row` FAILS (stale `0xFF` in the last row). The `coalesce` test passes — it documents the arithmetic the present loop must use, and its value is in Step 3 pairing it with the real fix.
+Expected:
+- `clear_rect_survives_a_rect_entirely_right_of_the_framebuffer` **panics** — "range start index 40 out of range" or "slice index starts at 40 but ends at 16". That panic is the defect.
+- `clear_rect_survives_a_negative_extent` fails or panics.
+- All four `clamp_band` tests fail to compile — `clamp_band` does not exist yet.
 
 - [ ] **Step 3: Fix M7 in `clear_rect`**
 
-The `x1`/`y1` clamps are already correct; the defect is the `row_end <= fb.len()` guard, which discards a row rather than trimming it. Since `x1` and `y1` are already clamped to `fb_w`/`fb_h`, `row_end` cannot exceed `fb.len()` — so the guard is either dead or masking an inconsistency. Replace it with a debug assertion so a future inconsistency is loud rather than silent:
+Two distinct defects, both from mixing `i32` arithmetic with `usize` casts: `x0`/`y0` are never clamped to the framebuffer's far edge while `x1`/`y1` are, so `x0 > x1` is reachable and slices backwards; and `(rect.x + rect.width)` is cast to `usize` *after* `.min()`, so a negative sum wraps to a huge value instead of clamping to zero.
+
+Do the whole computation in `i32`, clamp both ends to the framebuffer, and only then cast:
 
 ```rust
+/// Clear a rectangular region in the framebuffer to black (zero)
+fn clear_rect(fb: &mut [u8], fb_w: usize, fb_h: usize, rect: &DirtyRect) {
+    // Clamp BOTH ends in i32 before casting.  Casting a negative i32 to usize
+    // wraps to a huge value, and clamping only the far end lets x0 exceed x1,
+    // which slices backwards and panics (findings M7).
+    let x0 = rect.x.clamp(0, fb_w as i32);
+    let y0 = rect.y.clamp(0, fb_h as i32);
+    let x1 = rect.x.saturating_add(rect.width).clamp(0, fb_w as i32);
+    let y1 = rect.y.saturating_add(rect.height).clamp(0, fb_h as i32);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let (x0, y0, x1, y1) = (x0 as usize, y0 as usize, x1 as usize, y1 as usize);
+
     for y in y0..y1 {
         let row_start = (y * fb_w + x0) * 4;
         let row_end = (y * fb_w + x1) * 4;
@@ -790,34 +834,43 @@ The `x1`/`y1` clamps are already correct; the defect is the `row_end <= fb.len()
             fb[row_start..row_end].fill(0);
         }
     }
+}
 ```
 
-Also guard the degenerate case where `x1 < x0` or `y1 < y0` (a rect entirely off-screen), which would panic on the range: add at the top of the function, after the clamps:
+- [ ] **Step 4: Fix M6 — extract `clamp_band`, then use it in the present loop**
+
+The band arithmetic is inline inside `call_draw_purecpu`, where it cannot be tested. Extract it as a free function next to `coalesce_to_bands`:
 
 ```rust
-    if x1 <= x0 || y1 <= y0 {
-        return;
+/// Clamp a band to the visible rows, returning `(y, height)` in framebuffer
+/// rows, or None when nothing of it is on screen.
+///
+/// The present loop used to `continue` whenever a band's tail ran past the
+/// bottom of the window, which dropped the band WHOLE — every row in it went
+/// unpresented, including the visible ones (findings M6).  It also computed
+/// the slice from `band.y.max(0)` but passed the unclamped `band.y` as the
+/// destination row, so the two disagreed for a negative origin.
+fn clamp_band(band_y: i32, band_h: i32, screen_height: i32) -> Option<(usize, usize)> {
+    if band_h <= 0 || screen_height <= 0 {
+        return None;
     }
+    let y0 = band_y.max(0);
+    let y1 = band_y.saturating_add(band_h).min(screen_height);
+    if y1 <= y0 {
+        return None;
+    }
+    Some((y0 as usize, (y1 - y0) as usize))
+}
 ```
 
-Note `x1`/`y1` are computed via `.min(...) as usize` from `i32`; a rect with a negative `x + width` would wrap when cast. Compute them as `i32` first, clamp to `>= 0`, then cast.
-
-- [ ] **Step 4: Fix M6 in the present loop**
-
-Replace the `continue` at `purecpu.rs:505-507` with a clamp:
+Then the present loop at `purecpu.rs:498-519` becomes:
 
 ```rust
             let bands = coalesce_to_bands(&effective_dirty, screen_width);
             for band in &bands {
-                let y = band.y.max(0) as usize;
-                // M6: a band whose tail runs past the bottom of the window used
-                // to be dropped whole, so every row in it went unpresented.
-                // Clamp to the visible rows instead.
-                let max_h = (screen_height as usize).saturating_sub(y);
-                let h = (band.height.max(0) as usize).min(max_h);
-                if h == 0 {
+                let Some((y, h)) = clamp_band(band.y, band.height, screen_height as i32) else {
                     continue;
-                }
+                };
                 let offset = y * fb_w * 4;
                 let size = h * fb_w * 4;
                 if offset + size <= state.frame_buffer.len() {
@@ -832,7 +885,7 @@ Replace the `continue` at `purecpu.rs:505-507` with a clamp:
             }
 ```
 
-Note the last argument changed from `band.y as i16` to `y as i16` — they differ when `band.y` is negative, which is the case the `max(0)` exists for and which previously presented at the wrong offset.
+Note the destination row argument changed from `band.y as i16` to `y as i16`: they differ exactly when `band.y` is negative, which previously presented the clamped slice at an unclamped offset.
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
@@ -995,9 +1048,13 @@ pub fn cover_start(edge: f32) -> i32 {
 }
 
 /// First destination pixel *past* the quad, same rule.
+///
+/// Delegates rather than repeating the expression: the two names exist because
+/// the call sites mean different things, but there is only one coverage rule
+/// and a second copy of it would be free to drift.
 #[inline]
 pub fn cover_end(edge: f32) -> i32 {
-    (edge - 0.5).ceil() as i32
+    cover_start(edge)
 }
 
 /// Maps destination pixels to atlas texels along one axis.
