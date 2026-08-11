@@ -17,6 +17,10 @@ Every task's requirements implicitly include this section. Read it before every 
 
 - **Never touch X displays `:10`–`:14`.** Other users share this machine. All testing is on `:20`.
 - **The audible bell stays disabled in every run.** wezterm's default is `AudibleBell::SystemBeep`. `gen-config.sh` already emits `audible_bell = 'Disabled'` unconditionally (line 182, outside the `VISUAL_BELL` branch). **Every config in this work comes from `gen-config.sh`.** If a combination it refuses is needed, extend `gen-config.sh` — never hand-write around it.
+- **Nothing you run may emit raw bytes to the terminal.** This is the same shared-machine rule as the bell, one layer lower, and it is the one that actually got broken: a subagent's stdout lands in the *user's own terminal*, so a single `0x07` byte anywhere in it beeps at a person who is not looking at your work. Three mechanical rules, no judgement required:
+  - **Never `cat`, `head`, `tail` or otherwise print a binary file.** That includes every `.png` and `.xwd` under `tools/purecpu-parity/out/`. Inspect them with `file`, `identify`, `xxd | head`, or ImageMagick — never by dumping bytes.
+  - **Never execute a corpus script directly.** `corpus/cursor.sh` rings the bell by design; it is meant to run *inside* a wezterm launched by the harness, never in your own shell. Read corpus scripts with the Read tool; run them only via `compare-case.sh` / `sample-case.sh`.
+  - **Redirect long or unfamiliar command output to a file and Read it** rather than letting it stream. `cmd > out.log 2>&1` then Read `out.log`. This also keeps the output out of context.
 - **Never more than 4 cores.** `cargo build -j4`, `cargo test -j4`.
 - **Never run the 65536-atlas case.** 16 GiB on a shared ~25 GiB box. The 32768 case (4 GiB) is already measured; C1's fix is verified by unit test, not by allocating.
 - **Shared harness files** (`lib.sh`, `gen-config.sh`, `compare-case.sh`, `sample-case.sh`) are load-bearing for the review's committed results. Any change must keep default output byte-identical, verified.
