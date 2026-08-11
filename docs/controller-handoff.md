@@ -133,11 +133,43 @@ Carried forward from the review session where still true, plus this session's.
   had to say "you did not immediately pickup my comment". Both times I was
   working on the wrong layer while they were telling me something that would
   have corrected it. A user interjection outranks whatever is mid-flight.
-- **An idle notification is NOT proof a subagent is dead.** A reviewer went idle
-  and wrote nothing; I concluded it had died, then found a `cargo` build it had
-  launched still running. Check for live processes (`ps` for cargo/wezterm)
-  before concluding an agent failed — and prefer nudging it by message over
-  re-dispatching, since its context is intact.
+- **An idle notification is not a report.** Never conclude "done" or "stalled"
+  from silence — inspect the tree. This happened here: a reviewer went idle
+  having written nothing, I concluded it had died, and then found the `cargo`
+  build it had launched still running. It later finished and delivered a clean
+  review. Three signatures, three opposite remedies:
+  - clean tree + commit present → **finished silently**; go read the commit.
+  - dirty tree + no build process → **stalled**; run the gates and commit for it.
+  - dirty tree + a live build → **deadlocked on a pending build** (it ended its
+    turn while cargo ran and will never see the result).
+  **Deadlocked ≠ lost:** the edits are still in the worktree. `SendMessage` the
+  same agent to resume — do not re-dispatch, never restart from scratch.
+- **Put `timeout: 600000` on every long Bash call in a dispatch prompt, and tell
+  the agent never to end a turn while a background shell is live.** The cause of
+  the deadlock above is the subagent ending its turn, not the timeout: on
+  timeout Claude Code backgrounds the command rather than killing it, the agent
+  ends its turn anyway, and the background shell dies with the turn
+  (anthropics/claude-code#50572, closed "not planned"). Banning backgrounding
+  does not help — it just converts this into a synchronous timeout. Have the
+  agent poll `BashOutput` until the command exits. Release builds of this crate
+  are long enough to hit this every time.
+- **Never take a resumed agent's gate result on its word — re-derive it against
+  the commit.** A resumed subagent can report a *stale* log from before its last
+  edits as a fresh green run, and the loop cannot tell (obra/superpowers#2113).
+  Task 2's runtime verification came from a resumed reviewer, so it was
+  re-derived independently: binary built 11:48:50 and artifacts written
+  11:49–11:54, so not stale; `grep -c` gives **172** fallback firings where the
+  reviewer reported 168 (86 `Scale(2)` + 86 `Scale(4)`); peak RSS `653304 kB`
+  matches its 637 MiB exactly; and `identify` gives stddev 3222 over 188 colours
+  on the screenshot, so it is genuinely not blank. Conservative in the one place
+  it was off. **Do this for every load-bearing claim** — the check cost one
+  command.
+- **Verify a subagent's arithmetic, not its adjectives.** "All green" is a
+  claim; the count, the delta, and what accounts for it are the evidence.
+- **State process constraints as actions, not prohibitions.** "Don't pipe the
+  gate" gets ignored; "run it bare, wait for it in the same turn, read the
+  output as it comes" lands. Same shape as the bell rule that finally worked:
+  "redirect every command to a log file and Read it" beat "don't ring the bell".
 - **Verify runtime preconditions; a static trace is not an observation.** Both
   by-reading verdicts the predecessor review overturned failed on preconditions,
   not mechanisms. Task 2 reproduced the same shape: the fallback argument is
