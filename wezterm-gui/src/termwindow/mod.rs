@@ -1204,10 +1204,8 @@ impl TermWindow {
             last_shape_gen,
             last_quad_gen,
             last_resolved_viewport,
-            last_seqno,
             last_cursor_y,
             last_cursor_x,
-            fb_width,
             mut force_full,
         ) = {
             let s = self.purecpu_state.as_ref().unwrap();
@@ -1216,10 +1214,8 @@ impl TermWindow {
                 s.last_shape_generation,
                 s.last_quad_generation,
                 s.last_resolved_viewport,
-                s.last_seqno,
                 s.last_cursor_y,
                 s.last_cursor_x,
-                s.width,
                 s.force_full_repaint,
             )
         };
@@ -1260,31 +1256,27 @@ impl TermWindow {
         // frame has a correct baseline. get_changed_since() is non-consuming
         // so no state is lost.
         if force_full {
+            // Every pane is repainted, so every pane's baseline advances — not
+            // just the active one's.  Snapshotting only the active pane would
+            // leave the others comparing against a stale seqno on the next
+            // incremental frame.
+            let seqnos: Vec<(PaneId, SequenceNo)> = self
+                .get_panes_to_render()
+                .iter()
+                .map(|pos| (pos.pane.pane_id(), pos.pane.get_current_seqno()))
+                .collect();
             if let Some(pane) = self.get_active_pane_or_overlay() {
-                let new_seqno = pane.get_current_seqno();
                 let cursor = pane.get_cursor_position();
                 let state = self.purecpu_state.as_mut().unwrap();
-                state.last_seqno = new_seqno;
                 state.last_cursor_y = Some(cursor.y);
                 state.last_cursor_x = Some(cursor.x);
             }
+            let state = self.purecpu_state.as_mut().unwrap();
+            state.last_seqno_by_pane = seqnos.into_iter().collect();
         }
 
         // Compute dirty pixel regions if not doing full repaint
         if !force_full {
-            // Collect all data we need from self methods first
-            let pane_info = self.get_active_pane_or_overlay().map(|pane| {
-                let dims = pane.get_dimensions();
-                let viewport = self
-                    .get_viewport(pane.pane_id())
-                    .unwrap_or(dims.physical_top);
-                let visible_range = viewport..viewport + dims.viewport_rows as StableRowIndex;
-                let dirty_rows = pane.get_changed_since(visible_range, last_seqno);
-                let cursor = pane.get_cursor_position();
-                let new_seqno = pane.get_current_seqno();
-                (dims, viewport, dirty_rows, cursor, new_seqno)
-            });
-
             let cell_w = self.render_metrics.cell_size.width as i32;
             let cell_h = self.render_metrics.cell_size.height as i32;
             let (padding_left, padding_top) = self.padding_left_top();
@@ -1304,121 +1296,170 @@ impl TermWindow {
             };
             let border = self.get_os_border();
             let content_top = (top_bar_height + padding_top + border.top.get() as f32) as i32;
+            let content_left = (padding_left + border.left.get() as f32) as i32;
+            let total_cols = self.terminal_size.cols as i32;
+            let window_pixel_width = self.dimensions.pixel_width as i32;
 
-            // Now we can mutably borrow state
-            let state = self.purecpu_state.as_mut().unwrap();
-            state.dirty_pixel_rects.clear();
+            // I1: walk the same pane list paint_impl renders, not just the
+            // active pane.  A build running in one split while you read in
+            // another is the ordinary reason to use splits, and with only the
+            // active pane consulted the other one never repaints at all.
+            let panes = self.get_panes_to_render();
 
-            if let Some((dims, viewport, dirty_rows, cursor, new_seqno)) = pane_info {
-                // Convert dirty row ranges to full-width pixel bands.
-                // Line-level granularity is sufficient: XPutImage needs
-                // contiguous full-width data anyway.
+            let mut collected: Vec<DirtyRect> = vec![];
+            let mut seqnos: HashMap<PaneId, SequenceNo> = HashMap::new();
+            // (placement, viewport, cursor) of the active pane; the cursor and
+            // the blink phase are window-level state and belong to it alone.
+            let mut active = None;
+
+            for pos in &panes {
+                // NOTE: left / top / width / height are CELLS.  The same struct
+                // also carries pixel_width / pixel_height; substituting one of
+                // those here type-checks and yields a plausible-looking rect
+                // that no test in purecpu_dirty can catch.
+                let placement = purecpu_dirty::pane_placement(
+                    pos.left as i32,
+                    pos.top as i32,
+                    pos.width as i32,
+                    pos.height as i32,
+                    content_left,
+                    content_top,
+                    cell_w,
+                    cell_h,
+                );
+                // I2 on the horizontal axis.  The band spans the pane's PAINTED
+                // background, not its text cells: anything narrower leaves the
+                // window padding, the half-cell split gutter and glyph overhang
+                // past the last column cleared by nobody and drawn by nobody.
+                let span = purecpu_dirty::painted_x_span(
+                    pos.left as i32,
+                    pos.width as i32,
+                    total_cols,
+                    content_left,
+                    cell_w,
+                    window_pixel_width,
+                );
+
+                let pane_id = pos.pane.pane_id();
+                let dims = pos.pane.get_dimensions();
+                let viewport = self.get_viewport(pane_id).unwrap_or(dims.physical_top);
+                let visible_range = viewport..viewport + dims.viewport_rows as StableRowIndex;
+                // Per-pane baseline: seqno counters are per terminal, so the
+                // active pane's is meaningless for anyone else.  An unseen pane
+                // gets 0, which reports every row dirty for one frame — the safe
+                // direction.
+                let baseline = self
+                    .purecpu_state
+                    .as_ref()
+                    .unwrap()
+                    .last_seqno_by_pane
+                    .get(&pane_id)
+                    .copied()
+                    .unwrap_or(0);
+                let dirty_rows = pos.pane.get_changed_since(visible_range, baseline);
+                seqnos.insert(pane_id, pos.pane.get_current_seqno());
+
+                // Convert dirty row ranges to per-pane pixel bands.  Line-level
+                // granularity is sufficient: XPutImage needs contiguous
+                // full-width data anyway.
                 for range in dirty_rows.iter() {
                     for stable_row in range.clone() {
                         let row_in_viewport = (stable_row - viewport) as i32;
-                        if row_in_viewport < 0 || row_in_viewport >= dims.viewport_rows as i32 {
-                            continue;
-                        }
-                        let y = content_top + row_in_viewport * cell_h;
-                        state.dirty_pixel_rects.push(DirtyRect {
-                            x: 0,
-                            y,
-                            width: fb_width as i32,
-                            height: cell_h,
-                        });
-                    }
-                }
-
-                let cursor_row = cursor.y;
-                let cursor_col = cursor.x;
-
-                let cursor_moved = match (last_cursor_y, last_cursor_x) {
-                    (Some(prev_y), Some(prev_x)) => {
-                        prev_y != cursor_row || prev_x != cursor_col
-                    }
-                    _ => true, // first frame: treat as moved
-                };
-
-                if cursor_moved {
-                    // Mark previous cursor position dirty
-                    if let (Some(prev_y), Some(prev_x)) = (last_cursor_y, last_cursor_x) {
-                        let prev_row_in_viewport = (prev_y - viewport) as i32;
-                        if prev_row_in_viewport >= 0
-                            && prev_row_in_viewport < dims.viewport_rows as i32
+                        if let Some(rect) =
+                            purecpu_dirty::row_band_painted(&placement, row_in_viewport, &span)
                         {
-                            let y = content_top + prev_row_in_viewport * cell_h;
-                            let x = (padding_left + border.left.get() as f32) as i32
-                                + prev_x as i32 * cell_w;
-                            state.dirty_pixel_rects.push(DirtyRect {
-                                x,
-                                y,
-                                width: cell_w,
-                                height: cell_h,
-                            });
+                            collected.push(rect);
                         }
-                    }
-
-                    // Mark new cursor position dirty
-                    let cursor_row_in_viewport = (cursor_row - viewport) as i32;
-                    if cursor_row_in_viewport >= 0
-                        && cursor_row_in_viewport < dims.viewport_rows as i32
-                    {
-                        let y = content_top + cursor_row_in_viewport * cell_h;
-                        let x = (padding_left + border.left.get() as f32) as i32
-                            + cursor_col as i32 * cell_w;
-                        state.dirty_pixel_rects.push(DirtyRect {
-                            x,
-                            y,
-                            width: cell_w,
-                            height: cell_h,
-                        });
                     }
                 }
 
-                // Cursor blink: detect phase transitions (visible↔invisible)
-                // and only mark cursor dirty on actual transitions.  Between
-                // transitions the blink animation timer still fires (at
-                // animation_fps) but we skip paint_impl and just reschedule.
-                // This gives correct blink at ~2 paints/cycle instead of
-                // animation_fps paints/cycle.
+                if pos.is_active {
+                    let cursor = pos.pane.get_cursor_position();
+                    active = Some((placement, viewport, cursor));
+
+                    let cursor_moved = match (last_cursor_y, last_cursor_x) {
+                        (Some(prev_y), Some(prev_x)) => prev_y != cursor.y || prev_x != cursor.x,
+                        _ => true, // first frame: treat as moved
+                    };
+
+                    if cursor_moved {
+                        // The cursor is drawn inside its cell, so the narrow
+                        // cell_rect is right here — deliberately not the span.
+                        if let (Some(prev_y), Some(prev_x)) = (last_cursor_y, last_cursor_x) {
+                            if let Some(rect) = purecpu_dirty::cell_rect(
+                                &placement,
+                                (prev_y - viewport) as i32,
+                                prev_x as i32,
+                            ) {
+                                collected.push(rect);
+                            }
+                        }
+                        if let Some(rect) = purecpu_dirty::cell_rect(
+                            &placement,
+                            (cursor.y - viewport) as i32,
+                            cursor.x as i32,
+                        ) {
+                            collected.push(rect);
+                        }
+                    }
+                }
+            }
+
+            // Cursor blink: detect phase transitions (visible<->invisible) and
+            // only mark the cursor dirty on actual transitions.  Between
+            // transitions the blink animation timer still fires (at
+            // animation_fps) but we skip paint_impl and just reschedule.  This
+            // gives correct blink at ~2 paints/cycle instead of animation_fps
+            // paints/cycle.
+            let mut blink_rect = None;
+            let mut new_blink_visible = None;
+            if let Some((placement, viewport, cursor)) = active.as_ref() {
                 let cursor_blinking = cursor.shape.is_blinking()
                     && self.config.cursor_blink_rate != 0
                     && self.focused.is_some();
                 if cursor_blinking {
                     let intensity = self.cursor_blink_state.borrow().peek_intensity();
-                    // Quantize to on/off; None means cycle ended → visible
+                    // Quantize to on/off; None means cycle ended -> visible
                     let blink_visible = match intensity {
                         Some(i) => i < 0.5,
                         None => true,
                     };
-                    let phase_changed = blink_visible != state.last_blink_visible;
-                    // Also force paint when cycle completed so intensity_continuous()
-                    // in paint_pass can restart it
+                    let phase_changed =
+                        blink_visible != self.purecpu_state.as_ref().unwrap().last_blink_visible;
+                    // Also force paint when the cycle completed so
+                    // intensity_continuous() in paint_pass can restart it
                     let cycle_ended = intensity.is_none();
 
                     if phase_changed || cycle_ended {
-                        state.last_blink_visible = blink_visible;
-                        // Mark cursor position dirty for the blink transition
-                        let cursor_row_in_viewport = (cursor_row - viewport) as i32;
-                        if cursor_row_in_viewport >= 0
-                            && cursor_row_in_viewport < dims.viewport_rows as i32
-                        {
-                            let y = content_top + cursor_row_in_viewport * cell_h;
-                            let x = (padding_left + border.left.get() as f32) as i32
-                                + cursor_col as i32 * cell_w;
-                            state.dirty_pixel_rects.push(DirtyRect {
-                                x,
-                                y,
-                                width: cell_w,
-                                height: cell_h,
-                            });
-                        }
+                        new_blink_visible = Some(blink_visible);
+                        // Now via cell_rect against the ACTIVE pane's placement;
+                        // it used to be computed inline against the window
+                        // origin, which is I2 in the split case.
+                        blink_rect = purecpu_dirty::cell_rect(
+                            placement,
+                            (cursor.y - *viewport) as i32,
+                            cursor.x as i32,
+                        );
                     }
                 }
+            }
 
-                state.last_cursor_y = Some(cursor_row);
-                state.last_cursor_x = Some(cursor_col);
-                state.last_seqno = new_seqno;
+            // Only now take the &mut borrow: the loop above calls &self methods.
+            let state = self.purecpu_state.as_mut().unwrap();
+            state.dirty_pixel_rects.clear();
+            state.dirty_pixel_rects.extend(collected);
+            if let Some(rect) = blink_rect {
+                state.dirty_pixel_rects.push(rect);
+            }
+            if let Some(visible) = new_blink_visible {
+                state.last_blink_visible = visible;
+            }
+            // Assigning rather than merging also prunes panes that have gone
+            // away, so the map cannot grow without bound.
+            state.last_seqno_by_pane = seqnos;
+            if let Some((_, _, cursor)) = active {
+                state.last_cursor_y = Some(cursor.y);
+                state.last_cursor_x = Some(cursor.x);
             }
         }
 

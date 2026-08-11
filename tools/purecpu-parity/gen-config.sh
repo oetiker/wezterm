@@ -122,8 +122,82 @@ case "$DEFAULT_CURSOR_STYLE" in
     ;;
 esac
 
+# (Task 4) SPLIT_DIR / SPLIT_FIRST / SPLIT_SECOND build the two-pane scene the
+# I1 / I2 reproduce driver in docs/purecpu-review/findings.md:285-322 needs: one
+# window, two panes, a DIFFERENT command in each, and the split (second) pane
+# active. SPAWN_TABS cannot express that — it runs cmd.args in every pane, so
+# both panes animate and neither can serve as the "did the OTHER pane repaint?"
+# probe. Hand-writing the config instead is what the Global Constraints forbid,
+# because check_bell_disabled is then the only thing standing between a shared
+# machine and six seconds of beeping, and a hand-written config is exactly the
+# case where a bad value silently makes both windows use the same front end.
+#
+# Leaving SPLIT_DIR unset emits nothing new, so every Tasks 1-6 case reproduces
+# byte-for-byte.
+SPLIT_DIR="${SPLIT_DIR:-}"
+SPLIT_FIRST="${SPLIT_FIRST:-}"
+SPLIT_SECOND="${SPLIT_SECOND:-}"
+
+if [ -n "$SPLIT_DIR" ]; then
+  if [ "$SPAWN_TABS" = "true" ]; then
+    echo "gen-config.sh: SPLIT_DIR and SPAWN_TABS both set. Both register a" \
+         "gui-startup handler and only one can win, so the scene you measure" \
+         "would not be the scene you asked for." >&2
+    exit 1
+  fi
+  # 'Down' is not a wezterm split direction. It does not fail loudly: the
+  # handler errors out *after* spawn_window, leaving a single pane and a probe
+  # that silently tests nothing at all (findings.md:320-322 -- this already
+  # happened once).
+  case "$SPLIT_DIR" in
+    Right|Left|Top|Bottom) ;;
+    *)
+      echo "gen-config.sh: SPLIT_DIR=$SPLIT_DIR is not a wezterm split" \
+           "direction. Valid: Right, Left, Top, Bottom. In particular 'Down'" \
+           "is NOT valid and fails silently, leaving one pane and a probe" \
+           "that tests nothing." >&2
+      exit 1
+      ;;
+  esac
+  for v in SPLIT_FIRST SPLIT_SECOND; do
+    path="${!v}"
+    if [ -z "$path" ]; then
+      echo "gen-config.sh: SPLIT_DIR is set but $v is empty. A pane with no" \
+           "command runs your login shell, so the capture stops being" \
+           "hermetic and the probe measures your prompt." >&2
+      exit 1
+    fi
+    if [ ! -r "$path" ]; then
+      echo "gen-config.sh: $v=$path is not readable. wezterm would open a" \
+           "pane that exits immediately and the probe would sample a dead" \
+           "pane without saying so." >&2
+      exit 1
+    fi
+    case "$path" in
+      *\'*|*\\*)
+        echo "gen-config.sh: $v=$path contains a quote or backslash, which" \
+             "breaks the single-quoted Lua string below; wezterm then rejects" \
+             "the whole config and both windows fall back to the default" \
+             "front_end." >&2
+        exit 1
+        ;;
+    esac
+  done
+fi
+
 STARTUP=""
-if [ "$SPAWN_TABS" = "true" ]; then
+if [ -n "$SPLIT_DIR" ]; then
+STARTUP=$(cat <<LUA
+wezterm.on('gui-startup', function(cmd)
+  -- The split pane is created second and is therefore the ACTIVE one, which
+  -- is what the I1 / I2 parameterisation assumes: I1 puts the animation in
+  -- the inactive pane, I2 puts it in the active one.
+  local tab, pane, window = wezterm.mux.spawn_window { args = { 'bash', '$SPLIT_FIRST' } }
+  pane:split { direction = '$SPLIT_DIR', size = 0.5, args = { 'bash', '$SPLIT_SECOND' } }
+end)
+LUA
+)
+elif [ "$SPAWN_TABS" = "true" ]; then
 STARTUP=$(cat <<'LUA'
 wezterm.on('gui-startup', function(cmd)
   -- (Task 5 review round 1, I4) Registering a gui-startup handler at all
