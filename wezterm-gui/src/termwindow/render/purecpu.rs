@@ -424,6 +424,16 @@ impl crate::TermWindow {
                         let [cx1, cy1, cx2, cy2] = *clip;
 
                         // Clipped row/col ranges, in destination pixels.
+                        //
+                        // The `.max(dest_y)` / `.max(dest_x)` terms are
+                        // redundant today and kept as defence in depth: a full
+                        // repaint pushes the destination rect itself as the clip
+                        // rect (:353) and an incremental one intersects with it
+                        // in `collect_clip_rects`, so `cx1 >= dest_x` already
+                        // holds on both paths.  The `.max(0)` / `.min(fb_*)`
+                        // terms are NOT redundant — they are what keeps a quad
+                        // hanging off the top/left edge inside the framebuffer,
+                        // and they replace the old per-pixel `dy < 0` guard.
                         let row_start = cy1.max(dest_y).max(0);
                         let row_end = cy2.min(blit_y2).min(fb_h as i32);
                         let col_start = cx1.max(dest_x).max(0);
@@ -431,6 +441,13 @@ impl crate::TermWindow {
 
                         for dy in row_start..row_end {
                             let atlas_row = quad.texel_y(dy);
+                            // Documents an invariant rather than doing work:
+                            // sampled quads come back clamped to
+                            // `[0, atlas_h - 1]` by `Axis::texel`, and bg-image
+                            // quads are bounded by the `min(tex, dest)` crop, so
+                            // neither branch can land outside the atlas.  Kept
+                            // so a future producer of out-of-range texcoords
+                            // fails safe instead of indexing out of bounds.
                             if atlas_row < 0 || atlas_row >= atlas_h as i32 {
                                 continue;
                             }

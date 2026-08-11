@@ -21,6 +21,17 @@
 //! Leave it on its current path.  Routing it would expand scope silently and
 //! would manufacture parity diffs that look like sampler defects and are not.
 //!
+//! **An invariant this module silently depends on: the atlas side is a power of
+//! two.**  Texcoords reach us as `coords.min_x() / width` (`to_texture_coords`,
+//! `window/src/bitmaps/mod.rs:34-42`) and we multiply by the side again to get
+//! texels.  That round-trip is exact only because both operations are by a power
+//! of two — `ATLAS_SIZE = 128` (`termwindow/mod.rs:90`) growing by
+//! `(side * 2).max(size.next_power_of_two())` (`window/src/bitmaps/atlas.rs:117-120`).
+//! On a non-power-of-two side the round-trip would land at, say, `99.99997`, and
+//! `floor` would read one texel into the sprite to the *left* — on the first
+//! pixel of every sprite.  It would look like a font-rendering bug, not an atlas
+//! one.  If the atlas sizing ever changes, this module needs a half-texel inset.
+//!
 //! One place exact parity is still expected to wobble: at exact minification
 //! ratios (2:1, 3:1, …) every sample lands precisely *on* a texel boundary,
 //! where `floor` takes the upper texel and the hardware's finite-precision
@@ -482,6 +493,71 @@ mod tests {
         ("mirrored tile", [0.0, 0.0, 10.0, 10.0], [110.0, 0.0, 100.0, 10.0]),
     ];
 
+    /// Compares two walks and fails on the *first* differing pixel.
+    ///
+    /// A bare `assert_eq!` on these two vectors prints 400 four-tuples per side —
+    /// 12 KB of terminal in a project whose hard constraint is that nothing may
+    /// emit raw bytes to the terminal.  Same teeth, readable message: this still
+    /// dies on a rect change, on a pixel-count change, and on a single moved
+    /// texel, which are the three ways the legacy path can drift.
+    #[track_caller]
+    fn assert_same_walk(
+        got: &Option<([i32; 4], Vec<(i32, i32, i32, i32)>)>,
+        want: &Option<([i32; 4], Vec<(i32, i32, i32, i32)>)>,
+        what: &str,
+    ) {
+        match (got, want) {
+            (Some((got_rect, got_px)), Some((want_rect, want_px))) => {
+                assert_eq!(got_rect, want_rect, "rect moved for {what}");
+                assert_eq!(got_px.len(), want_px.len(), "pixel count moved for {what}");
+                if let Some((i, (g, w))) = got_px
+                    .iter()
+                    .zip(want_px.iter())
+                    .enumerate()
+                    .find(|(_, (g, w))| g != w)
+                {
+                    panic!(
+                        "sampling moved for {what}: pixel {i} of {} reads {g:?}, legacy reads {w:?} \
+                         (tuples are dest_x, dest_y, atlas_col, atlas_row)",
+                        got_px.len()
+                    );
+                }
+            }
+            _ => assert_eq!(
+                got.is_some(),
+                want.is_some(),
+                "the drop-or-draw decision moved for {what}"
+            ),
+        }
+    }
+
+    #[test]
+    fn fractional_texcoords_are_exercised_at_all() {
+        // Every case in BG_CASES uses whole-number atlas coordinates, so nothing
+        // in this module ever drove a fractional source origin — and fractional
+        // is the interesting case, because it is where the power-of-two atlas
+        // invariant in the module doc lives.
+        //
+        // A 1:4 magnification from a source origin of 100.4:
+        //   s(p) = 100.4 + ((p + 0.5) / 40) * 10 = 100.4 + (p + 0.5) / 4
+        // The fractional origin makes the run lengths *uneven* — 2 then 4 — which
+        // is exactly what a whole-number origin cannot produce and what a
+        // half-texel inset (were one ever wrongly added) would flatten.
+        let dest_f = [0.0, 0.0, 40.0, 40.0];
+        let tex_f = [100.4, 0.0, 110.4, 10.0];
+        let sampled = Quad::new(false, dest_f, tex_f, 4096, 4096);
+        let cols: Vec<i32> = (0..10).map(|dx| sampled.texel_x(dx)).collect();
+        assert_eq!(cols, vec![100, 100, 101, 101, 101, 101, 102, 102, 102, 102]);
+
+        // ...and the bg-image path truncates the source origin exactly as the old
+        // code did, so a fractional texcoord must not move it.
+        assert_same_walk(
+            &walk(&Quad::new(true, dest_f, tex_f, 4096, 4096)),
+            &legacy_oracle(dest_f, tex_f),
+            "fractional texcoords",
+        );
+    }
+
     #[test]
     fn span_joins_coverage_to_sampling() {
         // THE seam test.  `cover_start`/`cover_end` and `Axis::texel` had never
@@ -537,14 +613,11 @@ mod tests {
         // sampler defects.  Asserting "I did not touch it" is worth nothing;
         // this holds it to an independent transcription of the old code.
         for (name, dest_f, tex_f) in BG_CASES {
-            let got = walk(&Quad::new(true, dest_f, tex_f, 4096, 4096));
-            let want = legacy_oracle(dest_f, tex_f);
-            assert_eq!(
-                got.as_ref().map(|(r, w)| (*r, w.len())),
-                want.as_ref().map(|(r, w)| (*r, w.len())),
-                "bg-image rect/extent moved for {name}"
+            assert_same_walk(
+                &walk(&Quad::new(true, dest_f, tex_f, 4096, 4096)),
+                &legacy_oracle(dest_f, tex_f),
+                name,
             );
-            assert_eq!(got, want, "bg-image sampling moved for {name}");
         }
 
         // ...and the converse error — leaving an ordinary textured quad on the
