@@ -100,15 +100,29 @@ fn collect_clip_rects(
 
 /// Clear a rectangular region in the framebuffer to black (zero)
 fn clear_rect(fb: &mut [u8], fb_w: usize, fb_h: usize, rect: &DirtyRect) {
-    let x0 = rect.x.max(0) as usize;
-    let y0 = rect.y.max(0) as usize;
-    let x1 = (rect.x + rect.width).min(fb_w as i32) as usize;
-    let y1 = (rect.y + rect.height).min(fb_h as i32) as usize;
+    // Clamp BOTH ends in i32 before casting.  Casting a negative i32 to usize
+    // wraps to a huge value, and clamping only the far end lets x0 exceed x1,
+    // which slices backwards and panics (findings M7).
+    let x0 = rect.x.clamp(0, fb_w as i32);
+    let y0 = rect.y.clamp(0, fb_h as i32);
+    let x1 = rect.x.saturating_add(rect.width).clamp(0, fb_w as i32);
+    let y1 = rect.y.saturating_add(rect.height).clamp(0, fb_h as i32);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let (x0, y0, x1, y1) = (x0 as usize, y0 as usize, x1 as usize, y1 as usize);
 
     for y in y0..y1 {
         let row_start = (y * fb_w + x0) * 4;
         let row_end = (y * fb_w + x1) * 4;
-        if row_end <= fb.len() {
+        debug_assert!(
+            row_end <= fb.len(),
+            "clear_rect: row_end {row_end} exceeds framebuffer {} — \
+             fb_w/fb_h disagree with the buffer length",
+            fb.len()
+        );
+        let row_end = row_end.min(fb.len());
+        if row_start < row_end {
             fb[row_start..row_end].fill(0);
         }
     }
@@ -146,6 +160,26 @@ fn coalesce_to_bands(rects: &[DirtyRect], screen_width: u32) -> Vec<DirtyRect> {
             height: y2 - y,
         })
         .collect()
+}
+
+/// Clamp a band to the visible rows, returning `(y, height)` in framebuffer
+/// rows, or None when nothing of it is on screen.
+///
+/// The present loop used to `continue` whenever a band's tail ran past the
+/// bottom of the window, which dropped the band WHOLE — every row in it went
+/// unpresented, including the visible ones (findings M6).  It also computed
+/// the slice from `band.y.max(0)` but passed the unclamped `band.y` as the
+/// destination row, so the two disagreed for a negative origin.
+fn clamp_band(band_y: i32, band_h: i32, screen_height: i32) -> Option<(usize, usize)> {
+    if band_h <= 0 || screen_height <= 0 {
+        return None;
+    }
+    let y0 = band_y.max(0);
+    let y1 = band_y.saturating_add(band_h).min(screen_height);
+    if y1 <= y0 {
+        return None;
+    }
+    Some((y0 as usize, (y1 - y0) as usize))
 }
 
 impl crate::TermWindow {
@@ -500,11 +534,9 @@ impl crate::TermWindow {
             // Since bands span full width, the pixel data is contiguous in the framebuffer.
             let bands = coalesce_to_bands(&effective_dirty, screen_width);
             for band in &bands {
-                let y = band.y.max(0) as usize;
-                let h = band.height as usize;
-                if y + h > screen_height as usize {
+                let Some((y, h)) = clamp_band(band.y, band.height, screen_height as i32) else {
                     continue;
-                }
+                };
                 let offset = y * fb_w * 4;
                 let size = h * fb_w * 4;
                 if offset + size <= state.frame_buffer.len() {
@@ -513,7 +545,7 @@ impl crate::TermWindow {
                         screen_width,
                         h as u32,
                         0,
-                        band.y as i16,
+                        y as i16,
                     )?;
                 }
             }
@@ -736,5 +768,60 @@ mod test {
         assert_eq!(fb[idx..idx + 4], [0, 0, 0, 0]);
         // Check that pixel (0,0) is still white
         assert_eq!(fb[0..4], [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn clear_rect_survives_a_rect_entirely_right_of_the_framebuffer() {
+        // M7, the sharp end: x0 is NOT clamped to fb_w while x1 IS, so a rect
+        // starting past the right edge yields x0 > x1 and the fill slices
+        // fb[40..16] — a panic, not a skipped row.  A stray dirty rect from a
+        // resize race takes the process down.
+        let fb_w = 4usize;
+        let fb_h = 3usize;
+        let mut fb = vec![0xFFu8; fb_w * fb_h * 4];
+        let rect = DirtyRect { x: 10, y: 0, width: 2, height: 1 };
+        clear_rect(&mut fb, fb_w, fb_h, &rect);
+        // Nothing is on screen, so nothing may be cleared.
+        assert!(fb.iter().all(|&b| b == 0xFF), "off-screen rect touched pixels");
+    }
+
+    #[test]
+    fn clear_rect_survives_a_negative_extent() {
+        // The other half of M7: (rect.x + rect.width) is cast to usize AFTER
+        // .min(), so a negative sum wraps to a huge x1 rather than clamping to
+        // zero.  The `row_end <= fb.len()` guard then silently skips the row —
+        // which is the "silently not drawn" symptom the finding names.
+        let fb_w = 4usize;
+        let fb_h = 3usize;
+        let mut fb = vec![0xFFu8; fb_w * fb_h * 4];
+        let rect = DirtyRect { x: -10, y: 0, width: 2, height: 1 };
+        clear_rect(&mut fb, fb_w, fb_h, &rect);
+        assert!(fb.iter().all(|&b| b == 0xFF), "off-screen rect touched pixels");
+    }
+
+    #[test]
+    fn clamp_band_keeps_the_visible_rows_of_an_overhanging_band() {
+        // M6: a band whose tail ran past the bottom was dropped WHOLE, so
+        // every row in it went unpresented — including the visible ones.
+        assert_eq!(clamp_band(90, 20, 100), Some((90, 10)));
+    }
+
+    #[test]
+    fn clamp_band_passes_a_fully_visible_band_through() {
+        assert_eq!(clamp_band(10, 20, 100), Some((10, 20)));
+    }
+
+    #[test]
+    fn clamp_band_rejects_a_band_entirely_below_the_screen() {
+        assert_eq!(clamp_band(100, 20, 100), None);
+        assert_eq!(clamp_band(120, 20, 100), None);
+    }
+
+    #[test]
+    fn clamp_band_clips_a_negative_origin_to_zero() {
+        // A negative band origin must present from row 0, not at a negative
+        // offset — the old code did `band.y.max(0)` for the slice but passed
+        // the unclamped `band.y` as the destination, so the two disagreed.
+        assert_eq!(clamp_band(-5, 20, 100), Some((0, 15)));
     }
 }
