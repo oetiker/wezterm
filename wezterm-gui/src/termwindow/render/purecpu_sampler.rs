@@ -423,24 +423,36 @@ mod tests {
         assert_eq!(Axis::new(-3.0, 4.0, 5.0, 0.0, 4096).texel(5), 0);
     }
 
-    /// Walks a `Quad` exactly the way `purecpu.rs`'s blit loop walks it on a
-    /// full repaint (clip rect == destination rect), yielding
-    /// `(dest_x, dest_y, atlas_col, atlas_row)` per written pixel.
-    fn walk(q: &Quad) -> Option<([i32; 4], Vec<(i32, i32, i32, i32)>)> {
-        let rect = q.dest_rect();
-        let [dx0, dy0, dx1, dy1] = rect;
-        if dx1 - dx0 <= 0 || dy1 - dy0 <= 0 {
-            return None;
-        }
-        let (end_x, end_y) = q.blit_end()?;
-        let mut out = Vec::new();
-        for dy in dy0..end_y {
-            for dx in dx0..end_x {
-                out.push((dx, dy, q.texel_x(dx), q.texel_y(dy)));
-            }
-        }
-        Some((rect, out))
+    /// Walks a quad through **`purecpu.rs`'s real blit loop** on a full repaint
+    /// (clip rect == destination rect), yielding `(dest_x, dest_y, atlas_col,
+    /// atlas_row)` per written pixel.
+    ///
+    /// Until Task 15 this was a second implementation of that loop, written in
+    /// this file and free to drift from the one that ships — the precise hazard
+    /// the equivalence tests below exist to prevent, reintroduced one layer
+    /// down.  `blit_probe` drives the shipping `blit_vertex_buffer` against a
+    /// framebuffer and an atlas whose texels name their own coordinates, so the
+    /// tuples below are read back out of a real blit rather than predicted.
+    ///
+    /// `legacy_oracle` stays a deliberate transcription of the *old* code and
+    /// delegates to nothing; that asymmetry is the point.
+    ///
+    /// Two consequences of grading the real loop, both wanted: the walk is now
+    /// bounded by the harness framebuffer (`blit_probe` asserts the quad fits
+    /// rather than silently truncating) and by the atlas bounds check the loop
+    /// performs, and the atlas side is `purecpu::test::PROBE_ATLAS` rather
+    /// than a nominal 4096 — every texcoord these tests use is far inside it,
+    /// so no clamp behaviour changes.
+    fn walk(
+        bg_image: bool,
+        dest_f: [f32; 4],
+        tex_f: [f32; 4],
+    ) -> Option<([i32; 4], Vec<(i32, i32, i32, i32)>)> {
+        crate::termwindow::render::purecpu::test::blit_probe(bg_image, dest_f, tex_f)
     }
+
+    /// The atlas side `walk` blits against, as an `i32` for `Quad::new`.
+    const ATLAS: i32 = crate::termwindow::render::purecpu::test::PROBE_ATLAS as i32;
 
     /// The pre-Task-7 blit arithmetic, transcribed from `purecpu.rs` as it
     /// stood at b7936ac (`:303-307` rect, `:337-342` source, `:392-425` crop
@@ -552,7 +564,7 @@ mod tests {
         // ...and the bg-image path truncates the source origin exactly as the old
         // code did, so a fractional texcoord must not move it.
         assert_same_walk(
-            &walk(&Quad::new(true, dest_f, tex_f, 4096, 4096)),
+            &walk(true, dest_f, tex_f),
             &legacy_oracle(dest_f, tex_f),
             "fractional texcoords",
         );
@@ -614,7 +626,7 @@ mod tests {
         // this holds it to an independent transcription of the old code.
         for (name, dest_f, tex_f) in BG_CASES {
             assert_same_walk(
-                &walk(&Quad::new(true, dest_f, tex_f, 4096, 4096)),
+                &walk(true, dest_f, tex_f),
                 &legacy_oracle(dest_f, tex_f),
                 name,
             );
@@ -628,15 +640,15 @@ mod tests {
                 // The identity property: a 1:1 quad at integral coordinates
                 // must still select the very texels the old blit did, so this
                 // case is *expected* to agree and cannot carry the assertion.
-                assert_eq!(
-                    walk(&Quad::new(false, dest_f, tex_f, 4096, 4096)),
-                    legacy_oracle(dest_f, tex_f),
-                    "the 1:1 identity moved"
+                assert_same_walk(
+                    &walk(false, dest_f, tex_f),
+                    &legacy_oracle(dest_f, tex_f),
+                    "the 1:1 identity",
                 );
                 continue;
             }
             assert_ne!(
-                walk(&Quad::new(false, dest_f, tex_f, 4096, 4096)),
+                walk(false, dest_f, tex_f),
                 legacy_oracle(dest_f, tex_f),
                 "{name} is still being cropped rather than scaled"
             );
@@ -646,13 +658,13 @@ mod tests {
         // Sub-pixel origin: truncation gives 10, the coverage rule ceil(10.1)
         // gives 11 — the whole-pixel displacement M1 names.
         let (dest_f, tex_f) = (BG_CASES[1].1, BG_CASES[1].2);
-        assert_eq!(Quad::new(true, dest_f, tex_f, 4096, 4096).dest_rect(), [10, 20, 30, 40]);
-        assert_eq!(Quad::new(false, dest_f, tex_f, 4096, 4096).dest_rect(), [11, 21, 31, 41]);
+        assert_eq!(Quad::new(true, dest_f, tex_f, ATLAS, ATLAS).dest_rect(), [10, 20, 30, 40]);
+        assert_eq!(Quad::new(false, dest_f, tex_f, ATLAS, ATLAS).dest_rect(), [11, 21, 31, 41]);
         // Magnified 1:4: same rect either way, but the crop stops after 10 of
         // the 40 destination pixels while the sampler covers all 40.
         let (dest_f, tex_f) = (BG_CASES[2].1, BG_CASES[2].2);
-        assert_eq!(Quad::new(true, dest_f, tex_f, 4096, 4096).blit_end(), Some((10, 10)));
-        assert_eq!(Quad::new(false, dest_f, tex_f, 4096, 4096).blit_end(), Some((40, 40)));
+        assert_eq!(Quad::new(true, dest_f, tex_f, ATLAS, ATLAS).blit_end(), Some((10, 10)));
+        assert_eq!(Quad::new(false, dest_f, tex_f, ATLAS, ATLAS).blit_end(), Some((40, 40)));
     }
 
     #[test]
