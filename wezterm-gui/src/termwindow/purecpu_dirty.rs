@@ -7,7 +7,11 @@
 //! top-left was repainted at the wrong place — or, because the rects then
 //! matched nothing the paint pass drew, not repainted at all (findings I2).
 
+use crate::colorease::ColorEase;
 use crate::termwindow::render::purecpu::DirtyRect;
+use config::{VisualBell, VisualBellTarget};
+use std::time::Instant;
+use termwiz::cell::Blink;
 
 /// Where a pane sits in the window, in pixels, with its cell metrics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,10 +200,193 @@ pub fn cursor_blinking(
         && focused
 }
 
+/// The vertical extent of a pane's PAINTED background, in pixels — the y-axis
+/// twin of [`PaneSpan`].
+///
+/// Kept a separate type from [`PaneSpan`] on purpose: the two carry the same
+/// pair of numbers but never the same axis, and a single struct with `x`/`width`
+/// field names invites passing one where the other belongs, which type-checks
+/// and silently transposes the rect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PaneVSpan {
+    pub y: i32,
+    pub height: i32,
+}
+
+/// [`painted_x_span`] on the vertical axis.
+///
+/// Mirrors the `y` / `height_delta` half of the `background_rect` of
+/// `render/pane.rs` (:110-152 in `paint_pane`, :606-646 in `build_pane`), with
+/// the same rounding contract: floor the top edge, ceil the bottom, so the span
+/// is always a superset of the painted rect.
+///
+/// `content_top` is `top_bar_height + padding_top + border.top` **unrounded**
+/// — the paint pass's `top_pixel_y` — and `padding_top` is passed separately
+/// because a top-most pane's background starts at `top_pixel_y - padding_top`,
+/// i.e. it reaches up under the window padding to the bottom of the tab bar.
+/// Truncating either of them shortens the span and leaves a stale strip.
+pub fn painted_y_span(
+    top_cells: i32,
+    rows: i32,
+    total_rows: i32,
+    content_top: f32,
+    padding_top: f32,
+    cell_h: i32,
+    window_pixel_height: i32,
+) -> PaneVSpan {
+    let ch = cell_h as f32;
+
+    let (y, height_delta) = if top_cells == 0 {
+        (content_top - padding_top, padding_top + ch / 2.0)
+    } else {
+        (content_top + top_cells as f32 * ch - ch / 2.0, ch)
+    };
+
+    let bottom = if top_cells + rows >= total_rows {
+        window_pixel_height as f32
+    } else {
+        // Association matters, exactly as in painted_x_span: render/pane.rs
+        // builds a rect of (y, height) whose bottom edge is `y + height`, and
+        // `height` is `(rows*ch) + height_delta`, so `y` is added last.
+        y + ((rows as f32 * ch) + height_delta)
+    };
+
+    let y_i = y.floor() as i32;
+    PaneVSpan {
+        y: y_i,
+        height: (bottom.ceil() as i32 - y_i).max(0),
+    }
+}
+
+/// The pane's whole painted background rect, from its two spans.
+pub fn pane_rect(span: &PaneSpan, vspan: &PaneVSpan) -> DirtyRect {
+    DirtyRect {
+        x: span.x,
+        y: vspan.y,
+        width: span.width,
+        height: vspan.height,
+    }
+}
+
+/// What the visual bell is currently tinting, if anything.
+///
+/// The bell is not a resolution problem but a *scheduling* one: `Alert::Bell`
+/// calls `window.invalidate()` and nothing else, so PureCpu's idle skip sees an
+/// empty dirty list and returns before the paint pass — for the whole fade.
+/// The fade therefore needs a region pushed on **every** frame until it ends,
+/// which is what this reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BellRegion {
+    /// Not ringing, or the fade has completed.
+    None,
+    /// `VisualBellTarget::BackgroundColor`: a second background quad over the
+    /// pane's whole `background_rect` (`render/pane.rs:176-215`).
+    PaneBackground,
+    /// `VisualBellTarget::CursorColor`: only the cursor's own cell is tinted
+    /// (`render/mod.rs:536-560`, inside `compute_cell_fg_bg`).
+    CursorCell,
+}
+
+/// Whether the bell's fade is still running, and which region it paints.
+///
+/// **Delegates** to [`ColorEase::peek_intensity`], the same easing the paint
+/// pass runs through `get_intensity_if_bell_target_ringing`, rather than
+/// restating `elapsed < fade_in + fade_out`.  That expression is not equivalent
+/// at the edges (a zero `fade_out_duration_ms` makes the paint pass's
+/// `completion` a NaN, which compares false and keeps the bell alive), and a
+/// predicate that ends the fade one frame before the renderer does leaves the
+/// last tinted frame on screen forever.
+///
+/// `peek_intensity` takes `&self`: unlike `intensity_one_shot` it does **not**
+/// clear the start instant when the fade ends.  Clearing it is the paint pass's
+/// job (`per_pane.bell_start.take()`), and doing it here would end the fade
+/// without ever painting the final frame.
+pub fn bell_region(bell_start: Option<Instant>, visual_bell: &VisualBell) -> BellRegion {
+    let Some(start) = bell_start else {
+        return BellRegion::None;
+    };
+    let ease = ColorEase::new(
+        visual_bell.fade_in_duration_ms,
+        visual_bell.fade_in_function.clone(),
+        visual_bell.fade_out_duration_ms,
+        visual_bell.fade_out_function.clone(),
+        Some(start),
+    );
+    if ease.peek_intensity().is_none() {
+        return BellRegion::None;
+    }
+    match visual_bell.target {
+        VisualBellTarget::BackgroundColor => BellRegion::PaneBackground,
+        VisualBellTarget::CursorColor => BellRegion::CursorCell,
+    }
+}
+
+/// Whether a cell carrying this blink attribute is animating.
+///
+/// This is the predicate `render/screen_line.rs` itself gates on when it eases
+/// the foreground colour towards the background, so the two cannot drift: the
+/// renderer calls this function rather than testing `blink_rate != 0` inline.
+/// That matters more here than anywhere else in this module, because a blinking
+/// cell that PureCpu does not repaint is stuck at whatever intensity the last
+/// paint left — and the eased intensity starts at `fg == bg`, so the word is
+/// left as blank space rather than as a frozen word.
+pub fn text_blink_animates(blink: Blink, text_blink_rate: u64, text_blink_rate_rapid: u64) -> bool {
+    match blink {
+        Blink::None => false,
+        Blink::Slow => text_blink_rate != 0,
+        Blink::Rapid => text_blink_rate_rapid != 0,
+    }
+}
+
+/// Whether an animation frame scheduled by the last paint has come due.
+///
+/// `next_due` is the paint pass's own `has_animation`, i.e. the earliest
+/// instant at which any animation it drew wants to be redrawn.  Using it as the
+/// clock, rather than a second timetable computed here, is what keeps PureCpu's
+/// blinking text on the same cadence as the GPU path's.
+///
+/// It is deliberately **only** a clock.  Liveness is decided separately, from
+/// evidence found in the current frame, because `has_animation` outlives the
+/// thing that set it: it is refreshed only by a paint, so an animation that has
+/// scrolled off screen leaves a permanently-overdue instant behind.  Treating
+/// that as "an animation is live" would repaint at `animation_fps` forever,
+/// which is the exact regression this task is graded against.
+pub fn animation_frame_due(next_due: Option<Instant>, now: Instant) -> bool {
+    match next_due {
+        Some(due) => now >= due,
+        None => false,
+    }
+}
+
+/// Whether the animation timer must be rescheduled after an idle skip.
+///
+/// **This is a widening of what `schedule_blink_timer_if_needed` used to mean,
+/// and it is renamed to match.**  The old predicate was `cursor_blink_rate != 0
+/// && focused`: the cursor's timer, and nothing else's.  Once the bell, blinking
+/// text and animated images also depend on this timer, that gate strands all
+/// three whenever the cursor happens not to be blinking — `cursor_blink_rate =
+/// 0` and `default_cursor_style = "SteadyBlock"` are both ordinary settings, and
+/// under either of them a bell would tint the window and stay tinted.
+///
+/// `focused` stays, and is not a fourth animation but a gate over all of them,
+/// because `paint_impl` gates its own rescheduling the same way
+/// (`render/paint.rs:121`).  An unfocused window does not animate on the GPU
+/// path either, so keeping animations alive here would be a *divergence* from
+/// the renderer we are trying to match, not parity with it.
+pub fn animation_timer_needed(
+    cursor_blinking: bool,
+    bell_ringing: bool,
+    animated_cells_present: bool,
+    focused: bool,
+) -> bool {
+    focused && (cursor_blinking || bell_ringing || animated_cells_present)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use config::DefaultCursorStyle;
+    use config::{DefaultCursorStyle, EasingFunction};
+    use std::time::Duration;
     use termwiz::surface::CursorShape;
 
     /// A pane at the window's top-left: 80x24 cells of 10x20 px, content
@@ -621,6 +808,218 @@ mod tests {
             800,
             true
         ));
+    }
+
+    // ---- painted_y_span ---------------------------------------------------
+    //
+    // The fixture is the x-axis fixture transposed: cell_h = 20, a 24-row
+    // terminal, padding_top = 5 and a 25 px tab bar, so content_top (the paint
+    // pass's top_pixel_y) is 30 and the window is 30 + 24*20 + 5 = 515 px tall.
+
+    #[test]
+    fn painted_y_span_of_a_lone_pane_stops_at_the_tab_bar() {
+        // NOT the whole window, which is where the x axis differs: a left-most
+        // pane's background starts at x = 0, but a top-most pane's starts at
+        // top_pixel_y - padding_top = 25, below the tab bar.  This is the whole
+        // reason the visual bell's rect is the pane and not the window.
+        let s = painted_y_span(0, 24, 24, 30.0, 5.0, 20, 515);
+        assert_eq!((s.y, s.height), (25, 490));
+    }
+
+    #[test]
+    fn painted_y_span_of_a_top_pane_covers_the_padding_and_the_gutter() {
+        // Top-most but not bottom-most: reaches up under the window padding and
+        // half a cell down past its last row, to meet the split divider.
+        let s = painted_y_span(0, 12, 24, 30.0, 5.0, 20, 515);
+        assert_eq!(s.y, 25);
+        assert_eq!(s.height, 12 * 20 + 5 + 10, "must cover padding + half-cell gutter");
+    }
+
+    #[test]
+    fn painted_y_span_of_a_bottom_pane_runs_to_the_window_edge() {
+        // Bottom-most: starts half a cell ABOVE its first row and runs to the
+        // window's bottom edge, not to rows*cell_h.
+        let s = painted_y_span(12, 12, 24, 30.0, 5.0, 20, 515);
+        assert_eq!(s.y, 30 + 240 - 10, "must start half a cell above the pane");
+        assert_eq!(s.y + s.height, 515, "bottom-most pane must reach the window edge");
+    }
+
+    #[test]
+    fn painted_y_span_of_a_middle_pane_covers_both_gutters() {
+        // 36 rows so that rows 12..24 are neither top-most nor bottom-most.
+        let s = painted_y_span(12, 12, 36, 30.0, 5.0, 20, 755);
+        assert_eq!(s.y, 260);
+        assert_eq!(s.height, 12 * 20 + 20);
+    }
+
+    #[test]
+    fn painted_y_span_does_not_truncate_a_fractional_padding_top() {
+        // window_padding in cells, points or percent gives a fractional
+        // padding_top, and it reaches BOTH edges of the span: the top edge
+        // directly (content_top - padding_top) and the bottom edge through
+        // height_delta.  Truncating it anywhere ends the span short of the
+        // painted background.
+
+        // Top-most, not bottom-most, with no tab bar: y = 5.75 - 5.75 = 0,
+        // bottom = 1*7 + (5.75 + 3.5) = 16.25 -> ceil 17.
+        let s = painted_y_span(0, 1, 30, 5.75, 5.75, 7, 217);
+        assert_eq!((s.y, s.height), (0, 17));
+
+        // Interior: y = 4.5 + 7 - 3.5 = 8.0, bottom = 8 + 7 + 7 = 22.
+        let s = painted_y_span(1, 1, 30, 4.5, 4.5, 7, 219);
+        assert_eq!((s.y, s.height), (8, 14));
+    }
+
+    #[test]
+    fn painted_y_span_rounds_outward_on_an_odd_cell_height() {
+        // cell_h = 9 -> half a cell is 4.5, so an interior pane's top edge
+        // lands on .5 and the span must round OUTWARD: floor the top, ceil the
+        // bottom.  Painted rect is y = 4 + 90 - 4.5 = 89.5, bottom = 89.5 +
+        // (90 + 9) = 188.5, so the only outward-rounded answer is 89..189.
+        //
+        // This is the one fixture here whose edges are not already integers,
+        // which makes it the only one a rounding mutation can move.
+        let s = painted_y_span(10, 10, 30, 4.0, 4.0, 9, 300);
+        assert_eq!((s.y, s.height), (89, 100));
+    }
+
+    #[test]
+    fn pane_rect_takes_x_from_the_horizontal_span_and_y_from_the_vertical_one() {
+        // Four deliberately distinct numbers: a transposed field would still
+        // type-check and still produce a plausible rect.
+        let r = pane_rect(
+            &PaneSpan { x: 400, width: 410 },
+            &PaneVSpan { y: 25, height: 490 },
+        );
+        assert_eq!((r.x, r.y, r.width, r.height), (400, 25, 410, 490));
+    }
+
+    // ---- the visual bell --------------------------------------------------
+
+    fn visual_bell(target: VisualBellTarget) -> VisualBell {
+        VisualBell {
+            fade_in_duration_ms: 200,
+            fade_in_function: EasingFunction::Linear,
+            fade_out_duration_ms: 300,
+            fade_out_function: EasingFunction::Linear,
+            target,
+        }
+    }
+
+    /// An `Instant` that many milliseconds in the past.
+    fn ago(ms: u64) -> Option<Instant> {
+        Some(Instant::now() - Duration::from_millis(ms))
+    }
+
+    #[test]
+    fn bell_region_is_none_when_the_bell_has_never_rung() {
+        assert_eq!(
+            bell_region(None, &visual_bell(VisualBellTarget::BackgroundColor)),
+            BellRegion::None
+        );
+    }
+
+    #[test]
+    fn bell_region_covers_the_pane_during_the_fade_in() {
+        assert_eq!(
+            bell_region(ago(100), &visual_bell(VisualBellTarget::BackgroundColor)),
+            BellRegion::PaneBackground
+        );
+    }
+
+    #[test]
+    fn bell_region_lasts_the_whole_fade_out_and_then_stops() {
+        // 200 ms in + 300 ms out = 500 ms.  A predicate that watched only the
+        // fade-in would drop the region at 200 ms and leave the last tinted
+        // frame on screen for good; one that never stopped would repaint the
+        // pane forever.  Both directions, 100 ms clear of the boundary.
+        let vb = visual_bell(VisualBellTarget::BackgroundColor);
+        assert_eq!(bell_region(ago(400), &vb), BellRegion::PaneBackground);
+        assert_eq!(bell_region(ago(600), &vb), BellRegion::None);
+    }
+
+    #[test]
+    fn bell_region_follows_the_configured_target() {
+        // The discriminating negative for the two tests above: without it, a
+        // bell_region that always answered PaneBackground while ringing would
+        // pass them, and would repaint the whole pane at animation_fps for a
+        // bell that only tints one cell.
+        assert_eq!(
+            bell_region(ago(100), &visual_bell(VisualBellTarget::CursorColor)),
+            BellRegion::CursorCell
+        );
+    }
+
+    // ---- blinking text ----------------------------------------------------
+
+    #[test]
+    fn a_cell_without_the_blink_attribute_never_animates() {
+        assert!(!text_blink_animates(Blink::None, 500, 250));
+    }
+
+    #[test]
+    fn slow_blink_reads_the_slow_rate_and_rapid_blink_the_rapid_one() {
+        // Each rate is checked with the OTHER one set to zero, so a predicate
+        // that consulted the wrong field — or either field — fails here rather
+        // than passing on a fixture where both happen to be non-zero.
+        assert!(text_blink_animates(Blink::Slow, 500, 0));
+        assert!(!text_blink_animates(Blink::Slow, 0, 250));
+        assert!(text_blink_animates(Blink::Rapid, 0, 250));
+        assert!(!text_blink_animates(Blink::Rapid, 500, 0));
+    }
+
+    // ---- the animation clock ----------------------------------------------
+
+    #[test]
+    fn nothing_is_due_when_the_last_paint_scheduled_nothing() {
+        // The load-bearing case for idle CPU: has_animation is None on a window
+        // with no animation at all, and must not be read as "due now".
+        assert!(!animation_frame_due(None, Instant::now()));
+    }
+
+    #[test]
+    fn a_frame_is_due_from_its_instant_onwards_and_not_before() {
+        let t = Instant::now();
+        assert!(!animation_frame_due(Some(t + Duration::from_millis(1)), t));
+        assert!(animation_frame_due(Some(t), t), "due exactly at its instant");
+        assert!(animation_frame_due(Some(t - Duration::from_millis(1)), t));
+    }
+
+    // ---- the animation timer ----------------------------------------------
+
+    #[test]
+    fn an_idle_window_schedules_no_animation_timer() {
+        assert!(!animation_timer_needed(false, false, false, true));
+    }
+
+    #[test]
+    fn a_blinking_cursor_alone_keeps_the_timer_alive() {
+        assert!(animation_timer_needed(true, false, false, true));
+    }
+
+    #[test]
+    fn a_ringing_bell_alone_keeps_the_timer_alive() {
+        // THE CASE THE OLD PREDICATE GOT WRONG.  schedule_blink_timer_if_needed
+        // returned early unless cursor_blink_rate != 0, so with a steady cursor
+        // the bell rang, tinted the window on its one invalidate, and stayed
+        // tinted: nothing ever scheduled the frame that would fade it out.
+        assert!(animation_timer_needed(false, true, false, true));
+    }
+
+    #[test]
+    fn animated_cells_alone_keep_the_timer_alive() {
+        // Same for blinking text and GIF frames, which have no timer of their
+        // own at all once the idle skip has swallowed the paint.
+        assert!(animation_timer_needed(false, false, true, true));
+    }
+
+    #[test]
+    fn an_unfocused_window_animates_nothing() {
+        // Not a policy choice: paint_impl gates its own rescheduling on focus
+        // (render/paint.rs:121), so animating here would diverge from the GPU
+        // path rather than match it.  Held true for all three animations at
+        // once, so a predicate that only dropped focus from one of them fails.
+        assert!(!animation_timer_needed(true, true, true, false));
     }
 
     #[test]
