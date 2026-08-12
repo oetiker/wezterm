@@ -203,7 +203,6 @@ impl crate::TermWindow {
         let atlas_image = tex.image.borrow();
         let (atlas_w, atlas_h) = atlas_image.image_dimensions();
         let atlas_data = atlas_image.pixel_data_slice();
-        let atlas_stride = atlas_w * 4;
 
         let state = self.purecpu_state.as_mut().unwrap();
         let fb_w = state.width as usize;
@@ -263,8 +262,6 @@ impl crate::TermWindow {
             || foreground_text_hsb.saturation != 1.0
             || foreground_text_hsb.brightness != 1.0;
 
-        let half_w = fb_w as f32 / 2.0;
-        let half_h = fb_h as f32 / 2.0;
 
         // Selected once for the whole frame, exactly as GL does at
         // draw.rs:172-179.
@@ -289,346 +286,22 @@ impl crate::TermWindow {
                     _ => continue,
                 };
 
-                let num_quads = vertex_count / VERTICES_PER_CELL;
-                quads_total += num_quads as u64;
-                let mut clip_rects: Vec<[i32; 4]> = Vec::new();
-                for q in 0..num_quads {
-                    let base = q * VERTICES_PER_CELL;
-                    let tl = &vertices[base];     // top-left
-                    let _tr = &vertices[base + 1]; // top-right
-                    let _bl = &vertices[base + 2]; // bot-left
-                    let br = &vertices[base + 3]; // bot-right
-
-                    let has_color = tl.has_color;
-                    let fg = tl.fg_color;
-                    let alt = tl.alt_color;
-                    let mix_value = tl.mix_value;
-                    let hsv = tl.hsv;
-
-                    // Mix fg and alt color
-                    let fg_r = fg[0] * (1.0 - mix_value) + alt[0] * mix_value;
-                    let fg_g = fg[1] * (1.0 - mix_value) + alt[1] * mix_value;
-                    let fg_b = fg[2] * (1.0 - mix_value) + alt[2] * mix_value;
-                    let fg_a = fg[3] * (1.0 - mix_value) + alt[3] * mix_value;
-
-                    // Screen destination rect (clip-space to pixels) and atlas
-                    // rect (normalized tex coords to texels), both kept as
-                    // floats: the sampler interpolates texcoords across the
-                    // true quad, and the coverage rule needs the unrounded
-                    // edge.  Truncating the destination displaced sub-pixel
-                    // quads a whole pixel left/up (M1, the fancy tab bar's
-                    // bit-exact 1px shift); truncating the source lost up to a
-                    // texel of the extent.
-                    let dest_f = [
-                        tl.position[0] + half_w,
-                        tl.position[1] + half_h,
-                        br.position[0] + half_w,
-                        br.position[1] + half_h,
-                    ];
-                    let tex_f = [
-                        tl.tex[0] * atlas_w as f32,
-                        tl.tex[1] * atlas_h as f32,
-                        br.tex[0] * atlas_w as f32,
-                        br.tex[1] * atlas_h as f32,
-                    ];
-
-                    // `has_color == 2.0` (IS_BG_IMAGE) stays on the pre-Task-7
-                    // path — truncated rect, 1:1 crop — because background
-                    // image is out of scope for this pass and GL samples that
-                    // branch with a linear sampler, not Nearest.  See the
-                    // `purecpu_sampler` module doc.
-                    let quad = purecpu_sampler::Quad::new(
-                        has_color == 2.0,
-                        dest_f,
-                        tex_f,
-                        atlas_w as i32,
-                        atlas_h as i32,
-                    );
-                    let [dest_x, dest_y, dest_x2, dest_y2] = quad.dest_rect();
-
-                    let dest_w = dest_x2 - dest_x;
-                    let dest_h = dest_y2 - dest_y;
-                    if dest_w <= 0 || dest_h <= 0 {
-                        continue;
-                    }
-
-                    // Build the list of clip rects for this quad.
-                    // For full repaint: one clip rect = the entire quad.
-                    // For incremental: one clip rect per overlapping dirty rect
-                    // (the intersection). This avoids the bounding-box problem
-                    // where non-adjacent dirty rects cause large quads to
-                    // overwrite clean framebuffer areas between them.
-                    if full_repaint {
-                        clip_rects.clear();
-                        clip_rects.push([dest_x, dest_y, dest_x2, dest_y2]);
-                    } else {
-                        collect_clip_rects(
-                            dest_x, dest_y, dest_x2, dest_y2,
-                            &effective_dirty, &mut clip_rects,
-                        );
-                        if clip_rects.is_empty() {
-                            continue;
-                        }
-                    }
-
-                    quads_blitted += 1;
-
-                    let state = self.purecpu_state.as_mut().unwrap();
-
-                    if has_color == 3.0 {
-                        // IS_SOLID_COLOR: fill each clip rect with fg color
-                        let mut sr = fg_r;
-                        let mut sg = fg_g;
-                        let mut sb = fg_b;
-                        let sa = fg_a;
-
-                        if hsv[0] != 1.0 || hsv[1] != 1.0 || hsv[2] != 1.0 {
-                            let (h, s, v) = rgb_to_hsv(sr, sg, sb);
-                            let (nr, ng, nb) =
-                                hsv_to_rgb(h * hsv[0], s * hsv[1], v * hsv[2]);
-                            sr = nr;
-                            sg = ng;
-                            sb = nb;
-                        }
-
-                        sr = linear_to_srgb(sr);
-                        sg = linear_to_srgb(sg);
-                        sb = linear_to_srgb(sb);
-
-                        let sb8 = (sb.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                        let sg8 = (sg.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                        let sr8 = (sr.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                        let sa8 = (sa.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-
-                        for clip in &clip_rects {
-                            let [cx1, cy1, cx2, cy2] = *clip;
-                            for dy in cy1..cy2 {
-                                if dy < 0 || dy >= fb_h as i32 {
-                                    continue;
-                                }
-                                let row_off = dy as usize * fb_w;
-                                for dx in cx1..cx2 {
-                                    if dx < 0 || dx >= fb_w as i32 {
-                                        continue;
-                                    }
-                                    let fi = (row_off + dx as usize) * 4;
-                                    match subpixel_aa
-                                        .then(|| subpixel_mask(has_color, 0, 0, 0, 0))
-                                        .flatten()
-                                    {
-                                        // `colorMask = vec4(1.0)` — a straight
-                                        // replace, including alpha.  Identical
-                                        // to `blend_over` when sa8 == 255, and
-                                        // deliberately different when it is
-                                        // not; window borders (borders.rs) are
-                                        // the sub-layer-1 producer here.
-                                        Some([mr, mg, mb, ma]) => blend_over_masked(
-                                            &mut state.frame_buffer,
-                                            fi, sr8, sg8, sb8, sa8, mr, mg, mb, ma,
-                                        ),
-                                        None => blend_over(
-                                            &mut state.frame_buffer, fi, sr8, sg8, sb8, sa8,
-                                        ),
-                                    }
-                                }
-                            }
-                        }
-                        continue;
-                    }
-
-                    // Textured quads: sample the atlas across the full
-                    // destination rect.  The old code blitted 1:1 and cropped
-                    // to min(tex, dest), so any quad drawn at a size other than
-                    // its sprite's was cropped rather than scaled (finding I5)
-                    // — non-native inline images, DECDWL/DECDHL, and scaled
-                    // bitmap glyphs.  `blit_end` still crops for IS_BG_IMAGE,
-                    // and still drops the quad when that crop is empty.
-                    let Some((blit_x2, blit_y2)) = quad.blit_end() else {
-                        continue;
-                    };
-
-                    for clip in &clip_rects {
-                        let [cx1, cy1, cx2, cy2] = *clip;
-
-                        // Clipped row/col ranges, in destination pixels.
-                        //
-                        // The `.max(dest_y)` / `.max(dest_x)` terms are
-                        // redundant today and kept as defence in depth: a full
-                        // repaint pushes the destination rect itself as the clip
-                        // rect (:353) and an incremental one intersects with it
-                        // in `collect_clip_rects`, so `cx1 >= dest_x` already
-                        // holds on both paths.  The `.max(0)` / `.min(fb_*)`
-                        // terms are NOT redundant — they are what keeps a quad
-                        // hanging off the top/left edge inside the framebuffer,
-                        // and they replace the old per-pixel `dy < 0` guard.
-                        let row_start = cy1.max(dest_y).max(0);
-                        let row_end = cy2.min(blit_y2).min(fb_h as i32);
-                        let col_start = cx1.max(dest_x).max(0);
-                        let col_end = cx2.min(blit_x2).min(fb_w as i32);
-
-                        for dy in row_start..row_end {
-                            let atlas_row = quad.texel_y(dy);
-                            // Documents an invariant rather than doing work:
-                            // sampled quads come back clamped to
-                            // `[0, atlas_h - 1]` by `Axis::texel`, and bg-image
-                            // quads are bounded by the `min(tex, dest)` crop, so
-                            // neither branch can land outside the atlas.  Kept
-                            // so a future producer of out-of-range texcoords
-                            // fails safe instead of indexing out of bounds.
-                            if atlas_row < 0 || atlas_row >= atlas_h as i32 {
-                                continue;
-                            }
-                            let fb_row_off = dy as usize * fb_w;
-                            let atlas_row_off = atlas_row as usize * atlas_stride;
-
-                            for dx in col_start..col_end {
-                                let atlas_col = quad.texel_x(dx);
-                                if atlas_col < 0 || atlas_col >= atlas_w as i32 {
-                                    continue;
-                                }
-
-                                let ai = atlas_row_off + atlas_col as usize * 4;
-                                // Atlas is RGBA (ImageTexture stores RGBA despite
-                                // BitmapImage docs claiming BGRA)
-                                let tex_r = atlas_data[ai] as f32 / 255.0;
-                                let tex_g = atlas_data[ai + 1] as f32 / 255.0;
-                                let tex_b = atlas_data[ai + 2] as f32 / 255.0;
-                                let tex_a = atlas_data[ai + 3] as f32 / 255.0;
-
-                                let (mut out_r, mut out_g, mut out_b, out_a);
-
-                                if has_color == 2.0 {
-                                    // IS_BG_IMAGE
-                                    out_r = tex_r;
-                                    out_g = tex_g;
-                                    out_b = tex_b;
-                                    out_a = tex_a * fg_a;
-                                } else if has_color == 1.0 {
-                                    // IS_COLOR_EMOJI
-                                    out_r = tex_r;
-                                    out_g = tex_g;
-                                    out_b = tex_b;
-                                    out_a = tex_a;
-                                } else if has_color == 4.0 {
-                                    // IS_GRAY_SCALE
-                                    out_r = fg_r;
-                                    out_g = fg_g;
-                                    out_b = fg_b;
-                                    out_a = fg_a * tex_a;
-                                } else {
-                                    // IS_GLYPH (0.0) — coverage mask
-                                    out_r = fg_r;
-                                    out_g = fg_g;
-                                    out_b = fg_b;
-                                    // glyph-frag.glsl:148-152: the shader
-                                    // overwrites color.a with the mask's alpha
-                                    // ONLY when subpixel_aa is off.  Under
-                                    // dual-source the source alpha stays fg_a
-                                    // and the coverage arrives through the
-                                    // mask instead.
-                                    out_a = if subpixel_aa { fg_a } else { tex_a };
-
-                                    if apply_hsv {
-                                        let (h, s, v) = rgb_to_hsv(out_r, out_g, out_b);
-                                        let (nr, ng, nb) = hsv_to_rgb(
-                                            h * foreground_text_hsb.hue,
-                                            s * foreground_text_hsb.saturation,
-                                            v * foreground_text_hsb.brightness,
-                                        );
-                                        out_r = nr;
-                                        out_g = ng;
-                                        out_b = nb;
-                                    }
-                                }
-
-                                // Color space handling:
-                                // Texture-sourced colors (color emoji, bg image) are
-                                // already sRGB in the ImageTexture atlas.
-                                // Vertex-sourced colors (glyph, grayscale) are linear RGB.
-                                let tex_is_srgb = has_color == 1.0 || has_color == 2.0;
-
-                                // Per-vertex HSV (must operate in linear space)
-                                if hsv[0] != 1.0 || hsv[1] != 1.0 || hsv[2] != 1.0 {
-                                    if tex_is_srgb {
-                                        out_r = srgb_to_linear(out_r);
-                                        out_g = srgb_to_linear(out_g);
-                                        out_b = srgb_to_linear(out_b);
-                                    }
-                                    let (h, s, v) = rgb_to_hsv(out_r, out_g, out_b);
-                                    let (nr, ng, nb) =
-                                        hsv_to_rgb(h * hsv[0], s * hsv[1], v * hsv[2]);
-                                    out_r = nr;
-                                    out_g = ng;
-                                    out_b = nb;
-                                    // After HSV in linear space, convert to sRGB
-                                    out_r = linear_to_srgb(out_r);
-                                    out_g = linear_to_srgb(out_g);
-                                    out_b = linear_to_srgb(out_b);
-                                } else if !tex_is_srgb {
-                                    // Vertex colors are linear, convert to sRGB
-                                    out_r = linear_to_srgb(out_r);
-                                    out_g = linear_to_srgb(out_g);
-                                    out_b = linear_to_srgb(out_b);
-                                }
-                                // tex_is_srgb with no HSV → already sRGB, no conversion
-
-                                // The atlas bytes are the shader's `colorMask`
-                                // verbatim; see `subpixel_mask`.  `None` here
-                                // means this sub-layer (or this branch) does
-                                // not run under dual-source blending, and the
-                                // pre-existing scalar path is kept bit-exact.
-                                let mask = subpixel_aa
-                                    .then(|| {
-                                        subpixel_mask(
-                                            has_color,
-                                            atlas_data[ai],
-                                            atlas_data[ai + 1],
-                                            atlas_data[ai + 2],
-                                            atlas_data[ai + 3],
-                                        )
-                                    })
-                                    .flatten();
-
-                                match mask {
-                                    // A wholly uncovered texel contributes
-                                    // nothing on any channel: dst = dst.  This
-                                    // replaces the `out_a <= 0.0` skip, which
-                                    // no longer discriminates for IS_GLYPH now
-                                    // that out_a is fg_a rather than tex_a.
-                                    Some([0, 0, 0, 0]) => continue,
-                                    None if out_a <= 0.0 => continue,
-                                    // Deliberate behaviour change, on a path no
-                                    // measured row covers: a covered pixel whose
-                                    // `fg_a` is 0 is now PAINTED under subpixel,
-                                    // where the old skip dropped it.  That is
-                                    // what GL does — the dual-source colour
-                                    // equation `dst = src*mask + dst*(1-mask)`
-                                    // never references `src.a` — and it is
-                                    // reachable, because `fg_a` is the
-                                    // blink/fade-eased mixed alpha, so fully
-                                    // faded text under an LCD render target is
-                                    // painted at full coverage on both arms.
-                                    _ => {}
-                                }
-
-                                let fi = (fb_row_off + dx as usize) * 4;
-                                let sb = (out_b.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                                let sg = (out_g.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                                let sr = (out_r.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                                let sa = (out_a.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                                match mask {
-                                    Some([mr, mg, mb, ma]) => blend_over_masked(
-                                        &mut state.frame_buffer,
-                                        fi, sr, sg, sb, sa, mr, mg, mb, ma,
-                                    ),
-                                    None => {
-                                        blend_over(&mut state.frame_buffer, fi, sr, sg, sb, sa)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                let (vb_total, vb_blitted) = blit_vertex_buffer(
+                    &mut state.frame_buffer,
+                    fb_w,
+                    fb_h,
+                    atlas_data,
+                    atlas_w,
+                    atlas_h,
+                    vertices,
+                    full_repaint,
+                    &effective_dirty,
+                    subpixel_aa,
+                    apply_hsv,
+                    foreground_text_hsb,
+                );
+                quads_total += vb_total;
+                quads_blitted += vb_blitted;
 
                 vb.next_index();
             }
@@ -680,6 +353,387 @@ impl crate::TermWindow {
         Ok(())
     }
 }
+
+/// Blit one vertex buffer's quads into the framebuffer, returning
+/// `(quads_total, quads_blitted)`.
+///
+/// Extracted from `call_draw_purecpu` in Task 15 as a **pure move**: every
+/// expression below is the one that ran inside the loop, in the same order,
+/// with the same types.  Floating-point association order is semantics in this
+/// module — an ulp across a pixel centre is a 1px seam — so nothing here was
+/// reordered, factored or simplified, and the extraction was performed by
+/// script rather than by hand.
+///
+/// Everything it touches is plain borrowed data, so a test can stand up a 16x16
+/// framebuffer and a hand-built atlas and drive it with no `TermWindow`, no
+/// window and no X display.  That is the entire point of the seam: before it
+/// existed this loop was executed by no test at all, and an unconditional
+/// `panic!` on the first line of the clip loop left the suite green.
+///
+/// `half_w`/`half_h` and `atlas_stride` moved in with it — each is a pure
+/// function of an argument, so computing it here is the same value the caller
+/// used to hand over.
+#[allow(clippy::too_many_arguments)]
+fn blit_vertex_buffer(
+    fb: &mut [u8],
+    fb_w: usize,
+    fb_h: usize,
+    atlas_data: &[u8],
+    atlas_w: usize,
+    atlas_h: usize,
+    vertices: &[Vertex],
+    full_repaint: bool,
+    effective_dirty: &[DirtyRect],
+    subpixel_aa: bool,
+    apply_hsv: bool,
+    foreground_text_hsb: config::HsbTransform,
+) -> (u64, u64) {
+    let atlas_stride = atlas_w * 4;
+    let half_w = fb_w as f32 / 2.0;
+    let half_h = fb_h as f32 / 2.0;
+
+    let num_quads = vertices.len() / VERTICES_PER_CELL;
+    let quads_total = num_quads as u64;
+    let mut quads_blitted: u64 = 0;
+    let mut clip_rects: Vec<[i32; 4]> = Vec::new();
+        for q in 0..num_quads {
+            let base = q * VERTICES_PER_CELL;
+            let tl = &vertices[base];     // top-left
+            let _tr = &vertices[base + 1]; // top-right
+            let _bl = &vertices[base + 2]; // bot-left
+            let br = &vertices[base + 3]; // bot-right
+
+            let has_color = tl.has_color;
+            let fg = tl.fg_color;
+            let alt = tl.alt_color;
+            let mix_value = tl.mix_value;
+            let hsv = tl.hsv;
+
+            // Mix fg and alt color
+            let fg_r = fg[0] * (1.0 - mix_value) + alt[0] * mix_value;
+            let fg_g = fg[1] * (1.0 - mix_value) + alt[1] * mix_value;
+            let fg_b = fg[2] * (1.0 - mix_value) + alt[2] * mix_value;
+            let fg_a = fg[3] * (1.0 - mix_value) + alt[3] * mix_value;
+
+            // Screen destination rect (clip-space to pixels) and atlas
+            // rect (normalized tex coords to texels), both kept as
+            // floats: the sampler interpolates texcoords across the
+            // true quad, and the coverage rule needs the unrounded
+            // edge.  Truncating the destination displaced sub-pixel
+            // quads a whole pixel left/up (M1, the fancy tab bar's
+            // bit-exact 1px shift); truncating the source lost up to a
+            // texel of the extent.
+            let dest_f = [
+                tl.position[0] + half_w,
+                tl.position[1] + half_h,
+                br.position[0] + half_w,
+                br.position[1] + half_h,
+            ];
+            let tex_f = [
+                tl.tex[0] * atlas_w as f32,
+                tl.tex[1] * atlas_h as f32,
+                br.tex[0] * atlas_w as f32,
+                br.tex[1] * atlas_h as f32,
+            ];
+
+            // `has_color == 2.0` (IS_BG_IMAGE) stays on the pre-Task-7
+            // path — truncated rect, 1:1 crop — because background
+            // image is out of scope for this pass and GL samples that
+            // branch with a linear sampler, not Nearest.  See the
+            // `purecpu_sampler` module doc.
+            let quad = purecpu_sampler::Quad::new(
+                has_color == 2.0,
+                dest_f,
+                tex_f,
+                atlas_w as i32,
+                atlas_h as i32,
+            );
+            let [dest_x, dest_y, dest_x2, dest_y2] = quad.dest_rect();
+
+            let dest_w = dest_x2 - dest_x;
+            let dest_h = dest_y2 - dest_y;
+            if dest_w <= 0 || dest_h <= 0 {
+                continue;
+            }
+
+            // Build the list of clip rects for this quad.
+            // For full repaint: one clip rect = the entire quad.
+            // For incremental: one clip rect per overlapping dirty rect
+            // (the intersection). This avoids the bounding-box problem
+            // where non-adjacent dirty rects cause large quads to
+            // overwrite clean framebuffer areas between them.
+            if full_repaint {
+                clip_rects.clear();
+                clip_rects.push([dest_x, dest_y, dest_x2, dest_y2]);
+            } else {
+                collect_clip_rects(
+                    dest_x, dest_y, dest_x2, dest_y2,
+                    &effective_dirty, &mut clip_rects,
+                );
+                if clip_rects.is_empty() {
+                    continue;
+                }
+            }
+
+            quads_blitted += 1;
+
+            if has_color == 3.0 {
+                // IS_SOLID_COLOR: fill each clip rect with fg color
+                let mut sr = fg_r;
+                let mut sg = fg_g;
+                let mut sb = fg_b;
+                let sa = fg_a;
+
+                if hsv[0] != 1.0 || hsv[1] != 1.0 || hsv[2] != 1.0 {
+                    let (h, s, v) = rgb_to_hsv(sr, sg, sb);
+                    let (nr, ng, nb) =
+                        hsv_to_rgb(h * hsv[0], s * hsv[1], v * hsv[2]);
+                    sr = nr;
+                    sg = ng;
+                    sb = nb;
+                }
+
+                sr = linear_to_srgb(sr);
+                sg = linear_to_srgb(sg);
+                sb = linear_to_srgb(sb);
+
+                let sb8 = (sb.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                let sg8 = (sg.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                let sr8 = (sr.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                let sa8 = (sa.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+
+                for clip in &clip_rects {
+                    let [cx1, cy1, cx2, cy2] = *clip;
+                    for dy in cy1..cy2 {
+                        if dy < 0 || dy >= fb_h as i32 {
+                            continue;
+                        }
+                        let row_off = dy as usize * fb_w;
+                        for dx in cx1..cx2 {
+                            if dx < 0 || dx >= fb_w as i32 {
+                                continue;
+                            }
+                            let fi = (row_off + dx as usize) * 4;
+                            match subpixel_aa
+                                .then(|| subpixel_mask(has_color, 0, 0, 0, 0))
+                                .flatten()
+                            {
+                                // `colorMask = vec4(1.0)` — a straight
+                                // replace, including alpha.  Identical
+                                // to `blend_over` when sa8 == 255, and
+                                // deliberately different when it is
+                                // not; window borders (borders.rs) are
+                                // the sub-layer-1 producer here.
+                                Some([mr, mg, mb, ma]) => blend_over_masked(
+                                    &mut *fb,
+                                    fi, sr8, sg8, sb8, sa8, mr, mg, mb, ma,
+                                ),
+                                None => blend_over(
+                                    &mut *fb, fi, sr8, sg8, sb8, sa8,
+                                ),
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Textured quads: sample the atlas across the full
+            // destination rect.  The old code blitted 1:1 and cropped
+            // to min(tex, dest), so any quad drawn at a size other than
+            // its sprite's was cropped rather than scaled (finding I5)
+            // — non-native inline images, DECDWL/DECDHL, and scaled
+            // bitmap glyphs.  `blit_end` still crops for IS_BG_IMAGE,
+            // and still drops the quad when that crop is empty.
+            let Some((blit_x2, blit_y2)) = quad.blit_end() else {
+                continue;
+            };
+
+            for clip in &clip_rects {
+                let [cx1, cy1, cx2, cy2] = *clip;
+
+                // Clipped row/col ranges, in destination pixels.
+                //
+                // The `.max(dest_y)` / `.max(dest_x)` terms are
+                // redundant today and kept as defence in depth: a full
+                // repaint pushes the destination rect itself as the clip
+                // rect (:353) and an incremental one intersects with it
+                // in `collect_clip_rects`, so `cx1 >= dest_x` already
+                // holds on both paths.  The `.max(0)` / `.min(fb_*)`
+                // terms are NOT redundant — they are what keeps a quad
+                // hanging off the top/left edge inside the framebuffer,
+                // and they replace the old per-pixel `dy < 0` guard.
+                let row_start = cy1.max(dest_y).max(0);
+                let row_end = cy2.min(blit_y2).min(fb_h as i32);
+                let col_start = cx1.max(dest_x).max(0);
+                let col_end = cx2.min(blit_x2).min(fb_w as i32);
+
+                for dy in row_start..row_end {
+                    let atlas_row = quad.texel_y(dy);
+                    // Documents an invariant rather than doing work:
+                    // sampled quads come back clamped to
+                    // `[0, atlas_h - 1]` by `Axis::texel`, and bg-image
+                    // quads are bounded by the `min(tex, dest)` crop, so
+                    // neither branch can land outside the atlas.  Kept
+                    // so a future producer of out-of-range texcoords
+                    // fails safe instead of indexing out of bounds.
+                    if atlas_row < 0 || atlas_row >= atlas_h as i32 {
+                        continue;
+                    }
+                    let fb_row_off = dy as usize * fb_w;
+                    let atlas_row_off = atlas_row as usize * atlas_stride;
+
+                    for dx in col_start..col_end {
+                        let atlas_col = quad.texel_x(dx);
+                        if atlas_col < 0 || atlas_col >= atlas_w as i32 {
+                            continue;
+                        }
+
+                        let ai = atlas_row_off + atlas_col as usize * 4;
+                        // Atlas is RGBA (ImageTexture stores RGBA despite
+                        // BitmapImage docs claiming BGRA)
+                        let tex_r = atlas_data[ai] as f32 / 255.0;
+                        let tex_g = atlas_data[ai + 1] as f32 / 255.0;
+                        let tex_b = atlas_data[ai + 2] as f32 / 255.0;
+                        let tex_a = atlas_data[ai + 3] as f32 / 255.0;
+
+                        let (mut out_r, mut out_g, mut out_b, out_a);
+
+                        if has_color == 2.0 {
+                            // IS_BG_IMAGE
+                            out_r = tex_r;
+                            out_g = tex_g;
+                            out_b = tex_b;
+                            out_a = tex_a * fg_a;
+                        } else if has_color == 1.0 {
+                            // IS_COLOR_EMOJI
+                            out_r = tex_r;
+                            out_g = tex_g;
+                            out_b = tex_b;
+                            out_a = tex_a;
+                        } else if has_color == 4.0 {
+                            // IS_GRAY_SCALE
+                            out_r = fg_r;
+                            out_g = fg_g;
+                            out_b = fg_b;
+                            out_a = fg_a * tex_a;
+                        } else {
+                            // IS_GLYPH (0.0) — coverage mask
+                            out_r = fg_r;
+                            out_g = fg_g;
+                            out_b = fg_b;
+                            // glyph-frag.glsl:148-152: the shader
+                            // overwrites color.a with the mask's alpha
+                            // ONLY when subpixel_aa is off.  Under
+                            // dual-source the source alpha stays fg_a
+                            // and the coverage arrives through the
+                            // mask instead.
+                            out_a = if subpixel_aa { fg_a } else { tex_a };
+
+                            if apply_hsv {
+                                let (h, s, v) = rgb_to_hsv(out_r, out_g, out_b);
+                                let (nr, ng, nb) = hsv_to_rgb(
+                                    h * foreground_text_hsb.hue,
+                                    s * foreground_text_hsb.saturation,
+                                    v * foreground_text_hsb.brightness,
+                                );
+                                out_r = nr;
+                                out_g = ng;
+                                out_b = nb;
+                            }
+                        }
+
+                        // Color space handling:
+                        // Texture-sourced colors (color emoji, bg image) are
+                        // already sRGB in the ImageTexture atlas.
+                        // Vertex-sourced colors (glyph, grayscale) are linear RGB.
+                        let tex_is_srgb = has_color == 1.0 || has_color == 2.0;
+
+                        // Per-vertex HSV (must operate in linear space)
+                        if hsv[0] != 1.0 || hsv[1] != 1.0 || hsv[2] != 1.0 {
+                            if tex_is_srgb {
+                                out_r = srgb_to_linear(out_r);
+                                out_g = srgb_to_linear(out_g);
+                                out_b = srgb_to_linear(out_b);
+                            }
+                            let (h, s, v) = rgb_to_hsv(out_r, out_g, out_b);
+                            let (nr, ng, nb) =
+                                hsv_to_rgb(h * hsv[0], s * hsv[1], v * hsv[2]);
+                            out_r = nr;
+                            out_g = ng;
+                            out_b = nb;
+                            // After HSV in linear space, convert to sRGB
+                            out_r = linear_to_srgb(out_r);
+                            out_g = linear_to_srgb(out_g);
+                            out_b = linear_to_srgb(out_b);
+                        } else if !tex_is_srgb {
+                            // Vertex colors are linear, convert to sRGB
+                            out_r = linear_to_srgb(out_r);
+                            out_g = linear_to_srgb(out_g);
+                            out_b = linear_to_srgb(out_b);
+                        }
+                        // tex_is_srgb with no HSV → already sRGB, no conversion
+
+                        // The atlas bytes are the shader's `colorMask`
+                        // verbatim; see `subpixel_mask`.  `None` here
+                        // means this sub-layer (or this branch) does
+                        // not run under dual-source blending, and the
+                        // pre-existing scalar path is kept bit-exact.
+                        let mask = subpixel_aa
+                            .then(|| {
+                                subpixel_mask(
+                                    has_color,
+                                    atlas_data[ai],
+                                    atlas_data[ai + 1],
+                                    atlas_data[ai + 2],
+                                    atlas_data[ai + 3],
+                                )
+                            })
+                            .flatten();
+
+                        match mask {
+                            // A wholly uncovered texel contributes
+                            // nothing on any channel: dst = dst.  This
+                            // replaces the `out_a <= 0.0` skip, which
+                            // no longer discriminates for IS_GLYPH now
+                            // that out_a is fg_a rather than tex_a.
+                            Some([0, 0, 0, 0]) => continue,
+                            None if out_a <= 0.0 => continue,
+                            // Deliberate behaviour change, on a path no
+                            // measured row covers: a covered pixel whose
+                            // `fg_a` is 0 is now PAINTED under subpixel,
+                            // where the old skip dropped it.  That is
+                            // what GL does — the dual-source colour
+                            // equation `dst = src*mask + dst*(1-mask)`
+                            // never references `src.a` — and it is
+                            // reachable, because `fg_a` is the
+                            // blink/fade-eased mixed alpha, so fully
+                            // faded text under an LCD render target is
+                            // painted at full coverage on both arms.
+                            _ => {}
+                        }
+
+                        let fi = (fb_row_off + dx as usize) * 4;
+                        let sb = (out_b.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                        let sg = (out_g.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                        let sr = (out_r.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                        let sa = (out_a.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                        match mask {
+                            Some([mr, mg, mb, ma]) => blend_over_masked(
+                                &mut *fb,
+                                fi, sr, sg, sb, sa, mr, mg, mb, ma,
+                            ),
+                            None => {
+                                blend_over(&mut *fb, fi, sr, sg, sb, sa)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    (quads_total, quads_blitted)
+}
+
 
 /// Alpha-blend a source pixel (sRGB, non-premultiplied) over the framebuffer.
 /// fb is BGRA layout.
@@ -899,9 +953,14 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
     ((r + m).clamp(0.0, 1.0), (g + m).clamp(0.0, 1.0), (b + m).clamp(0.0, 1.0))
 }
 
+/// `pub(crate)` only so `purecpu_sampler`'s tests can reach [`test::blit_probe`].
+/// Those tests used to grade a private *copy* of the blit loop; Task 15 pointed
+/// them at the real one, and the harness that makes that possible lives here,
+/// next to the loop it drives, rather than being duplicated there.
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use super::*;
+    use crate::quad::{V_BOT_LEFT, V_BOT_RIGHT, V_TOP_LEFT, V_TOP_RIGHT};
 
     fn approx_eq(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-4
@@ -1207,5 +1266,616 @@ mod test {
         // offset — the old code did `band.y.max(0)` for the slice but passed
         // the unclamped `band.y` as the destination, so the two disagreed.
         assert_eq!(clamp_band(-5, 20, 100), Some((0, 15)));
+    }
+
+    // =====================================================================
+    // A framebuffer harness for the blit loop (Task 15).
+    //
+    // `call_draw_purecpu` used to be executed by no test whatsoever: with an
+    // unconditional `panic!` on the first line of the clip loop AND
+    // `cy2.min(blit_y2)` mutated to `cy2.min(blit_y2 + 1)`, the suite still
+    // reported "75 passed; 0 failed" and exited 0.  Everything below drives the
+    // *shipping* loop — `blit_vertex_buffer`, the function
+    // `call_draw_purecpu` now calls — with hand-built data: no `TermWindow`, no
+    // window, no X display, no atlas, no font.
+    // =====================================================================
+
+    /// Side of the atlas the harness builds.
+    ///
+    /// 256 so a texel's column and row each fit in one byte (see
+    /// [`probe_atlas`]), and a power of two so the texcoord round-trip through
+    /// `f32` normalisation is exact — the invariant `purecpu_sampler`'s module
+    /// doc says the whole sampler rests on.
+    pub(crate) const PROBE_ATLAS: usize = 256;
+
+    /// An atlas whose every texel names its own coordinates: `R = column`,
+    /// `G = row`, `B = 0`, `A = 255`.
+    ///
+    /// Blitted through `has_color == 1.0` (IS_COLOR_EMOJI) or `2.0`
+    /// (IS_BG_IMAGE) with an opaque `fg_color`, the loop copies the texel to the
+    /// framebuffer unchanged: both branches take `out_rgb = tex_rgb`, both are
+    /// `tex_is_srgb` so no transfer function runs, `hsv` is the identity, and
+    /// `out_a == 1.0` makes `blend_over` a straight replace.  So after a blit
+    /// the framebuffer says, per pixel, *which atlas texel that pixel read* —
+    /// which is what turns a framebuffer into a walk.
+    fn probe_atlas(w: usize, h: usize) -> Vec<u8> {
+        assert!(w <= 256 && h <= 256, "probe atlas coordinates must fit in a byte");
+        let mut data = vec![0u8; w * h * 4];
+        for row in 0..h {
+            for col in 0..w {
+                let i = (row * w + col) * 4;
+                data[i] = col as u8;
+                data[i + 1] = row as u8;
+                data[i + 2] = 0;
+                data[i + 3] = 255;
+            }
+        }
+        data
+    }
+
+    struct Rig {
+        fb: Vec<u8>,
+        fb_w: usize,
+        fb_h: usize,
+        atlas: Vec<u8>,
+        atlas_w: usize,
+        atlas_h: usize,
+    }
+
+    impl Rig {
+        fn new(fb_w: usize, fb_h: usize) -> Self {
+            Self {
+                fb: vec![0u8; fb_w * fb_h * 4],
+                fb_w,
+                fb_h,
+                atlas: probe_atlas(PROBE_ATLAS, PROBE_ATLAS),
+                atlas_w: PROBE_ATLAS,
+                atlas_h: PROBE_ATLAS,
+            }
+        }
+
+        fn blit(
+            &mut self,
+            verts: &[Vertex],
+            full_repaint: bool,
+            dirty: &[DirtyRect],
+        ) -> (u64, u64) {
+            blit_vertex_buffer(
+                &mut self.fb,
+                self.fb_w,
+                self.fb_h,
+                &self.atlas,
+                self.atlas_w,
+                self.atlas_h,
+                verts,
+                full_repaint,
+                dirty,
+                false,
+                false,
+                config::HsbTransform::default(),
+            )
+        }
+
+        /// The pixel at `(x, y)` in the framebuffer's own `[B, G, R, A]` order.
+        fn px(&self, x: usize, y: usize) -> [u8; 4] {
+            let i = (y * self.fb_w + x) * 4;
+            [self.fb[i], self.fb[i + 1], self.fb[i + 2], self.fb[i + 3]]
+        }
+
+        /// Whether anything was blitted to `(x, y)`.  The framebuffer starts at
+        /// zero and every quad the harness draws is opaque, so a non-zero alpha
+        /// is exactly "written" — no quad in this module writes alpha 0.
+        fn written(&self, x: usize, y: usize) -> bool {
+            self.px(x, y)[3] != 0
+        }
+
+        /// Every written pixel, row-major: `(x, y, [B, G, R, A])`.
+        fn written_pixels(&self) -> Vec<(usize, usize, [u8; 4])> {
+            let mut out = Vec::new();
+            for y in 0..self.fb_h {
+                for x in 0..self.fb_w {
+                    if self.written(x, y) {
+                        out.push((x, y, self.px(x, y)));
+                    }
+                }
+            }
+            out
+        }
+    }
+
+    /// The four vertices of one quad, in the layout the renderer produces.
+    ///
+    /// `dest` is `[x, y, x2, y2]` in framebuffer pixels and `tex` the same in
+    /// atlas texels; both are stored the way the real producers store them —
+    /// positions relative to the framebuffer centre, which the blit recovers by
+    /// adding `half_w`/`half_h` (`quad.rs`'s `set_position` writes window
+    /// coordinates), and texcoords normalised by the atlas side (`set_texture`).
+    ///
+    /// The assertion holds the centre round-trip to *exactness*.  A harness that
+    /// quietly displaced its own quad by an ulp would turn every geometry
+    /// assertion below into a statement about the harness rather than about the
+    /// loop, and it would do so silently.  Keep harness coordinates on
+    /// quarter-pixel multiples of a modest magnitude and the subtraction is
+    /// exact; the assertion is what makes "keep" enforceable.
+    fn quad(
+        dest: [f32; 4],
+        tex: [f32; 4],
+        has_color: f32,
+        fg: [f32; 4],
+        fb_w: usize,
+        fb_h: usize,
+    ) -> Vec<Vertex> {
+        let half_w = fb_w as f32 / 2.0;
+        let half_h = fb_h as f32 / 2.0;
+        for (d, half) in [
+            (dest[0], half_w),
+            (dest[2], half_w),
+            (dest[1], half_h),
+            (dest[3], half_h),
+        ] {
+            assert_eq!(
+                (d - half) + half,
+                d,
+                "harness displaced its own quad: {d} does not survive the centre round-trip"
+            );
+        }
+        quad_at(
+            [
+                dest[0] - half_w,
+                dest[1] - half_h,
+                dest[2] - half_w,
+                dest[3] - half_h,
+            ],
+            tex,
+            has_color,
+            fg,
+        )
+    }
+
+    /// [`quad`], but taking positions already in the renderer's centred
+    /// coordinates — for tests that must reproduce a producer's exact float
+    /// expression rather than name a destination pixel.
+    fn quad_at(pos: [f32; 4], tex: [f32; 4], has_color: f32, fg: [f32; 4]) -> Vec<Vertex> {
+        let n = PROBE_ATLAS as f32;
+        for t in tex {
+            assert_eq!(
+                (t / n) * n,
+                t,
+                "harness displaced its own texcoord: {t} does not survive normalisation"
+            );
+        }
+        let mut v = vec![Vertex::default(); VERTICES_PER_CELL];
+        v[V_TOP_LEFT].position = [pos[0], pos[1]];
+        v[V_TOP_RIGHT].position = [pos[2], pos[1]];
+        v[V_BOT_LEFT].position = [pos[0], pos[3]];
+        v[V_BOT_RIGHT].position = [pos[2], pos[3]];
+        v[V_TOP_LEFT].tex = [tex[0] / n, tex[1] / n];
+        v[V_BOT_RIGHT].tex = [tex[2] / n, tex[3] / n];
+        for vert in v.iter_mut() {
+            vert.has_color = has_color;
+            vert.fg_color = fg;
+            vert.alt_color = [0.0; 4];
+            vert.hsv = [1.0, 1.0, 1.0];
+            vert.mix_value = 0.0;
+        }
+        v
+    }
+
+    /// Drive one quad through the real blit loop and report which destination
+    /// pixel read which atlas texel: `(dest_rect, [(dest_x, dest_y, atlas_col,
+    /// atlas_row)])`, or `None` when the loop wrote nothing.
+    ///
+    /// This is the framebuffer equivalent of the walk `purecpu_sampler`'s tests
+    /// used to perform against a private transcription of this loop, and it is
+    /// what lets those tests grade the shipping code.  Pixels come back in the
+    /// loop's own order (row-major), so the two are directly comparable.
+    pub(crate) fn blit_probe(
+        bg_image: bool,
+        dest_f: [f32; 4],
+        tex_f: [f32; 4],
+    ) -> Option<([i32; 4], Vec<(i32, i32, i32, i32)>)> {
+        const FB: usize = 48;
+        let q = purecpu_sampler::Quad::new(
+            bg_image,
+            dest_f,
+            tex_f,
+            PROBE_ATLAS as i32,
+            PROBE_ATLAS as i32,
+        );
+        let rect = q.dest_rect();
+        // A quad the harness framebuffer clipped would report a *shorter* walk
+        // and read as a sampling difference, so refuse rather than mislead.
+        assert!(
+            rect[0] >= 0 && rect[1] >= 0 && rect[2] <= FB as i32 && rect[3] <= FB as i32,
+            "blit_probe: dest rect {:?} does not fit the {}x{} harness framebuffer",
+            rect,
+            FB,
+            FB
+        );
+        let mut rig = Rig::new(FB, FB);
+        let has_color = if bg_image { 2.0 } else { 1.0 };
+        let verts = quad(dest_f, tex_f, has_color, [0.0, 0.0, 0.0, 1.0], FB, FB);
+        rig.blit(&verts, true, &[]);
+        let out: Vec<(i32, i32, i32, i32)> = rig
+            .written_pixels()
+            .into_iter()
+            .map(|(x, y, [_b, g, r, _a])| (x as i32, y as i32, r as i32, g as i32))
+            .collect();
+        if out.is_empty() {
+            None
+        } else {
+            Some((rect, out))
+        }
+    }
+
+    const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+    const GREEN: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
+    /// `RED` after the solid path's `linear_to_srgb` and 8-bit rounding, in the
+    /// framebuffer's BGRA order: `linear_to_srgb(1.0) == 1.0` and
+    /// `linear_to_srgb(0.0) == 0.0`, so the primaries survive exactly and the
+    /// harness can pin values without restating the transfer function.
+    const RED_BGRA: [u8; 4] = [0, 0, 255, 255];
+    const GREEN_BGRA: [u8; 4] = [0, 255, 0, 255];
+
+    #[test]
+    fn blit_fills_a_solid_colour_quad_and_touches_nothing_else() {
+        // IS_SOLID_COLOR (3.0), the branch that paints every cell background,
+        // every cursor and every window border — and which no test executed.
+        let mut rig = Rig::new(16, 16);
+        let verts = quad([2.0, 3.0, 6.0, 7.0], [0.0; 4], 3.0, RED, 16, 16);
+        assert_eq!(rig.blit(&verts, true, &[]), (1, 1));
+        for y in 0..16 {
+            for x in 0..16 {
+                let inside = (2..6).contains(&x) && (3..7).contains(&y);
+                assert_eq!(
+                    rig.px(x, y),
+                    if inside { RED_BGRA } else { [0, 0, 0, 0] },
+                    "pixel ({x},{y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn blit_samples_a_textured_quad_across_its_destination() {
+        // The textured arm, 1:1: destination pixel (4,4) must read atlas texel
+        // (10,20) and (7,7) must read (13,23).  The probe atlas encodes its own
+        // coordinates, so these are assertions about *which texel was sampled*,
+        // not merely that something was drawn.
+        let mut rig = Rig::new(16, 16);
+        let verts = quad([4.0, 4.0, 8.0, 8.0], [10.0, 20.0, 14.0, 24.0], 1.0, RED, 16, 16);
+        assert_eq!(rig.blit(&verts, true, &[]), (1, 1));
+        for k in 0..4usize {
+            for j in 0..4usize {
+                assert_eq!(
+                    rig.px(4 + j, 4 + k),
+                    [0, (20 + k) as u8, (10 + j) as u8, 255],
+                    "pixel ({}, {}) read the wrong texel",
+                    4 + j,
+                    4 + k
+                );
+            }
+        }
+        assert_eq!(rig.written_pixels().len(), 16, "the quad painted outside itself");
+    }
+
+    #[test]
+    fn blit_stops_at_the_bg_image_crop_and_does_not_write_the_row_below() {
+        // The `cy2.min(blit_y2)` mutant.  It is a no-op for sampled quads —
+        // there `blit_y2 == dest_y2 >= cy2` and the extra `+ 1` is swallowed by
+        // the `min` — so the only geometry that discriminates is one where the
+        // crop actually bites: IS_BG_IMAGE, whose `blit_end` stops after
+        // `min(tex, dest)` texels.  A 4x4 sprite in a 12x12 destination is
+        // cropped to 4x4, so row 4 and column 4 must stay untouched.
+        let mut rig = Rig::new(16, 16);
+        let verts = quad([0.0, 0.0, 12.0, 12.0], [0.0, 0.0, 4.0, 4.0], 2.0, RED, 16, 16);
+        assert_eq!(rig.blit(&verts, true, &[]), (1, 1));
+        for y in 0..16 {
+            for x in 0..16 {
+                let inside = x < 4 && y < 4;
+                assert_eq!(
+                    rig.written(x, y),
+                    inside,
+                    "pixel ({x},{y}): the bg-image crop moved"
+                );
+                if inside {
+                    assert_eq!(rig.px(x, y), [0, y as u8, x as u8, 255], "pixel ({x},{y})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blit_clips_a_quad_hanging_off_the_top_left_corner() {
+        // Ruling 1's first unreachable case: a negative destination origin.
+        // `legacy_oracle` structurally cannot express it and nothing has ever
+        // executed it, yet it is what `row_start.max(0)` / `col_start.max(0)`
+        // exist for — and indexing the framebuffer at a negative row is not a
+        // wrong pixel, it is a panic or a wrapped `usize`.
+        //
+        // dest x: cover_start(-3) = ceil(-3.5) = -3, cover_end(5) = 5.
+        // texel_x(dx) = floor(8 + ((dx + 0.5 + 3) / 8) * 8) = 11 + dx.
+        // dest y: cover_start(-2) = -2, cover_end(6) = 6; texel_y(dy) = 11 + dy.
+        // So the clipped quad starts at pixel (0,0) reading texel (11,11).
+        let mut rig = Rig::new(16, 16);
+        let verts = quad([-3.0, -2.0, 5.0, 6.0], [8.0, 9.0, 16.0, 17.0], 1.0, RED, 16, 16);
+        assert_eq!(rig.blit(&verts, true, &[]), (1, 1));
+        for y in 0..16 {
+            for x in 0..16 {
+                let inside = x < 5 && y < 6;
+                assert_eq!(rig.written(x, y), inside, "pixel ({x},{y})");
+                if inside {
+                    assert_eq!(
+                        rig.px(x, y),
+                        [0, (11 + y) as u8, (11 + x) as u8, 255],
+                        "pixel ({x},{y}) read the wrong texel — the clip shifted the sampling"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blit_clips_a_quad_hanging_off_the_bottom_right_corner() {
+        // Ruling 1's second unreachable case.  Symmetric to the one above and
+        // *not* redundant with it: the top-left clip is `max`, the bottom-right
+        // clip is `min(fb_w)` / `min(fb_h)`, two different expressions.  Without
+        // this, deleting the `.min(fb_h as i32)` term writes past the end of the
+        // framebuffer with nothing to say so.
+        //
+        // texel_x(dx) = floor(8 + (dx + 0.5 - 12)) = dx - 4, texel_y(dy) = dy - 3.
+        let mut rig = Rig::new(16, 16);
+        let verts = quad([12.0, 12.0, 20.0, 20.0], [8.0, 9.0, 16.0, 17.0], 1.0, RED, 16, 16);
+        assert_eq!(rig.blit(&verts, true, &[]), (1, 1));
+        for y in 0..16 {
+            for x in 0..16 {
+                let inside = x >= 12 && y >= 12;
+                assert_eq!(rig.written(x, y), inside, "pixel ({x},{y})");
+                if inside {
+                    assert_eq!(
+                        rig.px(x, y),
+                        [0, (y - 3) as u8, (x - 4) as u8, 255],
+                        "pixel ({x},{y}) read the wrong texel"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blit_skips_a_quad_that_misses_every_dirty_rect() {
+        // Ruling 1's third unreachable case: an incremental repaint in which
+        // the quad overlaps no dirty rect.  This is the path that decides
+        // whether PureCpu's whole reason for existing — repainting only what
+        // changed — is correct or merely quiet, and `quads_blitted` is the
+        // metric the pass tunes against.
+        let mut rig = Rig::new(16, 16);
+        let verts = quad([2.0, 2.0, 6.0, 6.0], [10.0, 20.0, 14.0, 24.0], 1.0, RED, 16, 16);
+        let dirty = vec![DirtyRect { x: 8, y: 8, width: 4, height: 4 }];
+        assert_eq!(
+            rig.blit(&verts, false, &dirty),
+            (1, 0),
+            "the quad was counted as blitted"
+        );
+        assert!(
+            rig.written_pixels().is_empty(),
+            "a quad that misses every dirty rect painted anyway"
+        );
+    }
+
+    #[test]
+    fn blit_paints_only_the_intersection_with_a_dirty_rect() {
+        // The other half of the incremental path: a quad that *partly* overlaps
+        // must be painted exactly on the intersection, and must keep sampling
+        // the texel its full-quad geometry says — clipping moves which pixels
+        // are written, never which texel a written pixel reads.
+        let mut rig = Rig::new(16, 16);
+        let verts = quad([4.0, 4.0, 8.0, 8.0], [10.0, 20.0, 14.0, 24.0], 1.0, RED, 16, 16);
+        let dirty = vec![DirtyRect { x: 6, y: 0, width: 10, height: 6 }];
+        assert_eq!(rig.blit(&verts, false, &dirty), (1, 1));
+        for y in 0..16 {
+            for x in 0..16 {
+                let inside = (6..8).contains(&x) && (4..6).contains(&y);
+                assert_eq!(rig.written(x, y), inside, "pixel ({x},{y})");
+                if inside {
+                    assert_eq!(
+                        rig.px(x, y),
+                        [0, (20 + y - 4) as u8, (10 + x - 4) as u8, 255],
+                        "pixel ({x},{y}) resampled itself against the clip rect"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Lay out `cells` adjacent single-cell background quads exactly the way
+    /// `screen_line.rs:231-242` lays them out, blit each, and return both the
+    /// framebuffer and the destination-space edges `(left, right)` per cell.
+    ///
+    /// The two expressions under test are the ones that file actually writes:
+    /// a cluster's right edge is `(left_pixel_x + i*cw) + (w*cw)` and the next
+    /// cluster's left edge is `left_pixel_x + ((i+w)*cw)`.  The association is
+    /// reproduced verbatim, and the `+ half_w` that turns a vertex position into
+    /// a destination pixel is applied here rather than in the caller, because
+    /// that addition is part of the arithmetic under test and rounds too.
+    fn lay_out_cells(
+        fb_w: usize,
+        fb_h: usize,
+        left_pixel_x: f32,
+        cell_width: f32,
+        cells: usize,
+    ) -> (Rig, Vec<(f32, f32)>) {
+        let half_w = fb_w as f32 / 2.0;
+        let half_h = fb_h as f32 / 2.0;
+        let mut rig = Rig::new(fb_w, fb_h);
+        let mut edges = Vec::new();
+        for i in 0..cells {
+            let x = left_pixel_x + (i as f32 * cell_width);
+            let width = 1.0 * cell_width; // `cluster_width as f32 * cell_width`
+            let right = x + width;
+            edges.push((x + half_w, right + half_w));
+            let verts = quad_at(
+                [x, -half_h, right, half_h],
+                [0.0; 4],
+                3.0,
+                if i % 2 == 0 { RED } else { GREEN },
+            );
+            rig.blit(&verts, true, &[]);
+        }
+        (rig, edges)
+    }
+
+    #[test]
+    fn adjacent_solid_quads_never_seam_at_an_integral_cell_width() {
+        // Task 7's reviewer argued adjacent solid quads cannot seam because both
+        // carry "the same edge `e`".  The premise is false — `(left + i*cw) +
+        // (1*cw)` and `left + ((i+1)*cw)` are different expressions and need not
+        // be the same float — but the conclusion holds, for a reason nobody had
+        // stated: **`cell_width` is an integer.**  `screen_line.rs:62` computes
+        // it as `cell_size.width as f32 * width_scale`, an integral pixel count
+        // times 1.0 or 2.0, so `i * cw` is exact for every `i` and the two forms
+        // agree bit-for-bit.  Measured over 2.34M on-screen cell boundaries at
+        // window widths 800..3840: zero bit-differences, zero disagreements.
+        //
+        // This test asserts *both* links of that chain, because the pixel check
+        // alone would still pass if the edges differed but happened not to
+        // straddle a pixel centre — which is exactly the fragile situation
+        // `adjacent_solid_quads_can_seam_at_a_fractional_cell_width` exhibits.
+        let (fb_w, fb_h) = (1920usize, 2usize);
+        let half_w = fb_w as f32 / 2.0;
+        let mut checked = 0usize;
+        for &cw in &[4.0f32, 7.0, 8.0, 11.0, 16.0, 17.0, 23.0, 30.0] {
+            for ok in 0..8 {
+                // A fractional pane origin, which is where the rounding would
+                // have to come from once `i * cw` is exact.
+                let origin = ok as f32 * 0.1234;
+                let left = -half_w + origin;
+                let cells = (fb_w as f32 / cw) as usize - 1;
+                let (rig, edges) = lay_out_cells(fb_w, fb_h, left, cw, cells);
+
+                for i in 0..cells - 1 {
+                    assert_eq!(
+                        edges[i].1.to_bits(),
+                        edges[i + 1].0.to_bits(),
+                        "cells {} and {} disagree about their shared edge: {} vs {} \
+                         (cell_width {}, origin {}) — an integral cell_width is \
+                         supposed to make these the same float",
+                        i,
+                        i + 1,
+                        edges[i].1,
+                        edges[i + 1].0,
+                        cw,
+                        origin
+                    );
+                }
+
+                // ...and the framebuffer form, which is what a user would see.
+                let x0 = purecpu_sampler::cover_start(edges[0].0);
+                let x1 = purecpu_sampler::cover_end(edges[cells - 1].1);
+                assert!(x0 >= 0 && x1 <= fb_w as i32, "sweep ran off the harness");
+                assert!(x1 - x0 > 100, "sweep covered almost no pixels");
+                for y in 0..fb_h {
+                    for x in x0..x1 {
+                        let px = rig.px(x as usize, y);
+                        assert!(
+                            px == RED_BGRA || px == GREEN_BGRA,
+                            "unwritten or blended pixel ({},{}) = {:?} between adjacent \
+                             solid quads (cell_width {}, origin {})",
+                            x,
+                            y,
+                            px,
+                            cw,
+                            origin
+                        );
+                    }
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 64, "the sweep did not run");
+    }
+
+    #[test]
+    fn adjacent_solid_quads_can_seam_at_a_fractional_cell_width() {
+        // The finding, pinned rather than papered over: the safety asserted by
+        // `adjacent_solid_quads_never_seam_at_an_integral_cell_width` rests
+        // entirely on `cell_width` being integral, and nothing in the type
+        // system says it is.  Make it fractional and a one-pixel column that no
+        // quad writes is constructible — found by search over window widths
+        // 800..3840, at a rate of roughly one boundary in 30,000.
+        //
+        // Reproduction: window 1920 (`half_w == 960`), cell_width
+        // 16.144447326660156, pane origin 0.2888416647911072.  Cell 42's right
+        // edge lands *exactly* on the pixel centre 694.5, so `cover_end` gives
+        // 694; cell 43's left edge is one ulp higher, 694.5000610351562, so
+        // `cover_start` gives 695.  Pixel 694 is written by neither.
+        //
+        // Two things this is NOT.  It is not a PureCpu-vs-GL parity defect: GL
+        // rasterises the same two float edges under the same pixel-centre rule
+        // and drops the same column, so the backends agree.  And it is not a
+        // reason to change the coverage rule, which is what makes PureCpu match
+        // GL in the first place.  It is a reason to know that fractional cell
+        // metrics — fractional DPI scaling, say — would introduce visible
+        // 1px seams in cell backgrounds, and to have that fact fail loudly here
+        // rather than be rediscovered from a screenshot.
+        let (fb_w, fb_h) = (1920usize, 2usize);
+        let half_w = fb_w as f32 / 2.0;
+        let cw = 16.144447326660156f32;
+        let origin = 0.2888416647911072f32;
+        let left = -half_w + origin;
+
+        // Only the two cells either side of the seam are needed; laying out all
+        // 43 would blit 41 quads to say the same thing.
+        let mut rig = Rig::new(fb_w, fb_h);
+        let mut edges = Vec::new();
+        for (i, fg) in [(42usize, RED), (43usize, GREEN)] {
+            let x = left + (i as f32 * cw);
+            let right = x + 1.0 * cw;
+            edges.push((x + half_w, right + half_w));
+            rig.blit(
+                &quad_at([x, -(fb_h as f32 / 2.0), right, fb_h as f32 / 2.0], [0.0; 4], 3.0, fg),
+                true,
+                &[],
+            );
+        }
+
+        // The floats, so a future reader can see the mechanism rather than
+        // trust the pixel indices.
+        assert_eq!(edges[0].1, 694.5, "cell 42's right edge moved");
+        assert_eq!(edges[1].0, 694.5000610351562, "cell 43's left edge moved");
+        assert_eq!(
+            edges[1].0.to_bits() - edges[0].1.to_bits(),
+            1,
+            "the two edges are supposed to be exactly one ulp apart"
+        );
+        assert_eq!(purecpu_sampler::cover_end(edges[0].1), 694);
+        assert_eq!(purecpu_sampler::cover_start(edges[1].0), 695);
+
+        // ...and the seam itself, in the framebuffer.
+        assert_eq!(rig.px(693, 0), RED_BGRA, "cell 42's last column");
+        assert!(
+            !rig.written(694, 0),
+            "expected an unwritten seam column at 694; if this now passes, the \
+             coverage rule or the layout arithmetic changed and the finding \
+             above needs re-deriving rather than deleting"
+        );
+        assert_eq!(rig.px(695, 0), GREEN_BGRA, "cell 43's first column");
+    }
+
+    #[test]
+    fn the_harness_can_see_a_seam_when_there_is_one() {
+        // The control for the test above.  "No gap found" from an instrument
+        // that cannot register a gap is worth nothing, and a whole-framebuffer
+        // sweep that silently checked zero pixels would report exactly that.
+        // Two solid quads deliberately separated by one pixel column must fail
+        // the same "every pixel is written" check.
+        let mut rig = Rig::new(16, 4);
+        for (x0, x1, fg) in [(2.0f32, 5.0f32, RED), (6.0f32, 9.0f32, GREEN)] {
+            let verts = quad([x0, 0.0, x1, 4.0], [0.0; 4], 3.0, fg, 16, 4);
+            rig.blit(&verts, true, &[]);
+        }
+        assert!(rig.written(4, 0), "the left quad's last column");
+        assert!(!rig.written(5, 0), "the deliberate gap is not visible");
+        assert!(rig.written(6, 0), "the right quad's first column");
     }
 }
