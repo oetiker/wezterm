@@ -1298,6 +1298,33 @@ pub(crate) mod test {
     /// `out_a == 1.0` makes `blend_over` a straight replace.  So after a blit
     /// the framebuffer says, per pixel, *which atlas texel that pixel read* —
     /// which is what turns a framebuffer into a walk.
+    ///
+    /// # The load-bearing precondition is the opaque `fg_color`
+    ///
+    /// It is `blend_over`'s `sa == 255` **replace** fast path (`:742-746`) that
+    /// this encoding rests on, not the transfer functions — which is why
+    /// [`blit_probe`] hard-codes `fg = [0, 0, 0, 1]` rather than taking one.
+    /// Take that away on the `has_color == 2.0` arm, where `out_a = tex_a *
+    /// fg_a`, and the RGB is blended toward the cleared framebuffer instead of
+    /// replacing it, so the decoded coordinates come back **scaled**: at
+    /// `fg_a == 0.5` a pixel that really sampled texel `(10, 20)` decodes as
+    /// `(5, 10)`.  Measured, not argued.  The walk keeps the same *length*, so
+    /// `assert_same_walk`'s rect and pixel-count checks both still pass and only
+    /// a per-pixel mismatch could catch it.  The `has_color == 1.0` arm is
+    /// immune, because `out_a = tex_a` ignores `fg` entirely.
+    ///
+    /// What is *not* fragile is [`Rig::written`]'s `alpha != 0` predicate: on
+    /// this path `blend_over` guards `else if sa > 0`, so a zero-alpha pixel is
+    /// never written and `written == false` is then *correct*.  A sentinel
+    /// pre-fill — the fix an earlier round proposed — would make written-ness
+    /// robust and leave the RGB just as blended, i.e. it addresses the direction
+    /// that does not happen and not the one that does.
+    ///
+    /// Anyone extending the probe to `has_color == 0.0` should read that as: the
+    /// coordinate encoding, not the written-ness predicate, is what has to be
+    /// replaced.  IS_GLYPH and IS_GRAY_SCALE take `out_rgb` from the vertex, so
+    /// there is no coordinate to decode at all; see
+    /// [`coverage_atlas`] and the two tests that use it instead.
     fn probe_atlas(w: usize, h: usize) -> Vec<u8> {
         assert!(w <= 256 && h <= 256, "probe atlas coordinates must fit in a byte");
         let mut data = vec![0u8; w * h * 4];
@@ -1308,6 +1335,32 @@ pub(crate) mod test {
                 data[i + 1] = row as u8;
                 data[i + 2] = 0;
                 data[i + 3] = 255;
+            }
+        }
+        data
+    }
+
+    /// The coverage pattern [`coverage_atlas`] repeats across atlas columns:
+    /// full, half, quarter, none.
+    const COVERAGE: [u8; 4] = [255, 128, 64, 0];
+
+    /// An atlas that is a pure coverage mask: `RGB = 0`, `A = COVERAGE[col % 4]`.
+    ///
+    /// [`probe_atlas`] cannot serve `has_color == 0.0` (IS_GLYPH) or `4.0`
+    /// (IS_GRAY_SCALE): both take `out_rgb` from the *vertex* and only `out_a`
+    /// from the texture, so there is no coordinate left in the framebuffer to
+    /// decode.  What those branches do read is the texel alpha, and this atlas
+    /// makes it discriminate — including a partially covered texel, which is
+    /// what makes `blend_over`'s partial-alpha arm (`:747-754`) run from *inside*
+    /// the loop rather than only from its own unit test, and a wholly uncovered
+    /// one, which is what makes the loop's `out_a <= 0.0 => continue` (`:701`)
+    /// run at all.
+    fn coverage_atlas() -> Vec<u8> {
+        let n = PROBE_ATLAS;
+        let mut data = vec![0u8; n * n * 4];
+        for row in 0..n {
+            for col in 0..n {
+                data[(row * n + col) * 4 + 3] = COVERAGE[col % 4];
             }
         }
         data
@@ -1332,6 +1385,18 @@ pub(crate) mod test {
                 atlas_w: PROBE_ATLAS,
                 atlas_h: PROBE_ATLAS,
             }
+        }
+
+        /// [`Rig::new`] with a different atlas of the same shape — the two
+        /// branches that read only the texel *alpha* need [`coverage_atlas`]
+        /// rather than [`probe_atlas`].
+        fn with_atlas(fb_w: usize, fb_h: usize, atlas: Vec<u8>) -> Self {
+            assert_eq!(
+                atlas.len(),
+                PROBE_ATLAS * PROBE_ATLAS * 4,
+                "harness atlas is not {PROBE_ATLAS}x{PROBE_ATLAS} RGBA"
+            );
+            Self { atlas, ..Self::new(fb_w, fb_h) }
         }
 
         fn blit(
@@ -1363,8 +1428,13 @@ pub(crate) mod test {
         }
 
         /// Whether anything was blitted to `(x, y)`.  The framebuffer starts at
-        /// zero and every quad the harness draws is opaque, so a non-zero alpha
-        /// is exactly "written" — no quad in this module writes alpha 0.
+        /// zero and no path in the loop writes alpha 0: `blend_over` replaces
+        /// wholesale at `sa == 255` and otherwise guards `else if sa > 0`, and
+        /// the loop `continue`s at `out_a <= 0.0` before reaching it.  So a
+        /// non-zero alpha is exactly "written", including for the partially
+        /// covered texels [`coverage_atlas`] supplies.  (The predicate is sound
+        /// in both directions; the assumption that *is* delicate is the
+        /// coordinate encoding — see [`probe_atlas`].)
         fn written(&self, x: usize, y: usize) -> bool {
             self.px(x, y)[3] != 0
         }
@@ -1698,6 +1768,26 @@ pub(crate) mod test {
     /// reproduced verbatim, and the `+ half_w` that turns a vertex position into
     /// a destination pixel is applied here rather than in the caller, because
     /// that addition is part of the arithmetic under test and rounds too.
+    ///
+    /// # One deliberate simplification, and why it is safe
+    ///
+    /// The right edge is modelled as `x + width` — one rounding.  The real
+    /// producer is longer: `screen_line.rs:251-252` builds
+    /// `euclid::rect(x, .., width, ..)`, intersects it with `bounding_rect`, and
+    /// `filled_rectangle` (`render/mod.rs:281`) reads `rect.max_x()`.  euclid's
+    /// `intersection` goes `to_box2d` → min/max → `to_rect`, so `size.width` is
+    /// re-derived as `(x + width) - x` and `max_x()` is `x + ((x + width) - x)`:
+    /// **three** roundings where this models one.  That is not obviously an
+    /// identity, and if it were not one the seam tests below would be statements
+    /// about a producer that does not exist.
+    ///
+    /// It was checked rather than assumed: over 79,307,920 on-screen cell
+    /// boundaries (window widths 800..3840, integral cell widths 4..60,
+    /// fractional pane origins) the euclid round trip moved **0** edges, and the
+    /// integral-width sweep reports zero bit-differences and zero coverage
+    /// disagreements on *both* edge forms.  So an auditor comparing this
+    /// function against `screen_line.rs` should read the missing step as
+    /// accounted for, not as an oversight.
     fn lay_out_cells(
         fb_w: usize,
         fb_h: usize,
@@ -1737,10 +1827,20 @@ pub(crate) mod test {
         // agree bit-for-bit.  Measured over 2.34M on-screen cell boundaries at
         // window widths 800..3840: zero bit-differences, zero disagreements.
         //
-        // This test asserts *both* links of that chain, because the pixel check
-        // alone would still pass if the edges differed but happened not to
-        // straddle a pixel centre — which is exactly the fragile situation
-        // `adjacent_solid_quads_can_seam_at_a_fractional_cell_width` exhibits.
+        // This test asserts *both* links of that chain, and the two are NOT
+        // interchangeable — each catches something the other cannot:
+        //
+        //  - the pixel check catches a **gap**: an unwritten pixel is
+        //    `[0,0,0,0]` and matches neither colour.  It **cannot** catch an
+        //    **overlap**, because a doubly-written pixel is still exactly one of
+        //    the two colours.  That matters, because in a fractional sweep
+        //    overlaps are the *more common* failure: 745 overlaps against 609
+        //    seams over 35.7M boundaries.
+        //  - the bit-identity check is therefore what carries the overlap half
+        //    of the requirement — and it is also the only one that fires when
+        //    the edges differ but happen not to straddle a pixel centre, which
+        //    is exactly the fragile situation
+        //    `adjacent_solid_quads_can_seam_at_a_fractional_cell_width` exhibits.
         let (fb_w, fb_h) = (1920usize, 2usize);
         let half_w = fb_w as f32 / 2.0;
         let mut checked = 0usize;
@@ -1877,5 +1977,210 @@ pub(crate) mod test {
         assert!(rig.written(4, 0), "the left quad's last column");
         assert!(!rig.written(5, 0), "the deliberate gap is not visible");
         assert!(rig.written(6, 0), "the right quad's first column");
+    }
+
+    #[test]
+    fn blit_walks_more_than_one_quad_per_call() {
+        // Every other test in this module passes exactly `VERTICES_PER_CELL`
+        // vertices, so `for q in 0..num_quads` runs its body once per call.
+        // That leaves three things unexecuted: the `base = q * VERTICES_PER_CELL`
+        // indexing, the reuse of the `clip_rects` `Vec` across iterations (the
+        // second quad sees a `Vec` the first one filled, and depends on
+        // `collect_clip_rects` clearing it), and every `(quads_total,
+        // quads_blitted)` pair other than `(1,1)` / `(1,0)`.
+        //
+        // The two quads deliberately differ in *both* destination and texcoord,
+        // so an indexing slip that read quad 0's vertices twice would paint 16
+        // pixels in one place instead of 32 in two.
+        let mut rig = Rig::new(16, 16);
+        let mut verts = quad([0.0, 0.0, 4.0, 4.0], [10.0, 20.0, 14.0, 24.0], 1.0, RED, 16, 16);
+        verts.extend(quad(
+            [8.0, 8.0, 12.0, 12.0],
+            [30.0, 40.0, 34.0, 44.0],
+            1.0,
+            GREEN,
+            16,
+            16,
+        ));
+
+        // Incremental, not full repaint: the full-repaint arm `clear()`s
+        // `clip_rects` itself, so only this path grades the reuse.
+        let dirty = vec![DirtyRect { x: 0, y: 0, width: 16, height: 16 }];
+        assert_eq!(rig.blit(&verts, false, &dirty), (2, 2));
+
+        // Both quads are 1:1, so texel = dest + (tex_origin - dest_origin):
+        // quad 0 gives (10 + x, 20 + y); quad 1 gives (30 + (x-8), 40 + (y-8)),
+        // i.e. (22 + x, 32 + y).
+        for y in 0..16 {
+            for x in 0..16 {
+                let in0 = x < 4 && y < 4;
+                let in1 = (8..12).contains(&x) && (8..12).contains(&y);
+                let want = if in0 {
+                    [0, (20 + y) as u8, (10 + x) as u8, 255]
+                } else if in1 {
+                    [0, (32 + y) as u8, (22 + x) as u8, 255]
+                } else {
+                    [0, 0, 0, 0]
+                };
+                assert_eq!(rig.px(x, y), want, "pixel ({x},{y})");
+            }
+        }
+        assert_eq!(rig.written_pixels().len(), 32, "16 pixels per quad, two quads");
+    }
+
+    #[test]
+    fn blit_paints_one_quad_against_two_disjoint_dirty_rects() {
+        // `collect_clip_rects` exists for exactly this case, and the comment at
+        // its call site names it: "the bounding-box problem where non-adjacent
+        // dirty rects cause large quads to overwrite clean framebuffer areas
+        // between them".  Both other incremental tests pass a single dirty rect,
+        // so `clip_rects.len() > 1` — and therefore the inner `for clip in
+        // &clip_rects` running more than once — happened in no committed test.
+        //
+        // A 16x16 quad covering the whole framebuffer, against two 2x2 dirty
+        // rects at opposite corners.  Bounding-box behaviour would repaint the
+        // 12x12 span between them; correct behaviour touches 8 pixels.
+        let mut rig = Rig::new(16, 16);
+        let verts = quad([0.0, 0.0, 16.0, 16.0], [0.0, 0.0, 16.0, 16.0], 1.0, RED, 16, 16);
+        let dirty = vec![
+            DirtyRect { x: 0, y: 0, width: 2, height: 2 },
+            DirtyRect { x: 10, y: 10, width: 2, height: 2 },
+        ];
+        // One quad, and it *is* blitted — the counters do not see the split.
+        assert_eq!(rig.blit(&verts, false, &dirty), (1, 1));
+
+        // 1:1 over the whole framebuffer, so texel == dest pixel and the second
+        // clip rect must still sample from its own place, not from the first's.
+        for y in 0..16 {
+            for x in 0..16 {
+                let inside = (x < 2 && y < 2) || ((10..12).contains(&x) && (10..12).contains(&y));
+                let want = if inside { [0, y as u8, x as u8, 255] } else { [0, 0, 0, 0] };
+                assert_eq!(rig.px(x, y), want, "pixel ({x},{y})");
+            }
+        }
+        assert_eq!(rig.written_pixels().len(), 8, "two 2x2 dirty rects");
+    }
+
+    /// The vertex colour both branches below take their RGB from, in linear
+    /// space, with an `fg_a` that is neither 0 nor 1 so the two branches'
+    /// alphas differ.
+    ///
+    /// After `linear_to_srgb` and 8-bit rounding this is `(sr, sg, sb) =
+    /// (137, 0, 255)`, derived rather than observed:
+    ///
+    /// - `0.25 > 0.0031308`, so `1.055 * 0.25^(1/2.4) - 0.055`.
+    ///   `0.25^(1/2.4) = exp(ln(0.25)/2.4) = exp(-0.5776227) = 0.5612310`,
+    ///   `* 1.055 = 0.5920977`, `- 0.055 = 0.5370977`,
+    ///   `* 255 + 0.5 = 137.4599` → **137**.
+    /// - `0.0` and `1.0` are the transfer function's two fixed points → **0**
+    ///   and **255**.
+    ///
+    /// 137 is the discriminating one: without the transfer function the byte
+    /// would be `0.25 * 255 + 0.5 = 64`.
+    const GLYPH_FG: [f32; 4] = [0.25, 0.0, 1.0, 0.5];
+
+    /// The quad both branches below are driven with, and the texels it reads.
+    ///
+    /// `dest [4,4,8,8]`, `tex [12,0,16,4]`, 4x4 onto 4x4, so
+    /// `texel_x(dx) = floor(12 + (dx + 0.5 - 4)) = 8 + dx` — destination columns
+    /// 4,5,6,7 read atlas columns 12,13,14,15, whose `col % 4` is 0,1,2,3.  So
+    /// the four columns carry coverage 255, 128, 64 and 0 respectively: one
+    /// opaque texel, two partial, one empty.
+    fn coverage_quad(has_color: f32, fg: [f32; 4]) -> Vec<Vertex> {
+        quad([4.0, 4.0, 8.0, 8.0], [12.0, 0.0, 16.0, 4.0], has_color, fg, 16, 16)
+    }
+
+    #[test]
+    fn blit_paints_a_glyph_from_the_vertex_colour_and_the_texel_coverage() {
+        // `has_color == 0.0` (IS_GLYPH) is the branch that paints every
+        // character on screen, and until this test nothing executed it.  It
+        // cannot go through `blit_probe`: that decodes texel coordinates out of
+        // the framebuffer RGB, and this branch overwrites RGB with the vertex
+        // colour.  So drive the loop directly and pin the bytes.
+        //
+        // The branch is `out_rgb = fg_rgb`, `out_a = tex_a` (`subpixel_aa` is
+        // false, and the shader only keeps `fg_a` under dual-source), then —
+        // since `tex_is_srgb` is false here — `linear_to_srgb` on the RGB.
+        // Note what that means: `fg_a` is 0.5 and the output alpha ignores it.
+        //
+        // Source pixel: (sr, sg, sb) = (137, 0, 255), see `GLYPH_FG`.
+        // `blend_over` over a zero framebuffer, BGRA out:
+        //   sa=255 → replace           → [255, 0, 137, 255]
+        //   sa=128 → p = 128/255:      255p = 128.0   → +0.5 → 128
+        //                              137p = 68.769  → +0.5 → 69
+        //                              alpha = 128    → [128, 0, 69, 128]
+        //   sa=64  → p = 64/255:       255p = 64.0    → 64
+        //                              137p = 34.384  → +0.5 → 34
+        //                                             → [64, 0, 34, 64]
+        //   sa=0   → `out_a <= 0.0` short-circuits before `blend_over`
+        //                                             → [0, 0, 0, 0]
+        let mut rig = Rig::with_atlas(16, 16, coverage_atlas());
+        let verts = coverage_quad(0.0, GLYPH_FG);
+        assert_eq!(rig.blit(&verts, true, &[]), (1, 1));
+
+        let want: [[u8; 4]; 4] = [
+            [255, 0, 137, 255],
+            [128, 0, 69, 128],
+            [64, 0, 34, 64],
+            [0, 0, 0, 0],
+        ];
+        for y in 0..16 {
+            for x in 0..16 {
+                let expected = if (4..8).contains(&x) && (4..8).contains(&y) {
+                    want[x - 4]
+                } else {
+                    [0, 0, 0, 0]
+                };
+                assert_eq!(rig.px(x, y), expected, "pixel ({x},{y})");
+            }
+        }
+        // Three covered columns of four rows.  The uncovered column is the
+        // control: if `out_a` ever stopped coming from the texel this would be
+        // 16.
+        assert_eq!(rig.written_pixels().len(), 12, "the empty texel was painted");
+    }
+
+    #[test]
+    fn blit_paints_a_grayscale_glyph_with_the_vertex_alpha_folded_in() {
+        // `has_color == 4.0` (IS_GRAY_SCALE), the other branch no test executed.
+        // Same colour path as IS_GLYPH — `out_rgb = fg_rgb` then
+        // `linear_to_srgb` — and a *different* alpha: `out_a = fg_a * tex_a`
+        // rather than `tex_a`.  That difference is the whole reason the two
+        // branches exist separately, so this test uses `fg_a = 0.25` to make it
+        // visible: swap either branch's alpha expression for the other's and
+        // both of these tests go red.
+        //
+        //   tex_a = 255/255 → out_a = 0.25      → 0.25*255+0.5 = 64.25   → sa 64
+        //   tex_a = 128/255 → out_a = 0.1254902 → 32.0 + 0.5            → sa 32
+        //   tex_a = 64/255  → out_a = 0.0627451 → 16.0 + 0.5            → sa 16
+        //   tex_a = 0       → out_a = 0         → `out_a <= 0.0`, untouched
+        //
+        // and `blend_over`'s partial arm over a zero framebuffer, with
+        // (sr, sg, sb) = (137, 0, 255) exactly as above:
+        //   sa=64 → 255p = 64.0, 137p = 34.384+0.5 → [64, 0, 34, 64]
+        //   sa=32 → 255p = 32.0, 137p = 17.192+0.5 → [32, 0, 17, 32]
+        //   sa=16 → 255p = 16.0, 137p =  8.596+0.5 → [16, 0,  9, 16]
+        //
+        // Every one of these three goes through the `else if sa > 0` arm — the
+        // opaque `sa == 255` replace path never runs here, which is the other
+        // thing this test buys.
+        let mut rig = Rig::with_atlas(16, 16, coverage_atlas());
+        let fg = [GLYPH_FG[0], GLYPH_FG[1], GLYPH_FG[2], 0.25];
+        let verts = coverage_quad(4.0, fg);
+        assert_eq!(rig.blit(&verts, true, &[]), (1, 1));
+
+        let want: [[u8; 4]; 4] =
+            [[64, 0, 34, 64], [32, 0, 17, 32], [16, 0, 9, 16], [0, 0, 0, 0]];
+        for y in 0..16 {
+            for x in 0..16 {
+                let expected = if (4..8).contains(&x) && (4..8).contains(&y) {
+                    want[x - 4]
+                } else {
+                    [0, 0, 0, 0]
+                };
+                assert_eq!(rig.px(x, y), expected, "pixel ({x},{y})");
+            }
+        }
+        assert_eq!(rig.written_pixels().len(), 12, "the empty texel was painted");
     }
 }
