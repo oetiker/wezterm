@@ -1419,9 +1419,16 @@ impl TermWindow {
             let mut blink_rect = None;
             let mut new_blink_visible = None;
             if let Some((placement, viewport, cursor)) = active.as_ref() {
-                let cursor_blinking = cursor.shape.is_blinking()
-                    && self.config.cursor_blink_rate != 0
-                    && self.focused.is_some();
+                // I4: the shape must be resolved against default_cursor_style
+                // the way the render path resolves it before we ask whether it
+                // blinks; the raw pane shape is Default until an application
+                // sets one with DECSCUSR.  See purecpu_dirty::cursor_blinking.
+                let cursor_blinking = purecpu_dirty::cursor_blinking(
+                    self.config.default_cursor_style,
+                    cursor.shape,
+                    self.config.cursor_blink_rate,
+                    self.focused.is_some(),
+                );
                 if cursor_blinking {
                     let intensity = self.cursor_blink_state.borrow().peek_intensity();
                     // Quantize to on/off; None means cycle ended -> visible
