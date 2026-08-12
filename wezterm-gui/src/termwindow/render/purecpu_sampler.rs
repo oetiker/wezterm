@@ -226,11 +226,33 @@ impl Quad {
 
     /// The integer destination rect, `[x, y, x2, y2]`, half-open in both axes.
     pub fn dest_rect(&self) -> [i32; 4] {
-        if self.bg_image {
-            let [fx, fy, fx2, fy2] = self.dest_f;
+        Self::dest_rect_of(self.bg_image, self.dest_f)
+    }
+
+    /// The same rect, without building a `Quad` to ask for it.
+    ///
+    /// The blit loop needs the destination rect *before* it knows whether the
+    /// quad is worth drawing: on an incremental repaint most quads overlap no
+    /// dirty rect and bail, and building the source mapping for them is work
+    /// thrown away in the hot loop of the renderer whose entire reason to exist
+    /// is not doing work.  So the rect rule lives here and [`Quad::dest_rect`]
+    /// delegates to it — one copy, reachable from both.  A second copy inlined
+    /// at the call site would be free to drift from the one the sampler samples
+    /// against, and nothing would fail while it did.
+    pub fn dest_rect_of(bg_image: bool, dest_f: [f32; 4]) -> [i32; 4] {
+        let [fx, fy, fx2, fy2] = dest_f;
+        if bg_image {
             [fx as i32, fy as i32, fx2 as i32, fy2 as i32]
         } else {
-            [self.x.start, self.y.start, self.x.end, self.y.end]
+            // Identical by construction to `[x.start, y.start, x.end, y.end]`:
+            // `Span::new` builds those from the same `cover_start`/`cover_end`
+            // on the same edges.
+            [
+                cover_start(fx),
+                cover_start(fy),
+                cover_end(fx2),
+                cover_end(fy2),
+            ]
         }
     }
 
@@ -614,6 +636,37 @@ mod tests {
         let d = Span::new(64.0, 10.0, 100.0, 110.0, 4096);
         assert_eq!((d.start, d.end), (100, 110));
         assert_eq!(d.covered_texels(), (64..74).collect::<Vec<i32>>());
+    }
+
+    #[test]
+    fn dest_rect_of_is_the_rect_a_built_quad_reports() {
+        // The blit loop calls `dest_rect_of` to decide whether a quad is worth
+        // building, and `Quad`'s own `dest_rect` to decide where to write.  If
+        // those two ever disagreed, an incremental repaint would test one rect
+        // against the dirty list and paint another — so pin them to each other,
+        // on edges where the two branches of the rule give different answers.
+        //
+        // Sub-pixel edges, chosen so truncation and the coverage rule disagree
+        // on y1 (4.7 truncates to 4, covers from 5) but agree on x1:
+        //   sampled: ceil(2.3-0.5)=2, ceil(4.7-0.5)=5, ceil(6.1-0.5)=6, ceil(9.2-0.5)=9
+        //   bg_image: 2, 4, 6, 9   (plain truncation)
+        let dest_f = [2.3, 4.7, 6.1, 9.2];
+        let tex_f = [10.0, 20.0, 14.0, 24.0];
+
+        let sampled = Quad::new(false, dest_f, tex_f, 4096, 4096);
+        assert_eq!(sampled.dest_rect(), [2, 5, 6, 9]);
+        assert_eq!(Quad::dest_rect_of(false, dest_f), sampled.dest_rect());
+
+        let bg = Quad::new(true, dest_f, tex_f, 4096, 4096);
+        assert_eq!(bg.dest_rect(), [2, 4, 6, 9]);
+        assert_eq!(Quad::dest_rect_of(true, dest_f), bg.dest_rect());
+
+        // …and the two branches really are distinguishable on this input, so a
+        // `dest_rect_of` that ignored `bg_image` could not pass both above.
+        assert_ne!(
+            Quad::dest_rect_of(false, dest_f),
+            Quad::dest_rect_of(true, dest_f)
+        );
     }
 
     #[test]
