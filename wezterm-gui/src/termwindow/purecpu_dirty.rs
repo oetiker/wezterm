@@ -291,11 +291,19 @@ pub enum BellRegion {
 ///
 /// **Delegates** to [`ColorEase::peek_intensity`], the same easing the paint
 /// pass runs through `get_intensity_if_bell_target_ringing`, rather than
-/// restating `elapsed < fade_in + fade_out`.  That expression is not equivalent
-/// at the edges (a zero `fade_out_duration_ms` makes the paint pass's
-/// `completion` a NaN, which compares false and keeps the bell alive), and a
-/// predicate that ends the fade one frame before the renderer does leaves the
-/// last tinted frame on screen forever.
+/// restating `elapsed < fade_in + fade_out`.
+///
+/// The reason is not the edge cases — it is that delegation makes this
+/// predicate **bit-for-bit the renderer's own expression**, so it cannot end
+/// the fade a frame before or after the renderer does, and a predicate that
+/// ended it one frame early would leave the last tinted frame on screen
+/// forever.  The edge behaviour is worth knowing but does not carry the
+/// argument: with `fade_out_duration_ms = 0` and `elapsed > fade_in`,
+/// `completion` is `+inf`, not NaN, and `inf >= 1.0` is true, so the fade ends
+/// immediately (`colorease.rs`).  NaN arises only at the measure-zero instant
+/// `elapsed == fade_in` exactly, where it is `0.0/0.0`.  An earlier version of
+/// this comment claimed the NaN kept the bell alive and had the sign of the
+/// whole edge case backwards; the Task 10 review's M4 run disproved it.
 ///
 /// `peek_intensity` takes `&self`: unlike `intensity_one_shot` it does **not**
 /// clear the start instant when the fade ends.  Clearing it is the paint pass's

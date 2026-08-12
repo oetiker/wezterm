@@ -1323,6 +1323,31 @@ impl TermWindow {
                     lines: &mut [&mut termwiz::surface::Line],
                 ) {
                     for (idx, line) in lines.iter().enumerate() {
+                        // KNOWN MODELLING ASSUMPTION, shared with the dirty-row
+                        // walk below and NOT introduced here: this maps a line
+                        // to a viewport row by STABLE ROW, while the renderer
+                        // places it by SLICE INDEX (`render/pane.rs`, via
+                        // `line_idx + pos.top`).  The two agree only while
+                        // `first_row == self.viewport`.  `WithPaneLines` may
+                        // revise `first_row` upward when the requested range has
+                        // aged out of scrollback, and then the two diverge by
+                        // `first_row - viewport`.
+                        //
+                        // The consequence is a MISPLACED rect, not merely a
+                        // missed one — the blinking cell's own row stays stale
+                        // AND an unrelated row is repainted (with its own
+                        // correct content, so it is ugly, not unsafe).  Task
+                        // 10's report claimed the failure mode was always the
+                        // safe direction; the review refuted that by reading
+                        // both sides, and the claim is corrected here so nobody
+                        // widens this walk while believing it.
+                        //
+                        // Left as-is deliberately: the guard at the top of this
+                        // function forces a full repaint on any viewport change,
+                        // which covers the ordinary scroll route in, and the
+                        // remaining route (a viewport pinned in scrollback that
+                        // output then trims past) is unproven either way.  What
+                        // would settle it is named in the ledger.
                         let row_in_viewport =
                             (first_row + idx as StableRowIndex - self.viewport) as i32;
                         for cell in line.visible_cells() {
