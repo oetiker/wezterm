@@ -12,7 +12,7 @@
 
 Handoff commit: `6311e97`   Date: 2026-08-12   Reason: context budget — Tasks 13 and 16 closed, Task 14 dispatched and IN FLIGHT
 Worktree / branch: `/scratch/oetiker/wezterm` (primary checkout) @ `update-optimization-rebased`
-Trunk at time of writing: `main` @ 05343b3 — **reader: if trunk has moved, §2 is provisionally stale; if trunk now contains this branch's HEAD, this file is a tombstone** (`git merge-base --is-ancestor HEAD main`). `main` here is upstream wezterm and legitimately runs ahead of this branch by ordinary upstream commits; that is NOT a merge signal.
+Trunk at time of writing: **`origin/main`** @ e723cf5 (merge base) — **reader: if trunk has moved, §2 is provisionally stale; if trunk now contains this branch's HEAD, this file is a tombstone** (`git merge-base --is-ancestor HEAD origin/main`). **Do NOT check against local `main`: it has NO common ancestor with this branch** (`git merge-base main HEAD` exits 1), so `--is-ancestor HEAD main` always reports "not merged" and is not a real check. `origin` is upstream wezterm (`wez/wezterm`) and legitimately runs ahead by ordinary upstream commits — that is NOT a merge signal. `fork` (`oetiker/wezterm`) is this fork's own remote and is where a merge would actually show up.
 Sibling worktrees: `/scratch/oetiker/claude-worktrees/wezterm-osc52-upstream` @ `osc52-x11-fix` — the two-commit upstream PR (wezterm/wezterm#8043), unrelated to this pass but **now load-bearing for it** (§4, the L4 story); leave it alone until that PR resolves. This line cannot see worktrees created later; check yourself.
 
 ## 1. Mission
@@ -396,10 +396,15 @@ matter most:
 
 - **Integration state must be re-derived, never inherited.** Whether this branch
   is merged, pushed or superseded is not knowable from this file:
-  `git merge-base --is-ancestor HEAD main`, `git log --oneline HEAD..main`,
+  `git merge-base --is-ancestor HEAD origin/main`, `git log --oneline HEAD..origin/main`,
   `git branch -a --contains HEAD`. If this branch is merged, stop reading and go
-  to the successor's handoff. Note `main` is upstream wezterm and legitimately
-  runs ahead.
+  to the successor's handoff.
+  **Use `origin/main`, not local `main`.** Local `main` has NO common ancestor
+  with this branch — `git merge-base main HEAD` exits 1 — so
+  `--is-ancestor HEAD main` reports "not merged" unconditionally and looks like a
+  passing check while testing nothing. This cost the controller a wrong reading at
+  the end of the pass. `origin` is upstream wezterm and legitimately runs ahead;
+  `fork` (`oetiker/wezterm`) is where a merge of this work would actually appear.
 - **Sibling worktrees / other workstreams may exist that this file cannot name** —
   anything started after the handoff commit is invisible here.
 - **Task 14 was IN FLIGHT when this was written.** §2's task state and the suite
