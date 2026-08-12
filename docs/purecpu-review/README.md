@@ -1,4 +1,10 @@
-# PureCpu vs. the GPU backend: where the software renderer falls short
+# PureCpu vs. the GPU backend: what the software renderer costs you now
+
+*(This page was originally titled "where the software renderer falls short".
+After the fix pass that title would be misleading — the four root causes it was
+built around are repaired, and on a GPU-less box PureCpu now costs one to two
+orders of magnitude less CPU than the renderer it is matched against. The
+remaining shortfalls are stated below and they are small.)*
 
 This is the summary of a review of your fork's two large unreviewed changes on
 top of upstream `e723cf5` — the pure-Rust font stack and the `PureCpu` software
@@ -8,19 +14,32 @@ on a GPU-less machine with `front_end = "PureCpu"`, what do you lose compared to
 
 Scope, by your own decision: this fork only, Linux/X11 only, no
 macOS/Windows/Wayland, no upstreamability concerns, background image and
-transparency out of scope. **This review produces documents, not fixes.**
-Nothing in the tree was changed except these documents and the test harness that
-produced them; Rust source was read-only throughout.
+transparency out of scope.
+
+> **These documents now describe a repaired binary.** The review was written
+> first and produced documents only; a fix pass then followed, and this page has
+> been rewritten to describe what PureCpu does **now** rather than what it did
+> when the review was written. Everything below was re-measured against
+> `wezterm-gui-6311e97` (built from commit `6311e97`), with the pre-fix binary
+> `wezterm-gui-prefix` kept and re-run as the control arm wherever a before/after
+> claim is made. Where a verdict changed, the detail documents state the old
+> number, the new number and the commit.
+>
+> **The four root causes the original version of this page was built around are
+> repaired.** The table below is the post-fix version; the residue is stated
+> under it, plainly, and it is small and differently shaped from what the review
+> found.
 
 Two detail documents sit behind this page, and every claim here is traceable to
 a row or a finding in one of them:
 
-- **[parity-matrix.md](parity-matrix.md)** — 21 feature rows, each with a
-  verdict. **14 carry the command and the numbers behind them; 2 carry a code
+- **[parity-matrix.md](parity-matrix.md)** — 22 feature rows, each with a
+  verdict. **16 carry the command and the numbers behind them; 1 carries a code
   citation and no measurement; 5 are out of scope and carry a reason instead.**
-- **[findings.md](findings.md)** — 18 defects found by reading the fork's own
-  patch, the most severe of them then confirmed by runtime probes against the
-  built binary, ranked, with evidence class stated per finding.
+- **[findings.md](findings.md)** — 19 defects (18 from the review, plus one new
+  cost finding the fix pass's measurement round turned up), ranked, with
+  evidence class and a disposition — the fixing commit, or an explicit statement
+  that it was not fixed — stated per finding.
 - [noise-floor.md](noise-floor.md) — the calibration that makes the pixel
   comparisons trustworthy. Worth reading only if you want to check the method.
 
@@ -34,27 +53,42 @@ draws from a different texture and therefore cannot see some content classes was
 tested and is false (the GPU path has only one texture too; see
 `parity-matrix.md`, "Settled by reading: the single-texture question").
 
-So the gaps are not missing features. They are places where the hand-written
-rasteriser cannot reproduce what the GPU's fixed function does for free — plus
-one place where it never gets asked to draw at all. **Four root causes account
-for every confirmed defect in this review:**
+So the gaps were not missing features. They were places where the hand-written
+rasteriser could not reproduce what the GPU's fixed function does for free — plus
+one place where it never got asked to draw at all. **Four root causes accounted
+for every confirmed defect in the review. All four are now repaired:**
 
-| # | Root cause | Where | What it costs you |
+| # | Root cause | What it cost you | Status now |
 |---|---|---|---|
-| 1 | **The blit is 1:1 and crops; there is no resampler at all** | `purecpu.rs:346` | Anything whose quad is drawn at a size different from its atlas sprite: non-native-size inline images, double-width/height lines, scaled fallback and bitmap glyphs |
-| 2 | **The idle skip returns before the paint pass when no line is dirty** | `termwindow/mod.rs:1436-1447` | Everything time-driven: GIF frames, blinking text, the visual bell, and cursor blink's *app-driven* path (quantised to ~2 paints/cycle) |
-| 3 | **Cursor-blink detection tests the raw, unresolved cursor shape** | `termwindow/mod.rs:1383` vs `render/mod.rs:604-611` | `default_cursor_style = "Blinking*"` — the documented way to turn blinking on — is inert. This is the *config-driven* blink path; root cause 2 governs the app-driven one |
-| 4 | **Dirty tracking is scoped to the active pane, and dirty-rect geometry omits the pane's origin** | `findings.md` I1, I2 | **Panes in a split stop repainting.** Output in any non-active pane never appears; and even the active pane freezes when it is not at the window's top-left |
+| 1 | **The blit was 1:1 and cropped; there was no resampler at all** (`purecpu.rs:346`) | Anything drawn at a size different from its atlas sprite: non-native-size inline images, double-width/height lines, scaled fallback and bitmap glyphs | **Repaired** (`773b845`) — a nearest-neighbour source step, matching the GPU's nearest sampler. Non-native iTerm2 images went from `PAE = 61423` to **bit-identical**; DECDWL/DECDHL from body `PAE = 45232` to **257**, including the double-height bottom band that was previously **not drawn at all** |
+| 2 | **The idle skip returned before the paint pass when no line was dirty** (`termwindow/mod.rs:1436-1447`) | Everything time-driven: GIF frames, blinking text, the visual bell | **Repaired** (`230117c`) — blink, bell and animated images get their own dirty-rect producers. All three moved to `parity`, each against the pre-fix binary as a control in the same session |
+| 3 | **Cursor-blink detection tested the raw, unresolved cursor shape** (`termwindow/mod.rs:1383`) | `default_cursor_style = "Blinking*"` — the documented way to turn blinking on — was inert | **Repaired** (`868159c`) — the shape is resolved through `effective_shape` first. Blink now runs; it is the one row still `degraded`, because PureCpu's blink is a two-level square wave where OpenGL's is an eased sweep |
+| 4 | **Dirty tracking was scoped to the active pane, and dirty-rect geometry omitted the pane's origin** (`findings.md` I1, I2) | **Panes in a split stopped repainting** — the worst defect in the review, and the one you would have hit first | **Repaired** (`bc05562`) — dirty rects are computed for every pane at its own origin |
 
-**Root cause 4 is not in the parity matrix, and if you use splits it is
-probably the one that will bite you first.** No matrix row could have caught it:
-every harness case ran a single full-width pane, where both offsets are zero and
-the active pane is the only one with output. It was found by reading the fork's
-patch and then confirmed with purpose-built probes. Root causes 1-3 are what the
-pixel comparisons measure; 4 is why the pixel comparisons were not the whole job.
+**Root cause 4 was never in the parity matrix, and that is the methodological
+lesson worth keeping.** No matrix row could have caught it: every harness case
+ran a single full-width pane, where both pane offsets are zero and the active
+pane is the only one with output. It was found by reading the patch and then
+confirmed with purpose-built probes. The corpus was blind along an axis nobody
+thought to vary — not along an axis the tool could not see.
 
-The single most severe finding is separate from all four, and it is not a
-rendering issue at all. See below.
+**What is left.** Two rows, and neither is a missing capability:
+
+- **Cursor blink is quantised, not eased.** PureCpu alternates between two
+  levels where OpenGL sweeps continuously. Deliberate in the source (~2 paints
+  per cycle instead of `animation_fps` paints per cycle), and visible if you
+  look for it.
+- **The two backends cap their atlases at different sizes** — PureCpu at 8192,
+  this box's llvmpipe at 16384 — so an image large enough to need
+  `AllowImage::Scale` ends up at *different resolutions* on the two paths
+  (PureCpu at Scale(4), GL at Scale(2)). Every pixel of a 17000x64 sixel strip
+  differs by a uniform few LSB. Both backends are doing the documented thing
+  with different constants; closing it is a memory-budget decision, not a bug
+  fix. The 8192 cap exists because of C1 below.
+
+Plus one **cost** finding, new and unfixed: a static inline image costs
+**0.57 ms of CPU every frame** for as long as anything holds the animation timer
+open — a blinking cursor does, by default. See "The cost result" below.
 
 **A related question the matrix settles in passing: `Software` is not a third
 option.** `FrontEndSelection::Software` is consumed in exactly one place — it
@@ -68,10 +102,58 @@ per-frame animation repaints — which is precisely the list above.
 
 ---
 
+## The cost result, which reframes everything below
+
+**On a GPU-less box, PureCpu is not a degraded fallback on cost. It is one to
+two orders of magnitude cheaper than the renderer it is being matched against.**
+
+The fix pass's measurement round ran four arms per case — the pre-fix binary
+(floor), the fixed binary (subject), the fixed binary forced to repaint every
+frame (ceiling), and the fixed binary on **OpenGL** (the control) — sequentially,
+one window at a time, 30 s samples at `animation_fps = 60`:
+
+| case | floor | subject | ceiling | **OpenGL (llvmpipe)** | subject's position floor→ceiling |
+|---|---|---|---|---|---|
+| idle cursor | 1.03% | **1.43%** | 36.20% | **205.30%** | 1.1% |
+| SGR 5 blinking text | 0.00% | **6.00%** | 37.60% | **175.80%** | 16.0% |
+| static image | 0.90% | **4.83%** | 72.07% | **248.90%** | 5.5% |
+
+llvmpipe costs **176–249% CPU — 30 to 120× the PureCpu subject — in every
+measured case.** (Above 100% because llvmpipe is multi-threaded.) That is the
+strongest argument this front end exists, and it is worth stating before any
+parity gap, because it is the trade the parity gaps are being paid for.
+
+Two more results from the same round, one reassuring and one a correction:
+
+- **The idle skip works.** The idle-cursor subject sits **1.1% of the way from
+  floor to ceiling** — at the floor, which is where it should be.
+- **A prediction was directionally right and quantitatively wrong by about 6×,
+  and only this round could tell the two apart.** A review had predicted the
+  SGR 5 blink case would sit *near the ceiling*, because one blinking cell makes
+  the dirty set non-empty every animation frame and so defeats the idle skip.
+  The mechanism is confirmed — a paint pass does run every frame — but the
+  magnitude is not: the subject is **16% of the way to the ceiling**, 6.3×
+  cheaper than a full repaint, because the dirty-rect machinery still confines
+  the blit to the blinking cells' rows. Note the floor is **0.00%** here: the
+  pre-fix binary spent literally no CPU on blinking text, because it never
+  repainted it. That is the defect, and 6% is what correctness costs.
+
+**Absolute percentages drift with load on this shared machine; the
+floor→subject→ceiling *ratios* are the result, not the percentages.** Re-run a
+whole round rather than comparing a new number against a stored one.
+
+---
+
 ## Start here: the most severe finding
 
-**C1 — the atlas has no size ceiling. A ~1.5 KB sixel escape sequence makes
-PureCpu allocate 4 GiB.** ([findings.md](findings.md), C1)
+**C1 — the atlas had no size ceiling. A ~1.5 KB sixel escape sequence made
+PureCpu allocate 4 GiB.** ([findings.md](findings.md), C1) **Fixed in
+`c5cc8ab`**: the `PureCpu` arm now has a ceiling
+(`PURECPU_MAX_TEXTURE_SIZE = 8192`) and a `bail!`, so it reaches the same
+`AllowImage::Scale` downscale-and-retry the GL arm reaches — confirmed from the
+renderer's own log, which now carries the fallback line where before it carried
+none. The description below is the defect as found; it is kept because the
+mechanism explains both the fix and the atlas-cap asymmetry the fix left behind.
 
 `RenderContext::allocate_texture_atlas`'s `Glium` arm checks the requested side
 against `caps.max_texture_size` and bails, which is what sends the GPU path into
@@ -92,124 +174,139 @@ because the machine has 25 GiB and other people on it.
 e723cf5:wezterm-gui/src/renderstate.rs` has only `Glium` and `WebGpu` arms — there
 is no upstream software arm the missing ceiling could have come from.
 
-Fix direction: give the `PureCpu` arm a ceiling and a `bail!`, so it reaches the
-same `AllowImage::Scale` fallback the `Glium` arm already reaches.
+Fix direction, as recorded at the time and as taken: give the `PureCpu` arm a
+ceiling and a `bail!`, so it reaches the same `AllowImage::Scale` fallback the
+`Glium` arm already reaches.
 
-**And read I1/I2 next, before the matrix.** C1 is the most severe finding, but
-it needs a hostile or freak escape sequence to fire. The split-pane repaint bugs
-(root cause 4 above; `findings.md` I1 and I2) fire during ordinary everyday use
-of a feature you probably use, and they are `Important` for the same reason C1
-is `Critical` — content is silently not drawn. They are written up under "the
-rest of findings.md" below only because that section follows findings.md's own
-severity ladder, not because they are minor.
+**The one thing the fix left behind, stated because it is easy to miss:** the
+ceiling chosen was 8192 (256 MiB at RGBA), and this box's llvmpipe reports
+16384. So the two backends now fall back at *different* points and settle on
+different scale factors for the same oversized image. That asymmetry is what the
+17000x64 sixel strip's residual difference actually is — it is not a rasteriser
+defect, and it is not the double-composite finding M2 it was once conflated
+with. It has its own row in the matrix.
+
+**I1/I2 were the ones to act on, and they are fixed.** C1 is the most severe
+finding, but it needs a hostile or freak escape sequence to fire. The split-pane
+repaint bugs (root cause 4 above; `findings.md` I1 and I2) fired during ordinary
+everyday use — output in a background pane never appearing, and the *active*
+pane freezing when it was not at the window's top-left. Both are fixed in
+`bc05562`.
 
 ---
 
 ## Headline parity result
 
-21 features, graded against **their own named feature** — an animated GIF that
-draws correctly but never advances is `degraded` (the image is delivered, only
-its motion is lost); cursor blink is `missing` because the blink *is* the
+22 features, graded against **their own named feature** — an animated GIF that
+drew correctly but never advanced was `degraded` (the image was delivered, only
+its motion was lost); cursor blink was `missing`, because the blink *is* the
 feature.
 
-| Verdict | Count | |
-|---|---|---|
-| `parity` | 6 | all measured; 4 bit-identical on the element measured, 2 within 1 LSB |
-| `degraded` | 7 | 5 measured, 2 concluded by reading |
-| `missing` | 3 | all measured |
-| `known gap` | 5 | out of scope, not measured |
+| Verdict | Before the fix pass | **Now** | |
+|---|---|---|---|
+| `parity` | 6 | **15** | 16 measured, 1 by reading |
+| `degraded` | 7 | **2** | cursor blink (quantised) and the atlas-cap asymmetry |
+| `missing` | 3 | **0** | — |
+| `known gap` | 5 | 5 | out of scope, never measured |
 
-**What works — in a single pane.** Ordinary terminal text is *rendered* soundly:
-monochrome text is within one 8-bit step everywhere, with *zero* difference on
-background pixels (body `PAE = 257`, body `AE = 0` from 0.5% fuzz up). Read that
-as a statement about the rasteriser, not about daily use: **every row in this
-table was measured on a single full-width pane, and in a split the same text can
-simply stop updating** (root cause 4 / I1 / I2). Correct pixels and delivered
-pixels are different claims, and the matrix only certifies the first. Static cursors in all three shapes (block, bar, underline), window buttons,
+(21 rows before, 22 now: the atlas-cap asymmetry was added as a row of its own,
+because it is what a residual previously attributed to two other causes actually
+is.)
+
+**Nine rows changed verdict**: sixel, iTerm2, animated GIF, the fancy tab bar,
+DECDWL/DECDHL, blinking text, the visual bell and subpixel-antialiased text all
+reached `parity`; cursor blink went `missing` → `degraded`.
+
+**The OpenGL path is bit-identical across the whole pass.** Captured from the
+pre-fix and post-fix binaries sequentially — never concurrently, because focus
+state is a confound in any two-window comparison — on the same corpus with the
+same generated config: `AE = 0, PAE = 0` on plain text, window chrome and
+inline images alike, with matching non-zero ink on both sides so it is not a
+null comparison. No PureCpu fix leaked into the GPU path. That was the single
+most important invariant of the fix pass, because several fixes touched code the
+two backends share.
+
+**What works.** Ordinary terminal text is rendered soundly: monochrome text is
+within one 8-bit step everywhere, with *zero* difference on background pixels
+(body `PAE = 257`, body `AE = 0` from 0.5% fuzz up). **The caveat that used to
+follow this sentence is gone**: it read "in a single pane — in a split the same
+text can simply stop updating", and that was root cause 4, now fixed. Correct
+pixels and delivered pixels are still different claims, but they no longer come
+apart in a split.
+
+Static cursors in all three shapes (block, bar, underline), window buttons,
 rounded corners and split dividers are **bit-identical** on a crop tight to the
 element (`AE = 0`, `PAE = 0`) — no threshold question to answer, nothing differs.
-Inline images at their **native** size are bit-identical too. The retro tab bar
-is `parity` within 1 LSB rather than bit-identical, and it is the one row graded
-on a threshold borrowed from the body noise floor; the matrix says so in its
-Evidence cell rather than letting it read as equivalent to the others.
+Inline images are bit-identical at their native size **and now at non-native
+sizes too**. The retro tab bar is `parity` within 1 LSB rather than
+bit-identical, and it is graded on a threshold borrowed from the body noise
+floor; the matrix says so in its Evidence cell rather than letting it read as
+equivalent to the others. **The fancy tab bar has joined it**: its 1 px glyph
+shift is fixed, and the strip now measures `PAE = 257` and clears at 1% fuzz.
 
-**What is degraded.**
+**What changed, and what is left.**
 
-- **Inline images**, both protocols, but the two rows were measured on different
-  content and the evidence does not transfer between them:
-  - **iTerm2 OSC 1337 at a non-native size** is the severe one, and it is
-    measured directly. Requested at 200x132 px, and again at 20x4 cells, PureCpu
-    draws a *dotted grid of tiny cropped fragments* — one top-left tile per
-    covered cell, background showing through the rest of every cell — where
-    OpenGL draws a solid stretched block. Over a crop covering both non-native
-    blocks: `AE = 39360`, `PAE = 61423` (0.937, near-maximal). Reachable from an
-    ordinary escape sequence.
-  - **Sixel** is `degraded` from **two independent mechanisms**, neither of which
-    is the dotted grid above — no sixel was ever captured at a non-native
-    requested size, so that failure mode is *predicted* for sixel via the shared
-    `populate_image_quad` path, not shown. What *was* measured: (a) at 300x300,
-    still requested at its native size, source-stepping rounding displaces the
-    gradient band boundary by one scan row — `AE = 3300`, `PAE = 1542` (6 LSB),
-    which fails the gate; and (b) at 17000x64, once the atlas must grow past
-    `GL_MAX_TEXTURE_SIZE`, the GPU path downscales via `AllowImage::Scale(2)` and
-    PureCpu does not, so **every pixel in the visible strip differs** (`AE =
-    64000` of 64000) by a uniform ~2-3/255.
-  - Both protocols are bit-identical at native size (`AE = 0`, `PAE = 0`).
-- **Animated GIFs** never advance a frame on an otherwise-idle screen. Over 12
-  samples across 6 s, GL cycled both frames; PureCpu reported the same frame all
-  12 times.
-- **The fancy tab bar** — two distinct classes, neither absorbed into a
-  threshold: 37 columns are a bit-exact 1 px left shift, and 99 columns are a
-  larger (~77/255) non-integer positioning divergence that shifting does not fix.
-  The retro tab bar reproduces neither, which is what pins it to the `box_model`
-  glyph-quad path rather than to text rendering generally.
-- **Double-width and double-height lines (DECDWL/DECDHL)** — measured in a
-  Task 8 addendum, and the result is stark. OpenGL stretches each glyph to the
-  doubled cell; PureCpu draws it at **base size, spaced at the doubled pitch**,
-  so the line reads as small letters with gaps. Body `PAE = 45232` (176 LSB,
-  failing the gate by two orders of magnitude) against **`PAE = 257` for
-  ordinary single-width lines in the very same capture**. Worse, the DECDHL
-  **bottom half is not drawn at all** — the top line's quad is supposed to cover
-  both rows, and the 1:1 blit clips it away (over y=99-110, OpenGL lays down 1824
-  ink px and PureCpu exactly 0). `degraded` rather than `missing`, and the blank
-  band does not change that: a DECDHL pair's two lines are **required to hold the
-  same content** (`screen_line.rs:32`) — they are one logical line drawn across
-  two rows — so the empty band withholds nothing the row above is not already
-  showing. The text is all there, once, at the wrong size. That is what
-  distinguishes this from I1/I2, where a blank region means output was genuinely
-  lost and appears nowhere. The bottom-half band alone is a scoped `missing`.
-- **Scaled fallback and bitmap glyphs** (including colour emoji) — same
-  `purecpu.rs:346-347` mechanism, now demonstrated by the row above, but
-  deliberately not measured: it needs an installed font that actually yields
-  `glyph.scale != 1`, and a capture that used no such font would return a null
-  result indistinguishable from parity.
-- **Subpixel-antialiased text** (`freetype_render_target = "HorizontalLcd"`) —
-  the mildest entry here, and the README previously made it sound like the
-  worst. **PureCpu falls back to ordinary grayscale antialiasing**: the LCD path
-  already stores a max-of-channels alpha alongside the per-channel coverage
-  (`skrifa_rasterizer.rs:687,701`), which PureCpu's glyph branch uses
-  (`purecpu.rs:412-419`). The glyph is entirely present, correctly positioned
-  and legible. What you lose is the subpixel horizontal resolution and the
-  colour fringing — not the text.
+Every entry that used to sit under "degraded" or "missing" here has moved, with
+one exception. Rather than list nine repairs, here is the shape of the change
+and then the residue.
 
-**What is missing.**
+- **Inline images** — both protocols, at every size measured. The severe case
+  was iTerm2 at a non-native size: PureCpu drew a *dotted grid of tiny cropped
+  fragments*, one top-left tile per covered cell, where OpenGL drew a solid
+  stretched block (`AE = 39360`, `PAE = 61423`, near-maximal). It is now
+  **bit-identical**, and so is the 300x300 sixel whose gradient band boundary
+  used to land one scan row off. Checked against a null result, not assumed:
+  both backends' crops develop as sRGB with matching non-zero standard
+  deviation, so both really drew the image.
+- **Animated GIFs** now advance frames on an otherwise-idle screen; both frames
+  appear in a sampling window where PureCpu previously reported one frame for
+  all 12 samples.
+- **The fancy tab bar** — both classes are gone: the 37 columns of bit-exact
+  1 px shift, and the 99 columns of larger (~77/255) non-integer divergence
+  beside them. The shift test now returns `AE = 0` at the *unshifted*
+  alignment, which is the sharpest available form of "the shift is gone".
+- **Double-width and double-height lines** — the starkest repair. OpenGL
+  stretches each glyph to the doubled cell; PureCpu used to draw it at base size
+  spaced at the doubled pitch, so a double line read as small letters with gaps
+  (body `PAE = 45232` against `257` for ordinary lines in the same capture), and
+  the DECDHL **bottom half was not drawn at all** — 1824 OpenGL ink pixels
+  against exactly **0**. Now: body `PAE = 257`, and the bottom band lays down
+  **1820** ink pixels against OpenGL's 1824. Ink-count ratios went 2.01, 2.10
+  and 16.9 → **1.00** across the three bands.
+- **Blinking text (SGR 5)** was frozen *invisible* — deterministically, at the
+  eased fade's zero-intensity end, so the word was simply blank space. It now
+  varies across the same band as the reference in the same run.
+- **The visual bell** never visibly rang; it now flashes and fades through the
+  same levels as OpenGL.
+- **Subpixel-antialiased text** (`freetype_render_target = "HorizontalLcd"`)
+  went further than a repair: it was the review's better-founded *by-reading*
+  row, and it is now **measured**, because the same commit that implemented
+  per-channel subpixel antialiasing also taught the harness the config knob it
+  needed. Pre-fix body `PAE = 29041` (113 LSB, the grayscale fallback) against
+  post-fix `257`.
 
-- **Cursor blink** — but read the scope, because it is two different answers.
-  Config-driven blink (`default_cursor_style = "BlinkingBlock"`, the documented
-  way) **never starts at all**: sampled 16 times over 6.4 s, PureCpu returned
-  `gray(224)` every single time while GL swept the full 17-222 range. That is
-  root cause 3. Separately, an application that drives the shape itself with
-  DECSCUSR *does* blink — but that path is `degraded`, not fine: quantised to
-  ~2 paints/cycle by design, dwelling on two plateaux with a floor of
-  `gray(159)`, where GL sweeps continuously to within a few LSB of background.
-- **Blinking text (SGR 5)** — frozen, and frozen *invisible*, deterministically:
-  the eased intensity starts at 0 (`fg = bg`) on the one paint that happens when
-  the window settles, and the idle skip suppresses every paint after it, forever.
-  The word is simply blank space. There is no rescheduling mechanism for text
-  blink at all, so this is a structural absence rather than a resolution gap.
-- **The visual bell** never visibly rings. The `Alert::Bell` handler invalidates
-  the window but pushes no dirty rect, so the idle skip still takes the early
-  exit and the background-mix computation never runs.
+**The residue, in full:**
+
+- **Cursor blink is `degraded`.** Config-driven blink used to be inert — the
+  documented `default_cursor_style = "BlinkingBlock"` never started at all — and
+  it now runs. But PureCpu blinks as a **two-level square wave** where OpenGL
+  eases continuously, which is deliberate in the source (~2 paints per cycle
+  rather than `animation_fps` paints per cycle). Present, visibly coarser.
+- **The atlas-cap asymmetry is `degraded`**, and it is not really a rendering
+  defect: PureCpu caps its atlas at 8192 and this box's llvmpipe at 16384, so an
+  image big enough to need `AllowImage::Scale` is stored at a quarter resolution
+  on one path and a half on the other. Every pixel of the 17000x64 test strip
+  differs, by a uniform few LSB. Confirmed from both backends' own logs in the
+  same run rather than inferred.
+- **Scaled fallback and bitmap glyphs** (including colour emoji) is the one
+  `parity` verdict resting on reading alone. Its old `degraded` rested on the
+  1:1 crop, which no longer exists — the DECDWL row demonstrates the same code
+  path with numbers — but the precondition was never established: some installed
+  font must actually yield `glyph.scale != 1`, and a capture using no such font
+  would return a null result indistinguishable from parity. Read it as an
+  untested prediction that now points at parity, not as a result.
+- **One new, unfixed cost finding**: a static inline image costs 0.57 ms of CPU
+  per frame (`findings.md` N1).
 
 ---
 
@@ -218,24 +315,21 @@ Evidence cell rather than letting it read as equivalent to the others.
 The review distinguishes these deliberately, and this page does not flatten them:
 
 - **Measured** — a command was run against the built binary and the numbers are
-  in the Evidence cell. **14 of 21 rows**, including every `parity`, every
-  `missing`, and (as of the Task 8 addendum) double-width/height lines. Five
-  state "reproduced from a clean shell" in the matrix — the four
-  cursor/animation rows plus text glyphs — and the DECDWL addendum was run twice
-  from clean shells with identical numbers; several others were re-run
-  independently by a second reviewer during the review rounds.
+  in the Evidence cell. **16 of 22 rows**, including every `parity` bar one and
+  both `degraded`s. Every row was re-run against the post-fix binary in the
+  verification pass, and every row whose verdict *changed* was graded with the
+  **pre-fix binary as a control in the same session** — which is what makes a
+  negative result mean anything. In several cases the control reproduced the
+  documented pre-fix defect exactly (blinking text flat at `gray(16)`, cursor
+  blink flat at `gray(224)`, subpixel AA at body `PAE = 29041`), which proves
+  the instrument was working on the day the subject came back clean.
 - **By reading** — the code path is unambiguous but no runtime trigger was
-  demonstrated. **2 rows**, and they are not equally exposed:
-  - *Subpixel-antialiased text* has **no runtime precondition left to fail**.
-    The chain is traceable end to end (`HorizontalLcd` → `use_lcd_subpixel` →
-    `subpixel_mask_to_rgba` → `has_color = false` → PureCpu's glyph branch). If
-    you set the option, the divergence follows. This is the better-founded of
-    the two, and its consequence is mild — grayscale AA, see above.
-  - *Scaled fallback / bitmap glyphs* shares its mechanism with the DECDWL row,
-    which is now measured, but its precondition — that some installed font
-    yields `glyph.scale != 1` — is untested and font-dependent. It was left
-    unmeasured on purpose, because a null result would be indistinguishable
-    from parity.
+  demonstrated. **1 row**: *scaled fallback / bitmap glyphs*. Its precondition —
+  that some installed font yields `glyph.scale != 1` — is untested and
+  font-dependent, and it was left unmeasured on purpose, because a null result
+  there would be indistinguishable from parity. (*Subpixel-antialiased text* was
+  the other by-reading row; it is now measured, because the fix pass added the
+  config knob the harness had been missing.)
 - In `findings.md`, the same distinction is enforced by a written demotion rule:
   a defect whose trigger was not reproduced is recorded one class below its
   defect class. That is why M3/M4/M5 sit at Medium.
@@ -262,34 +356,39 @@ predictions.
 severity order inside Medium. The order below is the severity ladder the
 document itself defines, applied consistently.
 
-**Important — content silently not drawn in an ordinary configuration. This is
-root cause 4 from the summary table, and if you use splits it is the part of
-this review to act on first. Neither finding was reachable by the parity matrix
-at all**, for a reason worth internalising: every case in the harness put the
-content under test in a
-**single full-width pane**, where `pos.top` and `pos.left` are both zero and the
-active pane is the only one with live output. The corpus was blind along an axis
-nobody thought to vary — not along an axis the tool could not see:
+> **All of this section's findings are dispositioned in `findings.md`**, each
+> with the commit that addressed it. The severity ordering below is kept because
+> it is how you should read the document, and the defect descriptions are kept
+> because they explain what the fixes had to do.
 
-- **I1** — dirty tracking consults only the **active** pane, so output in any
-  other pane of a split is never repainted until something forces a full repaint.
-  Measured.
-- **I2** — dirty-rect geometry omits the pane's `pos.top`/`pos.left`, so even the
-  *active* pane freezes when it is not at the window's top-left. Measured on both
-  axes.
+**Important — content silently not drawn in an ordinary configuration. This was
+root cause 4 from the summary table, and it was the part of this review to act
+on first. Both are fixed in `bc05562`. Neither finding was reachable by the
+parity matrix at all**, for a reason worth internalising: every case in the
+harness put the content under test in a **single full-width pane**, where
+`pos.top` and `pos.left` are both zero and the active pane is the only one with
+live output. The corpus was blind along an axis nobody thought to vary — not
+along an axis the tool could not see:
 
-If you use splits, I1 and I2 are probably what you would notice first in daily
-use — ahead of anything in the parity matrix.
+- **I1** — dirty tracking consulted only the **active** pane, so output in any
+  other pane of a split was never repainted until something forced a full
+  repaint. Measured.
+- **I2** — dirty-rect geometry omitted the pane's `pos.top`/`pos.left`, so even
+  the *active* pane froze when it was not at the window's top-left. Measured on
+  both axes.
 
-**I3, I4, I5** are root causes 2, 3 and 1 stated as findings, with the
-matrix rows they explain cross-referenced.
+**I3, I4, I5** are root causes 2, 3 and 1 stated as findings, with the matrix
+rows they explain cross-referenced. All three are fixed (`230117c`, `868159c`,
+`773b845`); I4's row is `degraded` rather than `parity` because the blink is now
+present but quantised.
 
 **Medium, but read these three first within their class** — they are
 defect-class Critical (process aborts reachable from font data), recorded Medium
 only because no crafted font was built to fire them (`fontTools` was not
-available on the machine). They rank below I1/I2 under the document's own
-demotion rule precisely because their triggers were not reproduced, which is a
-statement about the evidence, not about how bad they would be:
+available on the machine). **Their division sites were guarded in `b10c3a5`, and
+that is deliberately not called "fixed":** no font reaching any of them was ever
+built, so nothing demonstrates a trigger now passing that used to abort. The
+guard is what changed; the evidence class did not.
 
 - **M3** — unconditional panic in the empty-path fallback of the COLR glyph
   rasteriser. The fallback is unfinishable and panics whenever reached; tiny-skia
@@ -299,19 +398,33 @@ statement about the evidence, not about how bad they would be:
   palettes.
 - **M5** — `unitsPerEm = 0` divides by zero in both the shaper and the rasteriser.
 
-**M1** explains the tab bar's bit-exact 1 px shift: destination coordinates are
-truncated (`as i32`) instead of rounded. Fix direction is one call:
-`(tl.position[0] + half_w).round() as i32`. **M2** documents that overlapping
-dirty rects composite the same pixel twice; the model is strongly supported
-(across all 87 label-row pixels differing by more than 1 LSB, the double-composite
-prediction lands within 1.91 LSB, mean residual -0.05) but its attribution to a
-specific rect overlap was **tested twice and eliminated** — the document says so
-rather than dressing it up.
+**M1** explained the tab bar's bit-exact 1 px shift: destination coordinates were
+truncated (`as i32`) instead of rounded. Fixed in `773b845` by exactly the
+one-call fix direction it recorded — and the shift test now returns `AE = 0` at
+the *unshifted* alignment. **M2** documented that overlapping dirty rects
+composite the same pixel twice; it is **closed by re-measurement with no code
+change**, and the way it was closed is the better lesson: in one experiment the
+pre-fix control reproduced M2's signature to the digit (`n = 87`,
+`max|resid| = 1.91`, `mean = -0.05`) while the subject returned `n = 0`. The
+control is what makes the negative mean anything. Which commit removed it was
+**not** determined and was not guessed.
 
-**M6, M7, L1-L5** are latent edge cases, performance and hygiene. `findings.md`
-also carries a **"Considered and rejected"** section of 7 non-findings, recorded
-so nobody re-derives them — including the triple-buffer misreading and several
-apparent panic sites that are in fact guarded.
+**M6, M7, L1-L5** are latent edge cases, performance and hygiene, and three of
+them are worth knowing about:
+
+- **L1** (per-band GC create/destroy) had its central claim **corrected**: those
+  are no-reply X requests queued with the `PutImage` they bracket, not round
+  trips, so there was no latency to save. The optimisation was built anyway,
+  **measured null on both the client and the X-server side**, and reverted.
+- **L2** (per-glyph `HintingInstance`) is fixed by a size-keyed cache
+  (`bce58ea`), with a test asserting the cache is invisible in the output.
+- **L5** is **closed as a non-defect**: it claimed removed font backends are
+  "silently substituted", and all three sites in fact warn, naming both what was
+  asked for and what was used.
+
+`findings.md` also carries a **"Considered and rejected"** section of 7
+non-findings, recorded so nobody re-derives them — including the triple-buffer
+misreading and several apparent panic sites that are in fact guarded.
 
 ---
 
@@ -322,11 +435,15 @@ Stated plainly, because a clean-looking matrix is misleading without it.
 **Out of scope by your decision, never measured** — 5 `known gap` rows:
 `window_background_image`, `window_background_opacity`,
 `text_background_opacity`, background blur / HSB tint, and the window background
-image sampling filter. The last of these *was* read (the GPU samples background
-image quads bilinearly, PureCpu does the same nearest 1:1 crop as every other
-quad, so the same crop-instead-of-scale defect is predicted) but no capture was
-taken, so treat it as an untested prediction. The other four were not looked at
-at all.
+image sampling filter. The last of these *was* read, and the reading has been
+updated rather than left stale: the GPU samples background-image quads
+*bilinearly*, and while the rasteriser did gain a resampler in the fix pass,
+`IS_BG_IMAGE` was **deliberately left on the old crop path** because background
+images are out of scope. So the predicted divergence is now two deep — PureCpu
+crops where the GPU rescales, and the GPU's rescale is bilinear where PureCpu's
+new sampler is nearest — and it is a deliberate scope boundary rather than an
+oversight. No capture was ever taken; treat it as an untested prediction. The
+other four were not looked at at all.
 
 **Platforms.** Linux/X11 only. macOS, Windows and Wayland were not examined in
 any way.
@@ -347,7 +464,11 @@ A fourth item belongs beside these but is a different thing and should not be
 counted with them: the DECSCUSR cursor-blink sub-finding **was** measured (30
 samples at 0.1 s), just with a hand-written config, because `gen-config.sh`
 correctly refuses the blink-rate/cursor-style combination that probe requires.
-Its regeneration block is fenced in the matrix and does run.
+Its regeneration block is fenced in the matrix and does run. **It was not
+re-run after the fixes**, so the app-driven blink path's quantisation
+sub-finding still rests on its original measurement; the config-driven path,
+which is the common case and the one that was `missing`, was re-measured with a
+control.
 
 **Method limits.** Three worth knowing:
 
@@ -357,6 +478,15 @@ Its regeneration block is fenced in the matrix and does run.
   the GIF row all use. With one pane, `pos.top`/`pos.left` are zero and the
   active pane is the only one producing output, so both defects are identically
   silent. Any defect that needs a split would have been missed the same way.
+- **The sampling interval is part of the instrument, and it can silently disarm
+  the animation method.** Those rows ask "does the sampled value change over
+  time", which presupposes the *reference* arm visibly changes — and it does not
+  at every interval. Re-grading cursor blink post-fix, the OpenGL arm read
+  essentially flat at 0.4 s, 0.1 s and 0.2 s, because each `import` costs a
+  variable fraction of the interval and the samples keep landing on the same
+  phase; 0.15 s resolved both arms cleanly. A flat subject against a flat
+  reference proves nothing and looks exactly like the defect. Check the
+  reference arm before reading a flat sequence as a finding.
 - **Time-driven rows cannot be diffed across backends at all**: each backend's
   blink/bell/animation phase runs off its own wall clock, so a cross-backend
   pixel diff of two captures "at the same moment" would measure phase offset,
@@ -369,19 +499,53 @@ Its regeneration block is fenced in the matrix and does run.
   explicit per-region pixel evidence, never on a threshold. `FUZZ` was never
   raised to make a case pass.
 
-**The existing test suite does not help here.** `cargo test -p wezterm-gui -p
-wezterm-font` passes (29 + 1), but `purecpu.rs`'s own unit tests do not touch the
-rasterising path at all — so a green suite says nothing about any of the above.
+**The test suite now says something, where it used to say nothing.** It passes
+at **127** (`wezterm-gui`) **+ 18** (`wezterm-font`), against 29 + 1 at review
+time. The number is not the point — the original complaint was the sharper one
+that a green suite was *uninformative*, because a `panic!` planted inside the
+blit loop left it green. That is closed: the loop now has a framebuffer harness,
+and mutation-testing a statement inside it **kills 7 tests, all at the mutated
+statement**, with a discriminating negative that correctly does not die (a test
+that returns before reaching the mutated loop). Breaking the loop turns the
+suite red.
+
+What the suite still does **not** cover, stated so the number is not read as
+more than it is: nothing in `call_draw_purecpu` itself; and inside the blit
+loop, the whole `subpixel_aa` arm, `apply_hsv`, per-vertex HSV, `mix_value != 0`
+and the degenerate-quad `continue`. Nor does any test execute the animation
+plumbing in `mod.rs` — `AnimatedCellScan` and `image_next_frame_due` are
+exercised only by the sampled animation rows, which are graded on a colour
+sequence rather than on an assertion.
 
 ---
 
 ## Re-running the harness
 
-Everything lives in [`tools/purecpu-parity/`](../../tools/purecpu-parity/). The
-binary under test is `/scratch/oetiker/wezterm-builds/wezterm-gui-rebased`
-(override with `WEZTERM_BIN`). `out/` is gitignored — every PNG referenced in
-the detail documents is a run artifact, regenerated by the commands printed
-beside the numbers they produced.
+Everything lives in [`tools/purecpu-parity/`](../../tools/purecpu-parity/).
+`lib.sh`'s default `WEZTERM_BIN` is the pre-fix
+`/scratch/oetiker/wezterm-builds/wezterm-gui-rebased`, so **every command below
+needs `WEZTERM_BIN` pointed at the binary you actually mean** — the post-fix
+numbers in these documents come from
+`/scratch/oetiker/wezterm-builds/wezterm-gui-6311e97`. Keeping the pre-fix
+binaries is deliberate: `wezterm-gui-prefix` is the control arm of every
+before/after comparison here and should not be deleted or overwritten. `out/` is
+gitignored — every PNG referenced in the detail documents is a run artifact,
+regenerated by the commands printed beside the numbers they produced.
+
+```bash
+export WEZTERM_BIN=/scratch/oetiker/wezterm-builds/wezterm-gui-6311e97
+```
+
+**The CPU-cost round** is a separate driver, because it measures time rather
+than pixels:
+
+```bash
+SUBJECT_BIN=$WEZTERM_BIN ./measure-round.sh    # FLOOR_BIN defaults to wezterm-gui-prefix
+```
+
+It runs four arms (floor / subject / ceiling / OpenGL) across three cases,
+sequentially, one window at a time. Read the ratios, not the absolute
+percentages — they drift with load on this shared machine.
 
 **Prerequisite.** `lib.sh` requires `PARITY_XAUTH`, and `PARITY_DISPLAY` if you
 are not on `:20`. It fails closed via `${VAR:?}`, so a missing value can only

@@ -10,6 +10,26 @@ Binary exercised for the probes below:
 modified: every probe is a corpus/config written outside the tree and run
 against that binary. Probes are recorded so they can be re-run.
 
+> **Disposition after the fix pass (Task 14).** This document was written as a
+> review, before any fix existed, and its finding texts are left as they were
+> written — they describe the defect as found. What is added per finding is a
+> **Disposition** line naming the commit that addressed it, so the document does
+> not read as current while describing a binary that no longer exists. The
+> post-fix binary is `wezterm-gui-6311e97` (md5
+> `3c3f5bef1b91c1f08a018c2da9e054d8`); the pre-fix reference kept as the control
+> arm of every before/after comparison is `wezterm-gui-prefix`.
+>
+> **Three dispositions are deliberately not the word "fixed".** M3, M4 and M5
+> are **panic sites guarded; trigger never reproduced** — no font reaching any
+> of them was ever built, so nothing demonstrates a trigger now passing that
+> used to abort. The guard is what changed; the evidence class did not.
+>
+> Ledger of dispositions: C1 `c5cc8ab` · I1/I2 `bc05562` · I3 `230117c` ·
+> I4 `868159c` · I5/M1 `773b845` · M6/M7 `f78b501` · M3/M4/M5 `b10c3a5`
+> (guarded) · M2 closed by re-measurement, no code change · L1 built, measured
+> null, reverted · L2 `bce58ea` · L3 `230117c` · L4 obsolete (upstream
+> `ef7b636`) · L5 closed on inspection, non-defect · N1 (new, below) unfixed.
+
 Severity vocabulary:
 
 - **Critical** — denial of service, memory exhaustion, or process abort
@@ -54,6 +74,8 @@ review produces documents only.
 ## Critical
 
 ### C1 — PureCpu grows the glyph atlas with no size ceiling; one ~1.5 KB escape sequence allocates 4 GiB
+
+**Disposition: fixed in `c5cc8ab`.** The `PureCpu` arm was given a ceiling (`PURECPU_MAX_TEXTURE_SIZE = 8192`, `renderstate.rs:35`) and a `bail!`, so it now reaches the same `AllowImage::Scale` downscale-and-retry the `Glium` arm reaches — exactly the fix direction below. Confirmed in Task 14 from the renderer's own log: PureCpu now emits `Cannot use a texture of size 32768 as it is larger than the max 8192 supported by the PureCpu renderer; will retry render with Scale(2)`, where before its log carried no texture-space line at all. **The 8192 cap is half the 16384 this box's llvmpipe reports, and that asymmetry has its own consequence** — the two backends settle on different scale factors for the same oversized image. It is now a row in `parity-matrix.md` rather than an unexplained residual.
 
 `wezterm-gui/src/renderstate.rs:78-118`,
 `window/src/bitmaps/atlas.rs:113-119`, `window/src/bitmaps/atlas.rs:30-49`
@@ -180,6 +202,8 @@ OpenGL  peak RSS: 3363024 kB = 3284 MiB
 
 ### I1 — Dirty-rect tracking only ever consults the *active* pane, so output in any other pane of a split is not repainted until something else forces a full repaint
 
+**Disposition: fixed in `bc05562`** (with I2 — dirty rects are computed for every pane at its own origin).
+
 `wezterm-gui/src/termwindow/mod.rs:1275-1330`, early exit at
 `mod.rs:1436-1447`
 
@@ -227,6 +251,8 @@ another is the ordinary reason to use splits.
 Reproduce: driver listed under I2.
 
 ### I2 — Dirty-rect geometry ignores the pane's position in the split grid, so even the *active* pane is not repainted when it is not at the window's top-left
+
+**Disposition: fixed in `bc05562`** (with I1).
 
 `wezterm-gui/src/termwindow/mod.rs:1305` (`content_top`, the row origin) and
 `mod.rs:1321` (row -> y),
@@ -323,6 +349,8 @@ probe that silently tests nothing. Use `'Bottom'`.
 
 ### I3 — The idle skip suppresses every time-driven repaint, and nothing else marks that content dirty
 
+**Disposition: fixed in `230117c`.** Blink, bell and animated images now have their own dirty-rect producers, so the idle skip no longer suppresses them. Re-measured in Task 14: the animated-GIF, blinking-text and visual-bell rows of `parity-matrix.md` all moved from `degraded`/`missing` to `parity`, each graded against the pre-fix binary as a control in the same session.
+
 `wezterm-gui/src/termwindow/mod.rs:1436-1447`; bell handler at
 `mod.rs:1574-1594`
 
@@ -363,6 +391,8 @@ producers, or consult `has_animation` before taking the early exit.
 
 ### I4 — Cursor-blink detection tests the *raw* pane cursor shape, so the documented way to enable blinking is inert
 
+**Disposition: fixed in `868159c`.** The shape is resolved through `effective_shape` before `is_blinking()` is tested. Re-measured in Task 14: config-driven blink now runs, and the row moved `missing` -> `degraded` — PureCpu blinks as a two-level square wave (`gray(161)` / `gray(224)`) where OpenGL eases, so it is no longer absent but not yet equivalent.
+
 `wezterm-gui/src/termwindow/mod.rs:1383`
 
 **Defect.** `cursor.shape.is_blinking()` is evaluated on the shape returned
@@ -390,6 +420,8 @@ blink.
 `is_blinking()`, as `render/mod.rs:604-611` does.
 
 ### I5 — Textured quads are blitted 1:1 and cropped; the rasteriser contains no resampler
+
+**Disposition: fixed in `773b845`** (with M1). The rasteriser gained a nearest-neighbour source step, which is the fix direction stated below. Re-measured in Task 14: every failure scenario listed here that was measurable now reports bit-identical — the non-native iTerm2 image (PAE 61423 -> 0), the 300x300 sixel (PAE 1542 -> 0) and DECDWL/DECDHL (body PAE 45232 -> 257, with the previously-blank DECDHL bottom band going from 0 ink pixels to 1820 against OpenGL's 1824). The `AllowImage::Scale` scenario is **not** closed by this commit and never was its target; it is the atlas-cap asymmetry, now its own matrix row. `IS_BG_IMAGE` was deliberately left on the old crop path (out of scope).
 
 `wezterm-gui/src/termwindow/render/purecpu.rs:344-360`
 
@@ -446,6 +478,8 @@ no gain. The README's ordering reflects severity, not id.
 
 ### M1 — Destination coordinates are truncated rather than rounded, displacing sub-pixel-positioned quads one pixel left/up
 
+**Disposition: fixed in `773b845`** (with I5) — destination coordinates are rounded rather than truncated. Re-measured in Task 14 with the same shift test that found it: over the tab-strip crop that carried the worst of it, the *unshifted* alignment now wins (`dx=0` AE=172 against `dx=1` AE=1023), where before `dx=1` was the bit-exact match. **The second, explicitly-unverified class in this finding — the 99 columns of ~77/255 non-integer divergence — went away with it**, which is consistent with the nearest-sampling-at-a-fractional-offset explanation this finding declined to assert, but does not prove it: the two changes landed in one commit and were not separated.
+
 `wezterm-gui/src/termwindow/render/purecpu.rs:257-264`
 
 **Defect.**
@@ -486,6 +520,8 @@ positions for the inactive tabs.
 **Fix direction.** Round: `(tl.position[0] + half_w).round() as i32`.
 
 ### M2 — Overlapping dirty rects composite the same pixel more than once
+
+**Disposition: closed by re-measurement, with no code change** (Task 11). The plan forbade fixing M2 before re-measuring, and the re-measurement found nothing left to fix. **The control is what makes the negative mean anything**: in one experiment, identical corpus, config and display, the pre-fix binary reproduced this finding's signature *to the digit* — `n=87, max|resid|=1.91, mean=-0.05`, with the same cell-0-and-nowhere-else per-column shape — while the subject returned **`n=0`**, not one label-row pixel above the 1 LSB floor. So the instrument was proven on the box that day and the defect was gone from the subject. Body PAE fell 13107 -> 1285. **The 1285 residue is not M2**: it is the PureCpu/OpenGL atlas-cap asymmetry, which now has its own matrix row. Which commit removed the double composite was **not** determined and was not guessed; the experiment that would settle it (build at `b7936ac` and re-run the same control/subject pair) is named in the ledger rather than dropped.
 
 `wezterm-gui/src/termwindow/render/purecpu.rs:77-99` (`collect_clip_rects`),
 `purecpu.rs:353-475` (blit loop)
@@ -619,6 +655,8 @@ or clip each quad against the union rather than blending once per rect.
 
 ### M3 — Unconditional panic in the empty-path fallback of the COLR glyph rasteriser
 
+**Disposition: panic site guarded in `b10c3a5`; trigger never reproduced.** Deliberately not called fixed. No font reaching this path was ever built — the tooling gap this finding records (`fontTools` unavailable) was never closed — so nothing demonstrates a trigger now passing that used to abort. The guard is what changed; the evidence class below has not.
+
 `wezterm-font/src/rasterizer/paint_ops.rs:329-334`
 
 **Defect class Critical, recorded Medium** under the demotion rule above: a
@@ -682,6 +720,8 @@ building a degenerate path and unwrapping it.
 
 ### M4 — `cpal.color_record_indices()[0]` panics on a CPAL table with zero palettes
 
+**Disposition: panic site guarded in `b10c3a5`; trigger never reproduced.** Deliberately not called fixed. No font reaching this path was ever built — the tooling gap this finding records (`fontTools` unavailable) was never closed — so nothing demonstrates a trigger now passing that used to abort. The guard is what changed; the evidence class below has not.
+
 `wezterm-font/src/rasterizer/skrifa_rasterizer.rs:370`
 
 **Defect class Critical, recorded Medium** under the demotion rule above:
@@ -705,6 +745,8 @@ downloads one — but this is not reachable from terminal output.
 **Evidence class:** by reading. Trigger **not reproduced**.
 
 ### M5 — `unitsPerEm = 0` divides by zero in both the shaper and the rasteriser
+
+**Disposition: panic site guarded in `b10c3a5`; trigger never reproduced.** Deliberately not called fixed. No font reaching this path was ever built — the tooling gap this finding records (`fontTools` unavailable) was never closed — so nothing demonstrates a trigger now passing that used to abort. The guard is what changed; the evidence class below has not.
 
 **Defect class Critical, recorded Medium** under the demotion rule above,
 trigger not reproduced. (The original text justified the Critical defect
@@ -750,6 +792,8 @@ passing. The guard is what changed; the evidence class below has not.
 
 ### M6 — A dirty band that extends past the bottom of the window is silently not presented
 
+**Disposition: fixed in `f78b501`** (with M7) — out-of-range bands are clamped instead of dropped. Trigger still not reproduced: this finding never had one, and the fix removes the silent-skip branch rather than demonstrating it firing.
+
 `wezterm-gui/src/termwindow/render/purecpu.rs:501-519`
 
 **Defect.**
@@ -774,6 +818,8 @@ in the presentation path, not because I saw it fire.
 **Evidence class:** by reading. **Unverified.**
 
 ### M7 — `clear_rect` silently skips a row instead of clamping when the computed row end exceeds the framebuffer
+
+**Disposition: fixed in `f78b501`** (with M6) — out-of-range clears are clamped, and the rect arithmetic was made saturating (`ed7ba9e`). Trigger still not reproduced, as above.
 
 `wezterm-gui/src/termwindow/render/purecpu.rs:102-115`
 
@@ -808,11 +854,38 @@ a full heap copy of the band, needed because the closure is deferred through
 `XConnection::with_window_inner` — and then issues `CreateGc` ... `PutImage`
 ... `FreeGc` per call. `call_draw_purecpu` calls it **once per coalesced
 band**, so a frame with five dirty bands performs five copies and five GC
-create/destroy round trips. For a full repaint at 1280x1024 that is a 5 MiB
+create/destroy pairs. For a full repaint at 1280x1024 that is a 5 MiB
 copy on top of the `PutImage` itself. A cost, not a correctness bug, in a
 renderer whose whole purpose is to be cheaper than the GPU path.
 
-**Evidence class:** by reading. Not measured.
+**Correction (Task 14): the original text said "five GC create/destroy *round
+trips*". They are not round trips, and the word carried the whole argument.**
+`CreateGc` and `FreeGc` are **no-reply** X requests. They are queued into the
+same output buffer as the `PutImage` they bracket and flushed with it, so
+nothing blocks waiting for a server response and there is no per-band latency
+to save. The remaining cost is real but small: request encoding, server-side
+resource creation, and the `to_vec` copy — which is a different and much
+cheaper claim than the one this finding originally made.
+
+**Built, measured null on both sides, and reverted (Task 13).** L1 was
+implemented — a cached GC hoisted out of the per-band path — and then backed
+out, because it bought nothing measurable. Client side: across repeated
+alternating-order runs the arms are indistinguishable (`static-image`
+5.10 / 5.00 without the cache against 5.10 / 5.13 with it; `blink-text` 6.30 /
+6.37 against 6.33 / 6.60 — a spread smaller than the within-arm spread). The
+first round's apparent "+0.66 pp, cache is worse" was load noise on a busy box
+and did not survive a quieter replication. **Server side, which is where a GC
+optimisation would have to show up if anywhere:** sampling the `:20` X server's
+own `/proc/<pid>/stat` across the same runs gives `static-image` 7, 7 ticks
+without the cache against 8, 7 with it — a one-tick (10 ms) spread over 1800
+`CreateGc`/`FreeGc` pairs, bounding the saving at roughly 5.5 µs per pair and
+itself dominated by noise — and `blink-text` mean 92 against 93, against a
+within-arm spread of 8. **So the null bounds both the client and the server,
+and L1 stays reverted.** This record is written here because it previously
+existed only in a source comment and in untracked files.
+
+**Evidence class:** by reading for the mechanism; **measured null** for the
+optimisation, on both the client and the X server side.
 
 ### L2 — `HintingInstance` is constructed per glyph rasterisation
 
@@ -824,7 +897,18 @@ rather than once per (font, size) pair, which is what skrifa's own
 documentation recommends. Affects first-render latency only, since rasterised
 glyphs land in the atlas cache.
 
-**Evidence class:** by reading. Not measured.
+**Disposition: fixed in `bce58ea`.** A `hinting_cache` keyed by the pixel
+size's bit pattern now holds one `Arc<HintingInstance>` per size per
+rasterizer. Two tests guard it: one asserts three rasterizations at one size
+share a single instance while a second size gets its own, and one asserts a
+cached instance rasterizes **identically** to a fresh one, so the cache is
+invisible in the output. The key is size alone, which is sound only because
+the variation location is always the default at the single call site; Task 14
+made that enforceable with a `debug_assert!(location.coords().is_empty())`
+rather than leaving it as a comment.
+
+**Evidence class:** by reading. Not measured — the cost was latency on first
+render, and no first-render latency benchmark was built.
 
 ### L3 — `schedule_blink_timer_if_needed` divides by `animation_fps` in integer arithmetic
 
@@ -835,7 +919,27 @@ schedules an immediate timer that invalidates, repaints and reschedules — a
 busy loop. `animation_fps` is user config, not attacker input, and 1000+ is
 not a plausible value, so this is hygiene. **Not reproduced.**
 
-**Evidence class:** by reading. **Unverified.**
+**Disposition: fixed in `230117c`, and it was worse than this finding says.**
+The integer division was not only zero above 1000 fps — it was *quantised
+everywhere*: at the shipped default `animation_fps = 60` it asked for a 16 ms
+frame against a true 16.667 ms, a 4% fast clock, and it collapsed every fps
+above 500 to the same 1 ms. The same expression existed independently at two
+sites, the timer that grants animation frames and the ease that asks for them,
+so the two clocks could disagree. `bce58ea` (F4) hoisted both into one
+`colorease::animation_frame_interval(fps)` using `Duration::from_secs_f64(1.0 /
+fps.max(1))`, so there is now a single definition shared with the OpenGL path.
+Task 14 confirmed the OpenGL path is bit-identical across the pass despite that
+sharing. **The `.max(1)` in the shared helper turns out to be load-bearing
+rather than defensive**, and Task 14 corrected two source comments that called
+it belt-and-braces: `ColorEase::intensity_one_shot` reads
+`config::configuration().animation_fps as u64` with no clamp of its own, and
+`animation_fps` is an unvalidated `u8`, so `animation_fps = 0` is a legal
+config value that reaches the helper — where `1.0 / 0` is `inf` and
+`Duration::from_secs_f64` panics. `fps_zero_does_not_divide_by_zero` is a
+genuine regression test for a config-reachable panic.
+
+**Evidence class:** by reading. **Trigger unverified** — no busy loop and no
+zero-fps panic was ever run; the arithmetic was fixed on inspection.
 
 ### L4 — `SetSelectionOwner` now uses `CURRENT_TIME`
 
@@ -879,11 +983,80 @@ pinned one of them for a reason gets a different implementation with only a
 log line to say so. Defensible for a personal fork; recorded because the
 config keys still advertise choices that no longer exist.
 
-**Evidence class:** by reading.
+**Disposition: closed on inspection as a non-defect (Task 14). No code
+change, and none is wanted.** The finding's own title is what is wrong: the
+substitution is **not silent**. All three sites warn, and each names both what
+was asked for and what was used instead —
+`"FreeType/Harfbuzz rasterizers have been removed, using skrifa instead"`
+(`rasterizer/mod.rs:46-48`),
+`"HarfBuzz shaper has been removed, using Harfrust instead"`
+(`shaper/mod.rs:146`), and
+`"FontConfig locator has been removed, using FontDb instead"`
+(`locator/mod.rs:225`). That is the behaviour the finding asks for, already
+present at every site it cites. What remains is a documentation observation,
+not a defect: the config schema still accepts enum variants that no longer
+select anything. Recorded as closed rather than deleted so the next reader
+does not re-derive it.
+
+**Evidence class:** by reading; **closed on inspection, non-defect.**
+
+### N1 — A static inline image costs 0.57 ms of CPU every frame, for as long as anything holds the animation timer open
+
+`wezterm-gui/src/termwindow/render/screen_line.rs` (`attrs.images()`),
+measured through `tools/purecpu-parity/measure-round.sh`, case `static-image`
+
+**New finding, added in Task 14 from the measurement round's results.** It is
+recorded here rather than folded into another finding because it is a distinct,
+quantified cost with its own mechanism.
+
+**Not a regression from the fix pass, and not in any task's scope.** It is
+pre-existing behaviour that the fix pass merely made *visible*: the pre-fix
+binary never ran the frame loop in this configuration at all, so it could not
+pay this cost. **It is unfixed.**
+
+**Defect.** `attrs.images()` does not borrow — it allocates a `Vec` and
+**deep-clones every `ImageCell`**, plus a `HashMap` lookup and a mutex
+acquisition per image cell, and it does this **per frame**. A still image marks
+no dirty region, so a source comment reasoned that "a still image costs nothing
+here, forever". That is true in *rects* and false in *CPU*: the per-frame image
+scan runs whenever a frame runs, and something as ordinary as a blinking cursor
+— the default — holds the animation timer open and makes frames run.
+
+**Failure scenario, measured.** `measure-round.sh`, 30 s samples,
+`animation_fps = 60` (the shipped default), one window at a time, CPU read from
+`utime + stime` in `/proc/<pid>/stat`:
+
+| case | subject CPU |
+|---|---|
+| `idle-cursor` — blinking cursor, no image | **1.43%** |
+| `static-image` — the same config plus one large static sixel | **4.83%** |
+
+The image contributes **3.40 percentage points**, which at 60 fps is
+**0.57 ms of CPU on every single frame**, spent re-cloning an image that never
+changes. The two rows differ only in the presence of the image, which is what
+makes the subtraction meaningful.
+
+**What this does *not* say.** It is not a parity gap — OpenGL runs the same
+`attrs.images()` scan, and on this box the GL arm costs 248.9% CPU on this very
+case against PureCpu's 4.83%. It is a cost worth removing on its own terms, not
+a place where PureCpu loses to the renderer it is matched against.
+
+**Evidence class:** measured (the cost, by subtraction of two arms in one
+round); by reading (the deep-clone mechanism).
+
+**Fix direction.** Return a borrow, or skip the image scan entirely on frames
+where no image cell's generation has changed.
 
 ---
 
 ## Test suite
+
+> **Post-fix status (Task 14).** The suite is now
+> `cargo test -j4 -p wezterm-gui --bin wezterm-gui` → **127 passed, 0 failed**
+> and `cargo test -j4 -p wezterm-font` → **18 passed, 0 failed**, against the
+> 29 + 1 recorded below. **The central complaint in this section is closed**,
+> and the paragraph after it is kept because the *rest* of it is still true.
+> Details below the original text.
 
 `CARGO_BUILD_JOBS=4 cargo test -j4 -p wezterm-gui -p wezterm-font`:
 **29 passed, 0 failed** in `wezterm-gui`, 1 passed in `wezterm-font`,
@@ -923,6 +1096,39 @@ metrics (`bitmap_pixel_width` 16 -> 5 and 20 -> 8, `bearing_x` 0.0 -> 3.0 —
 see `git diff e723cf5..HEAD -- wezterm-gui/src/shapecache.rs`), which records
 that shaping output changed but does not assert that the new values are
 correct.
+
+### What changed, and what did not (Task 14)
+
+**The complaint above is closed, and it was closed by evidence rather than by
+adding tests and asserting they help.** The original point was not "there are
+few tests" but the sharper one that **a green suite said nothing**, because a
+`panic!` planted inside the blit loop left the suite green. Task 15 built a
+framebuffer harness for that loop and then mutation-tested it: a mutation at
+`purecpu.rs:553` **kills 7 tests**, and all 7 die **at the mutated statement**
+rather than via some distant downstream assertion — including both re-pointed
+`purecpu_sampler` tests. The discriminating negative is what makes that a
+result rather than a coincidence:
+`blit_skips_a_quad_that_misses_every_dirty_rect` correctly does **not** die,
+because it `continue`s before reaching the clip loop. So the loop is now
+covered in the specific sense the complaint demanded: breaking it turns the
+suite red.
+
+**Still true, and worth stating plainly rather than letting the numbers imply
+otherwise.** Task 15's coverage is of the blit loop, not of everything around
+it. Not covered:
+
+- **nothing in `call_draw_purecpu` itself**;
+- inside `blit_vertex_buffer`: the whole **`subpixel_aa` arm**, **`apply_hsv`**,
+  **per-vertex HSV**, **`mix_value != 0`**, and the **degenerate-quad
+  `continue`**;
+- **none of Task 10's `mod.rs` plumbing**, `AnimatedCellScan`, or
+  `image_next_frame_due` — no test executes any of it.
+
+Note the asymmetry that leaves: the `subpixel_aa` arm is untested by the suite
+but *is* measured end-to-end in `parity-matrix.md`'s subpixel row, while the
+`mod.rs` animation plumbing is neither unit-tested nor covered by a static
+capture — it is exercised only by the sampled animation rows, which are graded
+on a colour sequence rather than on an assertion.
 
 ---
 
