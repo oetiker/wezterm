@@ -2183,12 +2183,42 @@ impl WindowOps for XWindow {
         dst_y: i16,
     ) -> anyhow::Result<()> {
         let window_id = self.0;
+        // L1, half one: this copy cannot be removed without restructuring
+        // the presentation path.  `with_window_inner` takes an
+        // `FnOnce(&mut XWindowInner) + Send + 'static` (connection.rs:995-998)
+        // and runs it later on the main thread, so the closure cannot borrow
+        // the caller's band at all.  The copy is what makes the hand-off
+        // sound, not an oversight.
         let pixels = pixels.to_vec();
         XConnection::with_window_inner(window_id, move |inner| {
             let conn = inner.conn();
             let xcb_conn = &conn.conn;
             let target_window = inner.child_id;
 
+            // L1, half two: MEASURED, AND DELIBERATELY LEFT ALONE.  Task 13
+            // built the obvious fix — one GC cached on XWindowInner, created
+            // on first use and freed in close/Drop — and measured it against
+            // this code with everything else held identical (release builds
+            // md5 fb07d4ca vs 79606945, PureCpu, ANIMATION_FPS=60, four 30 s
+            // CPU samples per arm per case, arm order reversed between
+            // rounds).  Result: no improvement.  static-image 5.03% cached
+            // vs 5.69% churning, blink-text 6.94% vs 6.54% — the two cases
+            // disagree in sign and the within-arm spread (up to 1.77 pp) is
+            // three times the between-arm difference.
+            //
+            // The reason it cannot show is worth keeping: CreateGc and FreeGc
+            // are no-reply requests of a couple of dozen bytes, batched into
+            // the same write as the PutImage they bracket.  The finding that
+            // raised this called them "round trips"; they are not, and that
+            // is what the cost model got wrong.  Note also that whatever the
+            // X server itself spends allocating the GC lands in the server's
+            // process, which the instrument does not sample — so the
+            // measurement bounds the client-side cost, not the total.
+            //
+            // Reinstating the cache is a ~40-line change (a field, a lazy
+            // accessor, and a free in both close and Drop, since the GC must
+            // not outlive child_id); do not do it without an instrument that
+            // can resolve it.
             let gc: xcb::x::Gcontext = xcb_conn.generate_id();
             xcb_conn.send_request(&xcb::x::CreateGc {
                 cid: gc,

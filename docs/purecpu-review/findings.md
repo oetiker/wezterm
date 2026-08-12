@@ -706,8 +706,11 @@ downloads one — but this is not reachable from terminal output.
 
 ### M5 — `unitsPerEm = 0` divides by zero in both the shaper and the rasteriser
 
-**Defect class Critical, recorded Medium** under the demotion rule above (it
-reaches M3's abort), trigger not reproduced.
+**Defect class Critical, recorded Medium** under the demotion rule above,
+trigger not reproduced. (The original text justified the Critical defect
+class by saying M5 "reaches M3's abort". **That is wrong — see the
+correction below.** The class stands on its own footing: an `inf` scale
+breaks layout wholesale and saturates every advance to `i32::MAX`.)
 
 `wezterm-font/src/shaper/harfrust_shaper.rs:242`,
 `wezterm-font/src/rasterizer/skrifa_rasterizer.rs:383-384`,
@@ -718,12 +721,27 @@ reaches M3's abort), trigger not reproduced.
 advances then go through `(pos.x_advance as f64 * scale_26_6) as i32`
 (`harfrust_shaper.rs:307-310`), where an infinite float saturates to
 `i32::MAX` in Rust — no panic, but glyph advances of two billion pixels and
-completely broken layout. In the COLR path the infinite scale propagates into
-path coordinates, `Rect::from_points` returns `None`, and the result is the
-unconditional panic of **M3**.
+completely broken layout.
+
+**Correction (Task 12): M5's infinite scale does not reach M3's panic. M3
+and M5 are independent defects.** The original text claimed the infinite
+scale propagates into COLR path coordinates, so `Rect::from_points` returns
+`None` and M3's unconditional panic fires. It does not.
+`glyph_outline_draw_ops` draws with `Size::unscaled()`, so the points the
+pen collects are in font units and the scale never enters them; the scale is
+carried separately in a `tiny_skia::Transform` applied at rasterisation
+time. An `inf` in that transform produces a degenerate or empty raster, not
+an out-of-range point set, and M3's `Rect::from_points` sees the same
+unscaled points it would have seen with a sane `unitsPerEm`. Neither finding
+is a precondition of the other, and fixing one does not close the other.
 
 The author was aware of the hazard elsewhere: `harfrust_shaper.rs:680` guards
 the same division with `if ch > 0.0 && upem > 0.0`.
+
+**Guarded, not reproduced.** M5's division sites were given zero checks in
+commit `b10c3a5`; no font that reaches any of M3/M4/M5 was ever built, so
+none of the three is "fixed" in the sense of a demonstrated trigger now
+passing. The guard is what changed; the evidence class below has not.
 
 **Not reproduced.** Missing evidence is a font with `head.unitsPerEm = 0`
 (same tooling gap as M4).
@@ -834,7 +852,19 @@ made deliberately here. Recorded so the trade is visible, not as a defect to
 fix. Note this is an OSC 52 fix riding along in the same patch, unrelated to
 PureCpu.
 
-**Evidence class:** by reading.
+**Closed as superseded, not fixed (Task 13).** The finding predates commit
+`ef7b636`, "x11: fix OSC 52 clipboard silently doing nothing" (upstream PR
+wezterm/wezterm#8043), which introduced this very `CURRENT_TIME` on purpose:
+`copy_and_paste.time` only advances on key/button events delivered to this
+window, so it lags the selection's `lastTimeChanged` and the X server
+silently drops a `SetSelectionOwner` carrying a stale timestamp — OSC 52
+then does nothing at all, with no error anywhere. Reverting to the stored
+timestamp would reinstate that no-op in exchange for the ICCCM race
+`CURRENT_TIME` cannot lose. The trade is deliberate and upstream's; there is
+no code change to make here. Recorded as **obsolete**, and deliberately not
+deleted, so the next reader does not re-derive it and "fix" it back.
+
+**Evidence class:** by reading. **Obsolete — superseded by `ef7b636`.**
 
 ### L5 — Removed backends are silently substituted
 

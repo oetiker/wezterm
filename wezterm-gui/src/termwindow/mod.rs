@@ -1163,8 +1163,9 @@ impl TermWindow {
         // L3: `1000 / fps` is integer division, so the interval was quantised
         // to whole milliseconds before it was ever used — at animation_fps = 60
         // that is 16 ms rather than 16.667 ms, a 4% fast clock, and every fps
-        // above 500 collapsed to the same 1 ms.
-        let frame_interval = std::time::Duration::from_secs_f64(1.0 / fps as f64);
+        // above 500 collapsed to the same 1 ms.  F4 fixed the same expression
+        // in ColorEase; the interval now has one definition, shared.
+        let frame_interval = crate::colorease::animation_frame_interval(fps);
         let next_due = std::time::Instant::now() + frame_interval;
 
         // Use the same scheduling mechanism as paint_impl
