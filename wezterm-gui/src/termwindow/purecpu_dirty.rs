@@ -14,12 +14,25 @@ use std::time::Instant;
 use termwiz::cell::Blink;
 
 /// Where a pane sits in the window, in pixels, with its cell metrics.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// The origins are **`f32` and deliberately unrounded**, for the same reason
+/// [`painted_x_span`]'s `content_left` is: they feed the *far* edges of every
+/// rect derived from them ([`cell_rect`], [`row_band_painted`], [`row_band`]),
+/// which are `origin + n*cell + cell`.  Flooring the origin translates the whole
+/// rect left/up by `frac(origin)` — safe on the near edge, and short by exactly
+/// `frac(origin)` on the far one, because the paint pass places the same cell at
+/// the unrounded origin.  Nothing downstream restores it: `coalesce_to_bands`
+/// merges verbatim and `clamp_band` only clips.  Each accessor therefore rounds
+/// **outward** at the point of use — floor the near edge, ceil the far one —
+/// exactly as the spans do, so every rect is a superset of what was painted.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PanePlacement {
     /// Pixel x of the pane's left edge, including window padding and border.
-    pub origin_x: i32,
-    /// Pixel y of the pane's top edge, including the tab bar, padding and border.
-    pub origin_y: i32,
+    /// Unrounded; see the type's doc.
+    pub origin_x: f32,
+    /// Pixel y of the pane's top edge, including the tab bar, padding and
+    /// border.  Unrounded; see the type's doc.
+    pub origin_y: f32,
     /// Pane width in cells.
     pub cols: i32,
     /// Pane height in cells.
@@ -34,25 +47,42 @@ pub struct PanePlacement {
 /// Takes plain values rather than a `PositionedPane` so this module has no
 /// `mux` dependency and can be tested without constructing an `Arc<dyn Pane>`.
 /// `PositionedPane::left`/`top`/`width`/`height` are all in **cells**.
+///
+/// `content_left` / `content_top` are the paint pass's own `left_pixel_x` /
+/// `top_pixel_y`, **unrounded**.  They must not be truncated by the caller —
+/// see [`PanePlacement`] for what truncating them costs.
 #[allow(clippy::too_many_arguments)]
 pub fn pane_placement(
     left_cells: i32,
     top_cells: i32,
     cols: i32,
     rows: i32,
-    content_left: i32,
-    content_top: i32,
+    content_left: f32,
+    content_top: f32,
     cell_w: i32,
     cell_h: i32,
 ) -> PanePlacement {
     PanePlacement {
-        origin_x: content_left + left_cells * cell_w,
-        origin_y: content_top + top_cells * cell_h,
+        origin_x: content_left + (left_cells * cell_w) as f32,
+        origin_y: content_top + (top_cells * cell_h) as f32,
         cols,
         rows,
         cell_w,
         cell_h,
     }
+}
+
+/// Round a painted 1-D extent `near .. near + len` outward to whole pixels,
+/// returning `(near_px, len_px)`.
+///
+/// The single place [`PanePlacement`]'s unrounded origins become integers.  Both
+/// edges are derived from the *same* unrounded `near`, so the far edge keeps the
+/// fraction the near edge drops — which is precisely what flooring the origin up
+/// front threw away.
+fn outward(near: f32, len: i32) -> (i32, i32) {
+    let near_px = near.floor() as i32;
+    let far_px = (near + len as f32).ceil() as i32;
+    (near_px, (far_px - near_px).max(0))
 }
 
 /// One full-width-*within-the-pane* band for a viewport row.
@@ -66,11 +96,13 @@ pub fn row_band(p: &PanePlacement, row_in_viewport: i32) -> Option<DirtyRect> {
     if row_in_viewport < 0 || row_in_viewport >= p.rows {
         return None;
     }
+    let (x, width) = outward(p.origin_x, p.cols * p.cell_w);
+    let (y, height) = outward(p.origin_y + (row_in_viewport * p.cell_h) as f32, p.cell_h);
     Some(DirtyRect {
-        x: p.origin_x,
-        y: p.origin_y + row_in_viewport * p.cell_h,
-        width: p.cols * p.cell_w,
-        height: p.cell_h,
+        x,
+        y,
+        width,
+        height,
     })
 }
 
@@ -151,11 +183,14 @@ pub fn row_band_painted(
     if row_in_viewport < 0 || row_in_viewport >= p.rows {
         return None;
     }
+    // The x axis comes ready-rounded from `span`; the y axis is rounded
+    // outward here for the reason spelled out on [`PanePlacement`].
+    let (y, height) = outward(p.origin_y + (row_in_viewport * p.cell_h) as f32, p.cell_h);
     Some(DirtyRect {
         x: span.x,
-        y: p.origin_y + row_in_viewport * p.cell_h,
+        y,
         width: span.width,
-        height: p.cell_h,
+        height,
     })
 }
 
@@ -165,11 +200,13 @@ pub fn cell_rect(p: &PanePlacement, row_in_viewport: i32, col: i32) -> Option<Di
     if row_in_viewport < 0 || row_in_viewport >= p.rows || col < 0 || col >= p.cols {
         return None;
     }
+    let (x, width) = outward(p.origin_x + (col * p.cell_w) as f32, p.cell_w);
+    let (y, height) = outward(p.origin_y + (row_in_viewport * p.cell_h) as f32, p.cell_h);
     Some(DirtyRect {
-        x: p.origin_x + col * p.cell_w,
-        y: p.origin_y + row_in_viewport * p.cell_h,
-        width: p.cell_w,
-        height: p.cell_h,
+        x,
+        y,
+        width,
+        height,
     })
 }
 
@@ -401,8 +438,8 @@ mod tests {
     /// origin at (5, 30) for padding and the tab bar.
     fn top_left() -> PanePlacement {
         PanePlacement {
-            origin_x: 5,
-            origin_y: 30,
+            origin_x: 5.,
+            origin_y: 30.,
             cols: 80,
             rows: 24,
             cell_w: 10,
@@ -414,8 +451,8 @@ mod tests {
     /// cell column 40 and row 0.
     fn split_right() -> PanePlacement {
         PanePlacement {
-            origin_x: 5 + 40 * 10,
-            origin_y: 30,
+            origin_x: (5 + 40 * 10) as f32,
+            origin_y: 30.,
             cols: 40,
             rows: 24,
             cell_w: 10,
@@ -426,8 +463,8 @@ mod tests {
     /// The bottom pane of a horizontal split: starts at cell row 12.
     fn split_bottom() -> PanePlacement {
         PanePlacement {
-            origin_x: 5,
-            origin_y: 30 + 12 * 20,
+            origin_x: 5.,
+            origin_y: (30 + 12 * 20) as f32,
             cols: 80,
             rows: 12,
             cell_w: 10,
@@ -477,6 +514,64 @@ mod tests {
         assert!(cell_rect(&split_bottom(), 12, 0).is_none());
     }
 
+    /// A pane whose content origin has a fraction on BOTH axes, as a
+    /// `window_padding` in cells, points or percent gives.  4x4 cells of 7x9 px
+    /// at cell (1,1), content origin (5.75, 3.5) -> pane origin (12.75, 12.5).
+    ///
+    /// Every other fixture in this module has integer edges, and an
+    /// integer-edged fixture cannot see a rounding mutation at all — Task 10's
+    /// review found five of six `painted_y_span` fixtures in exactly that state.
+    fn fractional_origin() -> PanePlacement {
+        pane_placement(
+            /* left_cells */ 1,
+            /* top_cells */ 1,
+            /* cols */ 4,
+            /* rows */ 4,
+            /* content_left */ 5.75,
+            /* content_top */ 3.5,
+            /* cell_w */ 7,
+            /* cell_h */ 9,
+        )
+    }
+
+    #[test]
+    fn cell_rect_does_not_truncate_a_fractional_content_origin() {
+        // The paint pass places this cell at x = 12.75 + 2*7 = 26.75 and
+        // y = 12.5 + 1*9 = 21.5, i.e. it covers 26.75..33.75 and 21.5..30.5.
+        // The only outward-rounded answer is x 26..34 and y 21..31.
+        //
+        // Flooring the origin instead (12, 12 — the pre-fix behaviour) gives
+        // x 26..33 and y 21..30: the true rect translated left and up, short by
+        // frac(origin) on the right and bottom edges.  A block cursor's own
+        // background colour is what would be left stale in that sliver, since
+        // it is IS_SOLID_COLOR and so excluded from `grow_rects_to_quads`.
+        let r = cell_rect(&fractional_origin(), 1, 2).unwrap();
+        assert_eq!((r.x, r.y, r.width, r.height), (26, 21, 8, 10));
+        assert_eq!(r.x + r.width, 34, "right edge must not round short");
+        assert_eq!(r.y + r.height, 31, "bottom edge must not round short");
+    }
+
+    #[test]
+    fn row_band_painted_does_not_truncate_a_fractional_content_top() {
+        // The vertical axis of the SAME defect, on the main seqno-driven
+        // repaint path: the painted band is y 30.5..39.5, so the band must be
+        // 30..40.  Flooring content_top gives 30..39 and leaves the bottom
+        // half-pixel of the last row of every contiguous dirty run stale.
+        // The x axis arrives ready-rounded from the span and is passed through.
+        let span = PaneSpan { x: 3, width: 40 };
+        let r = row_band_painted(&fractional_origin(), 2, &span).unwrap();
+        assert_eq!((r.x, r.y, r.width, r.height), (3, 30, 40, 10));
+        assert_eq!(r.y + r.height, 40, "bottom edge must not round short");
+    }
+
+    #[test]
+    fn row_band_does_not_truncate_a_fractional_content_origin() {
+        // The text-area band keeps the same contract on both axes:
+        // x 12.75..40.75 -> 12..41, y 12.5..21.5 -> 12..22.
+        let r = row_band(&fractional_origin(), 0).unwrap();
+        assert_eq!((r.x, r.y, r.width, r.height), (12, 12, 29, 10));
+    }
+
     #[test]
     fn placement_converts_cell_offsets_to_pixels() {
         // PositionedPane.left/top are in CELLS, not pixels.  Multiplying by
@@ -487,20 +582,20 @@ mod tests {
             /* top_cells */ 12,
             /* cols */ 40,
             /* rows */ 12,
-            /* content_left */ 5,
-            /* content_top */ 30,
+            /* content_left */ 5.0,
+            /* content_top */ 30.0,
             /* cell_w */ 10,
             /* cell_h */ 20,
         );
-        assert_eq!(p.origin_x, 405, "left_cells was not scaled by cell_w");
-        assert_eq!(p.origin_y, 270, "top_cells was not scaled by cell_h");
+        assert_eq!(p.origin_x, 405., "left_cells was not scaled by cell_w");
+        assert_eq!(p.origin_y, 270., "top_cells was not scaled by cell_h");
         assert_eq!((p.cols, p.rows), (40, 12));
     }
 
     #[test]
     fn placement_at_the_window_origin_is_the_content_origin() {
-        let p = pane_placement(0, 0, 80, 24, 5, 30, 10, 20);
-        assert_eq!((p.origin_x, p.origin_y), (5, 30));
+        let p = pane_placement(0, 0, 80, 24, 5.0, 30.0, 10, 20);
+        assert_eq!((p.origin_x, p.origin_y), (5., 30.));
     }
 
     #[test]

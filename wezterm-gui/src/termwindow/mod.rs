@@ -1416,16 +1416,19 @@ impl TermWindow {
                 tab_bar_height
             };
             let border = self.get_os_border();
-            // Unrounded, for painted_y_span, for the same reason content_left
-            // is kept unrounded below.
+            // Both kept UNROUNDED, and passed unrounded to every consumer.
+            // They feed the FAR edge of everything derived from them — the
+            // right edge of painted_x_span, the bottom of painted_y_span, and
+            // (through PanePlacement's origins) the right/bottom of every
+            // cell_rect and row band.  Truncating either one here translates
+            // those rects left/up by its fraction, which is safe on the near
+            // edge and exactly one fraction short on the far one: a stale
+            // column at the split gutter, and a stale strip along the bottom of
+            // the last row of every dirty run.  Reachable with any
+            // window_padding in cells, points or percent.  Each consumer rounds
+            // outward at the point of use instead.
             let content_top_px = top_bar_height + padding_top + border.top.get() as f32;
-            let content_top = content_top_px as i32;
-            // Kept UNROUNDED for painted_x_span: it feeds the right edge of the
-            // span, so truncating it here leaves a stale column at the split
-            // gutter with a fractional window_padding.  pane_placement still
-            // wants the floored pixel origin, which is the safe direction there.
             let content_left_px = padding_left + border.left.get() as f32;
-            let content_left = content_left_px as i32;
             let total_cols = self.terminal_size.cols as i32;
             let total_rows = self.terminal_size.rows as i32;
             let window_pixel_width = self.dimensions.pixel_width as i32;
@@ -1453,8 +1456,8 @@ impl TermWindow {
                     pos.top as i32,
                     pos.width as i32,
                     pos.height as i32,
-                    content_left,
-                    content_top,
+                    content_left_px,
+                    content_top_px,
                     cell_w,
                     cell_h,
                 );
@@ -1589,8 +1592,7 @@ impl TermWindow {
                         animated_cells_present = true;
                         if frame_due {
                             for (row, col) in &scan.blink_cells {
-                                if let Some(rect) =
-                                    purecpu_dirty::cell_rect(&placement, *row, *col)
+                                if let Some(rect) = purecpu_dirty::cell_rect(&placement, *row, *col)
                                 {
                                     collected.push(rect);
                                 }
@@ -1614,8 +1616,7 @@ impl TermWindow {
                             }
                             animated_cells_present = true;
                             if purecpu_dirty::animation_frame_due(due, now) {
-                                if let Some(rect) =
-                                    purecpu_dirty::cell_rect(&placement, *row, *col)
+                                if let Some(rect) = purecpu_dirty::cell_rect(&placement, *row, *col)
                                 {
                                     collected.push(rect);
                                 }
