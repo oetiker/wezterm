@@ -72,7 +72,9 @@ pane is the only one with output. It was found by reading the patch and then
 confirmed with purpose-built probes. The corpus was blind along an axis nobody
 thought to vary — not along an axis the tool could not see.
 
-**What is left.** Two rows, and neither is a missing capability:
+**What is left.** Two *matrix rows*, neither of them a missing capability — plus
+two findings that are not matrix rows at all and are listed with the full
+residue further down (`findings.md` N2's open half, and the cost finding N1):
 
 - **Cursor blink is quantised, not eased.** PureCpu alternates between two
   levels where OpenGL sweeps continuously. Deliberate in the source (~2 paints
@@ -292,6 +294,12 @@ and then the residue.
   it now runs. But PureCpu blinks as a **two-level square wave** where OpenGL
   eases continuously, which is deliberate in the source (~2 paints per cycle
   rather than `animation_fps` paints per cycle). Present, visibly coarser.
+  **Which evidence carries which half of that:** the blink's *presence* is
+  measured against a pre-fix control and is not in doubt; the *shape* rests on
+  samples at a single interval plus the source comment, and it is the source
+  comment that makes the two-level reading more than an aliasing hypothesis —
+  a sampler that aliases could flatten an eased waveform into two apparent
+  levels. The `degraded`-rather-than-`parity` verdict turns on the shape.
 - **The atlas-cap asymmetry is `degraded`**, and it is not really a rendering
   defect: PureCpu caps its atlas at 8192 and this box's llvmpipe at 16384, so an
   image big enough to need `AllowImage::Scale` is stored at a quarter resolution
@@ -305,6 +313,16 @@ and then the residue.
   font must actually yield `glyph.scale != 1`, and a capture using no such font
   would return a null result indistinguishable from parity. Read it as an
   untested prediction that now points at parity, not as a result.
+- **Animated-image ink that escapes its cell is still not repainted**
+  (`findings.md` N2, the open half). Glyph ink escaping a dirtied cell *was* a
+  defect — a descender left frozen below its cell while the glyph above it
+  blinked — and it is fixed; it is also **the one defect in this pass that was
+  reproduced in pixels rather than reasoned about**. But the fix grows dirty
+  rects to overlapping quads on vertex buffer 1, where glyphs live, and image
+  quads live on buffer 0 and are shifted by the window padding. So four of the
+  five dirty-rect producers are covered and animated images are not. Admitting
+  buffer 0 wholesale would grow every incremental frame to the pane-sized
+  background quad, i.e. to a full repaint.
 - **One new, unfixed cost finding**: a static inline image costs 0.57 ms of CPU
   per frame (`findings.md` N1).
 
