@@ -28,6 +28,22 @@ struct Info {
     y_offset: i32,
 }
 
+/// Substituted when a font does not tell us its own units per em.
+const DEFAULT_UNITS_PER_EM: u16 = 1000;
+
+/// `unitsPerEm` is a `u16` read straight from the `head` table, and a malformed
+/// font may declare zero. Every scale in this shaper is `pixel_size / upem`, so
+/// a zero would make them all infinite: advances then saturate to `i32::MAX`
+/// and layout is destroyed, and in the COLR path the infinite scale reaches the
+/// rasteriser. Substitute the same default we use for a missing `head` table.
+fn sane_units_per_em(units_per_em: u16) -> u16 {
+    if units_per_em == 0 {
+        DEFAULT_UNITS_PER_EM
+    } else {
+        units_per_em
+    }
+}
+
 fn get_only_char(s: &str) -> Option<char> {
     let mut chars = s.chars();
     let first_char = chars.next()?;
@@ -158,10 +174,12 @@ impl HarfrustShaper {
 
                     let units_per_em = {
                         use read_fonts::TableProvider;
-                        font_ref
-                            .head()
-                            .map(|h: read_fonts::tables::head::Head| h.units_per_em())
-                            .unwrap_or(1000)
+                        sane_units_per_em(
+                            font_ref
+                                .head()
+                                .map(|h: read_fonts::tables::head::Head| h.units_per_em())
+                                .unwrap_or(DEFAULT_UNITS_PER_EM),
+                        )
                     };
 
                     let shaper_data = harfrust::ShaperData::new(&font_ref);
@@ -630,7 +648,7 @@ impl FontShaper for HarfrustShaper {
             skrifa::instance::Size::unscaled(),
             skrifa::instance::LocationRef::default(),
         );
-        let upem = skrifa_metrics.units_per_em as f64;
+        let upem = sane_units_per_em(skrifa_metrics.units_per_em) as f64;
         let scale_factor = pixel_size / upem;
 
         // Note: skrifa reports descent as negative (OpenType convention)
@@ -735,7 +753,7 @@ impl FontShaper for HarfrustShaper {
                     skrifa::instance::Size::unscaled(),
                     skrifa::instance::LocationRef::default(),
                 );
-                let upem = m.units_per_em as f64;
+                let upem = sane_units_per_em(m.units_per_em) as f64;
                 let sf = pixel_size / upem;
                 // Note: skrifa descent is negative, so ascent + (-descent) = ascent - descent
                 let cell_height = (m.ascent - m.descent + m.leading) as f64 * sf;
@@ -764,5 +782,44 @@ impl FontShaper for HarfrustShaper {
         }
 
         self.metrics_for_idx(metrics_idx, size, dpi)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These tests exercise the guard itself, not any font that reaches it. No
+    // font with head.unitsPerEm == 0 was built or observed; the degenerate
+    // value is passed in directly.
+
+    #[test]
+    fn zero_units_per_em_falls_back_to_the_default() {
+        assert_eq!(sane_units_per_em(0), DEFAULT_UNITS_PER_EM);
+        assert_eq!(sane_units_per_em(0), 1000);
+    }
+
+    #[test]
+    fn real_units_per_em_values_are_passed_through() {
+        // The discriminating negative: without it, a helper that returned 1000
+        // unconditionally would pass the test above.
+        assert_eq!(sane_units_per_em(1000), 1000);
+        assert_eq!(sane_units_per_em(2048), 2048);
+        assert_eq!(sane_units_per_em(1), 1);
+        assert_eq!(sane_units_per_em(u16::MAX), u16::MAX);
+    }
+
+    #[test]
+    fn the_shaping_scale_stays_finite_for_a_zero_units_per_em() {
+        // This is what the guard buys: pixel_size / 0 would be inf, and an
+        // advance of 1000 font units would then saturate to i32::MAX instead
+        // of 16 pixels.
+        let pixel_size = 16.0f64;
+        let scale = pixel_size / sane_units_per_em(0) as f64;
+        assert_eq!(scale, 0.016);
+        assert_eq!((1000.0f64 * scale) as i32, 16);
+
+        let unguarded = pixel_size / 0.0f64;
+        assert_eq!((1000.0f64 * unguarded) as i32, i32::MAX);
     }
 }
