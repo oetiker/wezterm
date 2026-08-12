@@ -50,6 +50,16 @@ pub struct PureCpuState {
     /// Last quantized cursor blink phase (true = visible) for
     /// detecting blink transitions without running paint_impl every frame.
     pub last_blink_visible: bool,
+    /// Destination rects of the text quads the PREVIOUS frame painted, in
+    /// framebuffer pixels, as `[x0, y0, x1, y1]`.
+    ///
+    /// Glyph ink is not confined to its cell — see [`grow_rects_to_quads`] —
+    /// so a dirty rect derived from cells has to be grown to the ink that
+    /// actually lands in it.  The ink that has to be *erased* is the previous
+    /// frame's, and the ink that has to be *drawn* is this frame's, so both
+    /// lists are needed: with only the current frame's quads, a descender that
+    /// was there last frame and is not there now would never be repainted over.
+    pub last_text_quads: Vec<[i32; 4]>,
 }
 
 impl PureCpuState {
@@ -69,6 +79,7 @@ impl PureCpuState {
             last_seqno_by_pane: HashMap::new(),
             last_selection_range: None,
             last_blink_visible: true,
+            last_text_quads: vec![],
         }
     }
 
@@ -106,6 +117,109 @@ fn collect_clip_rects(
                 dest_x2.min(rx2),
                 dest_y2.min(ry2),
             ]);
+        }
+    }
+}
+
+/// Append the destination rects of one vertex buffer's quads to `out`, clamped
+/// to the framebuffer.
+///
+/// The rect is computed with `purecpu_sampler::Quad::dest_rect_of` — the same
+/// call the blit loop makes, on the same inputs, so the rect recorded here is
+/// **the** rect those pixels are written to and not a second approximation of
+/// it.  Anything that rounded differently would leave the blit painting outside
+/// the region this made dirty, which is the exact bug being fixed.
+///
+/// Only vertex buffer **1** is passed in by the caller: that is the buffer the
+/// glyphs go to (`screen_line.rs`, `layers.allocate(1)`), and it is the only one
+/// whose quads can escape the cell they belong to.  Backgrounds, underlines,
+/// selection and the cursor are allocated on buffers 0 and 2 and are built at
+/// cell geometry, so growing a dirty rect to *their* extent would grow it to the
+/// pane-sized background quad and turn every incremental frame into a full one.
+fn collect_quad_dest_rects(
+    vertices: &[Vertex],
+    fb_w: usize,
+    fb_h: usize,
+    out: &mut Vec<[i32; 4]>,
+) {
+    let half_w = fb_w as f32 / 2.0;
+    let half_h = fb_h as f32 / 2.0;
+    for q in 0..vertices.len() / VERTICES_PER_CELL {
+        let base = q * VERTICES_PER_CELL;
+        let tl = &vertices[base];
+        let br = &vertices[base + 3];
+        let dest_f = [
+            tl.position[0] + half_w,
+            tl.position[1] + half_h,
+            br.position[0] + half_w,
+            br.position[1] + half_h,
+        ];
+        let [x0, y0, x1, y1] =
+            purecpu_sampler::Quad::dest_rect_of(tl.has_color == 2.0, dest_f);
+        // Clamp to the framebuffer: an off-screen quad must not drag a dirty
+        // rect off-screen with it, where clear_rect would clamp it back anyway
+        // and coalesce_to_bands would widen a band for nothing.
+        let x0 = x0.clamp(0, fb_w as i32);
+        let y0 = y0.clamp(0, fb_h as i32);
+        let x1 = x1.clamp(0, fb_w as i32);
+        let y1 = y1.clamp(0, fb_h as i32);
+        if x1 > x0 && y1 > y0 {
+            out.push([x0, y0, x1, y1]);
+        }
+    }
+}
+
+/// Grow each dirty rect to cover the whole of every glyph quad that overlaps it.
+///
+/// **The defect this repairs.**  Every rect the dirty walk produces is derived
+/// from *cells* (`purecpu_dirty::cell_rect` is exactly one cell;
+/// `row_band_painted` is exactly one cell tall).  A glyph's ink is not confined
+/// to its cell: `screen_line.rs` places the glyph quad at
+/// `top = cell_height + descender - (y_offset + bearing_y)` with the height of
+/// the *rasterized* sprite, and at `pos_x + x_offset + bearing_x` with its
+/// width, and it does not clip — the `// TODO: clipping` there is not an
+/// oversight to be fixed elsewhere, it is the reason ink leaves the cell.  So a
+/// descender, an italic tail, a ligature or any fallback-font glyph taller than
+/// the cell paints outside the rect its cell made dirty.  When only that cell
+/// animates (SGR 5 blink, or the cursor) the escaped ink is never repainted and
+/// the previous frame's fragment survives on screen.
+///
+/// **Why this is done here and not with a margin at the dirty walk.**  The scan
+/// that builds the rects (`AnimatedCellScan`, `termwindow/mod.rs`) walks cells,
+/// not shaped glyphs; it has the text but no bearings, no sprite sizes and no
+/// shaping, so there is nothing there to derive a bound from.  `RenderMetrics`
+/// carries `descender`/`descender_row`/`strike_row`, but those describe font
+/// metrics and the underline's position — none of them bounds rasterized ink,
+/// and a fallback glyph is bounded by nothing at all.  Any margin chosen there
+/// would be a guess.  One stage later, here, the exact extent is already
+/// computed: it is the quad's own destination rect.  So no bound is needed and
+/// none is invented.
+///
+/// **Both frames.**  `now` are this frame's quads, whose ink must be drawn;
+/// `before` are the previous frame's, whose ink must be erased.  Dropping
+/// `before` leaves the old ink standing when a glyph shrinks or disappears.
+///
+/// **The overlap test uses the ORIGINAL rects**, held in `orig`, while the
+/// growth accumulates into `expanded`.  Testing against the growing rect would
+/// make the result depend on the order quads happen to sit in the buffer, and
+/// would chain: a grown rect reaches a second glyph, which grows it further.
+/// It is not needed for correctness — the pixels a chained-in glyph owns
+/// outside the region were painted correctly by an earlier frame and are never
+/// cleared, so they stay correct.
+fn grow_rects_to_quads(orig: &[DirtyRect], expanded: &mut [DirtyRect], quads: &[[i32; 4]]) {
+    debug_assert_eq!(orig.len(), expanded.len());
+    for (o, e) in orig.iter().zip(expanded.iter_mut()) {
+        let ox2 = o.x.saturating_add(o.width);
+        let oy2 = o.y.saturating_add(o.height);
+        for &[qx, qy, qx2, qy2] in quads {
+            if qx < ox2 && qx2 > o.x && qy < oy2 && qy2 > o.y {
+                let ex2 = e.x.saturating_add(e.width).max(qx2);
+                let ey2 = e.y.saturating_add(e.height).max(qy2);
+                e.x = e.x.min(qx);
+                e.y = e.y.min(qy);
+                e.width = ex2 - e.x;
+                e.height = ey2 - e.y;
+            }
         }
     }
 }
@@ -204,9 +318,31 @@ impl crate::TermWindow {
         let (atlas_w, atlas_h) = atlas_image.image_dimensions();
         let atlas_data = atlas_image.pixel_data_slice();
 
+        let (fb_w, fb_h) = {
+            let s = self.purecpu_state.as_ref().unwrap();
+            (s.width as usize, s.height as usize)
+        };
+
+        // The exact destination extent of this frame's glyph ink, for
+        // grow_rects_to_quads below.  Buffer 1 only — see collect_quad_dest_rects
+        // for why the other two must not be included.  Collected here, before
+        // purecpu_state is borrowed mutably, and unconditionally: a full repaint
+        // does not need it for itself, but the *next* incremental frame needs
+        // this frame's ink recorded as its `before`.
+        let mut text_quads: Vec<[i32; 4]> = vec![];
+        for layer in render_state.layers.borrow().iter() {
+            let vb = &layer.vb.borrow()[1];
+            let (vertex_count, _index_count) = vb.vertex_index_count();
+            if vertex_count == 0 {
+                continue;
+            }
+            let bufs = vb.current_vb_mut();
+            if let VertexBuffer::PureCpu(v) = &*bufs {
+                collect_quad_dest_rects(&v[..vertex_count], fb_w, fb_h, &mut text_quads);
+            }
+        }
+
         let state = self.purecpu_state.as_mut().unwrap();
-        let fb_w = state.width as usize;
-        let fb_h = state.height as usize;
         let screen_width = state.width;
         let screen_height = state.height;
 
@@ -228,8 +364,20 @@ impl crate::TermWindow {
                 state.dirty_pixel_rects.len() as f64,
             );
 
-            let dirty_pixels: i64 = state
-                .dirty_pixel_rects
+            let mut effective = state.dirty_pixel_rects.clone();
+            // Grow the cell-derived rects to the glyph ink that overlaps them,
+            // in both frames: this frame's quads have to be drawn, the previous
+            // frame's have to be erased.
+            grow_rects_to_quads(&state.dirty_pixel_rects, &mut effective, &text_quads);
+            grow_rects_to_quads(
+                &state.dirty_pixel_rects,
+                &mut effective,
+                &state.last_text_quads,
+            );
+
+            // Recorded AFTER the growth, so the metric reports what is actually
+            // repainted rather than what the dirty walk asked for.
+            let dirty_pixels: i64 = effective
                 .iter()
                 .map(|r| (r.width as i64) * (r.height as i64))
                 .sum();
@@ -242,8 +390,6 @@ impl crate::TermWindow {
                 },
             );
 
-            let effective = state.dirty_pixel_rects.clone();
-
             // Clear dirty regions in framebuffer before re-blitting
             for rect in &effective {
                 clear_rect(&mut state.frame_buffer, fb_w, fb_h, rect);
@@ -252,6 +398,7 @@ impl crate::TermWindow {
             state.dirty_pixel_rects.clear();
             effective_dirty = effective;
         }
+        state.last_text_quads = text_quads;
 
         let blit_start = Instant::now();
         let mut quads_total: u64 = 0;
@@ -2232,5 +2379,163 @@ pub(crate) mod test {
             }
         }
         assert_eq!(rig.written_pixels().len(), 12, "the empty texel was painted");
+    }
+
+    // ---- glyph overhang: growing a cell-derived rect to the ink ------------
+
+    /// One dirty rect and one quad, through [`grow_rects_to_quads`].
+    fn grow_one(rect: DirtyRect, quads: &[[i32; 4]]) -> DirtyRect {
+        let orig = [rect];
+        let mut expanded = orig.clone();
+        grow_rects_to_quads(&orig, &mut expanded, quads);
+        expanded[0].clone()
+    }
+
+    /// A cell: column 1, row 1 of a 10x20 grid whose origin is (0,0).
+    fn cell_1_1() -> DirtyRect {
+        DirtyRect { x: 10, y: 20, width: 10, height: 20 }
+    }
+
+    #[test]
+    fn a_descender_grows_the_cell_rect_downwards_to_exactly_its_own_extent() {
+        // The finding's own case: the cell is y 20..40, the glyph's ink runs to
+        // y 43.  The rect must reach 43 and stop there — not stay at 40 (the
+        // defect), and not take a whole extra cell to 60 (the margin this task
+        // deliberately does not invent).
+        let r = grow_one(cell_1_1(), &[[12, 24, 18, 43]]);
+        assert_eq!((r.x, r.y, r.width, r.height), (10, 20, 10, 23));
+    }
+
+    #[test]
+    fn an_italic_tail_grows_the_cell_rect_leftwards() {
+        // The half of the finding that was never stated: bearings and italic
+        // tails put ink LEFT of the cell.  A vertical-only widening leaves this
+        // one exactly as stale as before.
+        let r = grow_one(cell_1_1(), &[[7, 22, 12, 38]]);
+        assert_eq!((r.x, r.y, r.width, r.height), (7, 20, 13, 20));
+    }
+
+    #[test]
+    fn a_quad_that_does_not_touch_the_rect_does_not_grow_it() {
+        // The discriminating negative: without it, a "grow to the union of ALL
+        // quads" implementation — which is what growing to the pane-sized
+        // background quad would amount to — passes both tests above and turns
+        // every incremental frame into a full repaint.
+        let r = grow_one(cell_1_1(), &[[0, 0, 5, 5], [30, 45, 40, 60]]);
+        assert_eq!((r.x, r.y, r.width, r.height), (10, 20, 10, 20));
+    }
+
+    #[test]
+    fn growth_is_tested_against_the_original_rect_and_does_not_chain() {
+        // A grows the rect down to y=50; B starts at y=45, so it touches the
+        // GROWN rect but not the original.  B must not be pulled in: testing
+        // against the growing rect makes the answer depend on the order quads
+        // happen to sit in the vertex buffer, which is not a property this
+        // module may have.  Both orders, so a chaining implementation cannot
+        // pass by luck.
+        let a = [12, 24, 18, 50];
+        let b = [12, 45, 18, 60];
+        let r = grow_one(cell_1_1(), &[a, b]);
+        assert_eq!((r.y, r.height), (20, 30), "B was chained in");
+        let r = grow_one(cell_1_1(), &[b, a]);
+        assert_eq!((r.y, r.height), (20, 30), "B was chained in (reversed)");
+    }
+
+    #[test]
+    fn every_rect_grows_by_the_quads_that_touch_it_and_no_others() {
+        // Two panes' worth of rects in one list: growth must not leak from one
+        // rect to another, which a single accumulated bounding box would do.
+        let orig = vec![cell_1_1(), DirtyRect { x: 100, y: 20, width: 10, height: 20 }];
+        let mut expanded = orig.clone();
+        grow_rects_to_quads(&orig, &mut expanded, &[[12, 24, 18, 43], [102, 15, 108, 38]]);
+        assert_eq!(
+            (expanded[0].x, expanded[0].y, expanded[0].width, expanded[0].height),
+            (10, 20, 10, 23)
+        );
+        assert_eq!(
+            (expanded[1].x, expanded[1].y, expanded[1].width, expanded[1].height),
+            (100, 15, 10, 25)
+        );
+    }
+
+    #[test]
+    fn collect_quad_dest_rects_reports_the_blit_rect_and_clamps_it_to_the_screen() {
+        // The rect recorded must be the one the blit writes — same call, same
+        // rule — and it must be clamped, so an off-screen quad cannot drag a
+        // band off the bottom of the framebuffer.
+        const FB: usize = 48;
+        let mut verts = quad([12.0, 24.0, 18.0, 43.0], [0.0; 4], 3.0, RED, FB, FB);
+        // Half off the bottom-right corner: 40..60 clamps to 40..48.
+        verts.extend(quad([40.0, 40.0, 60.0, 60.0], [0.0; 4], 3.0, RED, FB, FB));
+        // Wholly off-screen: dropped entirely rather than recorded empty.
+        verts.extend(quad([50.0, 50.0, 60.0, 60.0], [0.0; 4], 3.0, RED, FB, FB));
+        let mut out = vec![];
+        collect_quad_dest_rects(&verts, FB, FB, &mut out);
+        assert_eq!(out, vec![[12, 24, 18, 43], [40, 40, 48, 48]]);
+        // …and the first of those is exactly what the blit loop's own rule says.
+        assert_eq!(
+            purecpu_sampler::Quad::dest_rect_of(false, [12.0, 24.0, 18.0, 43.0]),
+            [12, 24, 18, 43]
+        );
+    }
+
+    #[test]
+    fn stale_ink_survives_a_cell_sized_rect_and_the_grown_rect_repaints_it() {
+        // THE DEFECT, in pixels, through the shipping blit loop — not a claim
+        // about geometry.  Frame 1 paints a "glyph" whose ink runs 3 px below
+        // its cell.  Frame 2 repaints only that cell, in a different colour,
+        // exactly as a blink phase change does.
+        //
+        // The ink is a solid quad rather than a sampled sprite because the
+        // question here is which PIXELS get repainted, and `dest_rect_of`
+        // treats the two identically (only `has_color == 2.0` takes the other
+        // branch, and that is the background image).
+        const FB: usize = 48;
+        let ink = [12.0f32, 24.0, 18.0, 43.0];
+        let below = (14usize, 41usize); // inside the ink, below the cell
+        let inside = (14usize, 30usize); // inside the ink and inside the cell
+
+        // --- without the growth: the old colour survives below the cell -----
+        let mut rig = Rig::new(FB, FB);
+        rig.blit(&quad(ink, [0.0; 4], 3.0, RED, FB, FB), true, &[]);
+        let stale = rig.px(below.0, below.1);
+        assert_eq!(stale, RED_BGRA, "frame 1 did not paint the overhang");
+
+        let dirty = vec![cell_1_1()];
+        for r in &dirty {
+            clear_rect(&mut rig.fb, FB, FB, r);
+        }
+        rig.blit(&quad(ink, [0.0; 4], 3.0, GREEN, FB, FB), false, &dirty);
+        assert_eq!(
+            rig.px(inside.0, inside.1),
+            GREEN_BGRA,
+            "the cell itself must have been repainted"
+        );
+        assert_eq!(
+            rig.px(below.0, below.1),
+            RED_BGRA,
+            "THE DEFECT: the ink below the cell kept frame 1's colour"
+        );
+
+        // --- with the growth: the whole glyph is repainted -------------------
+        let mut rig = Rig::new(FB, FB);
+        rig.blit(&quad(ink, [0.0; 4], 3.0, RED, FB, FB), true, &[]);
+        let mut quads = vec![];
+        collect_quad_dest_rects(&quad(ink, [0.0; 4], 3.0, GREEN, FB, FB), FB, FB, &mut quads);
+        let orig = vec![cell_1_1()];
+        let mut grown = orig.clone();
+        grow_rects_to_quads(&orig, &mut grown, &quads);
+        for r in &grown {
+            clear_rect(&mut rig.fb, FB, FB, r);
+        }
+        rig.blit(&quad(ink, [0.0; 4], 3.0, GREEN, FB, FB), false, &grown);
+        assert_eq!(
+            rig.px(below.0, below.1),
+            GREEN_BGRA,
+            "the grown rect must repaint the ink that escaped the cell"
+        );
+        // and it must not have repainted the whole framebuffer to get there:
+        // the pixel one row below the ink is still untouched.
+        assert_eq!(rig.px(14, 43), [0, 0, 0, 0], "growth reached past the ink");
     }
 }
