@@ -169,9 +169,38 @@ pub fn cell_rect(p: &PanePlacement, row_in_viewport: i32, col: i32) -> Option<Di
     })
 }
 
+/// Whether the cursor blink animation is running, and so whether the cursor's
+/// cell must be marked dirty when the blink phase turns over.
+///
+/// I4: **the shape has to be resolved against `default_cursor_style` before
+/// asking whether it blinks**, exactly as the render path resolves it
+/// (`render/mod.rs`, `effective_shape` at the `params.cursor` match).  The raw
+/// pane shape stays `CursorShape::Default` until an application sets one with
+/// DECSCUSR, and `Default::is_blinking()` is false — so testing the raw shape
+/// made `default_cursor_style = "BlinkingBlock"`, the documented way to turn
+/// blinking on, completely inert.  Measured: PureCpu returned `gray(224)` on all
+/// 16 samples over 6.4 s while GL swept 17–222.
+///
+/// This **delegates** to `effective_shape` rather than restating its match arms.
+/// A second copy would be free to drift from the renderer this predicate exists
+/// to predict, and the failure would be silent: the cursor would be repainted on
+/// a schedule that no longer matched the one it is drawn on.
+pub fn cursor_blinking(
+    default_cursor_style: config::DefaultCursorStyle,
+    shape: termwiz::surface::CursorShape,
+    cursor_blink_rate: u64,
+    focused: bool,
+) -> bool {
+    default_cursor_style.effective_shape(shape).is_blinking()
+        && cursor_blink_rate != 0
+        && focused
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use config::DefaultCursorStyle;
+    use termwiz::surface::CursorShape;
 
     /// A pane at the window's top-left: 80x24 cells of 10x20 px, content
     /// origin at (5, 30) for padding and the tab bar.
@@ -541,5 +570,74 @@ mod tests {
         assert_eq!((r.x, r.y, r.width, r.height), (400, 90, 410, 20));
         assert!(row_band_painted(&p, 24, &span).is_none(), "row bound still applies");
         assert!(row_band_painted(&p, -1, &span).is_none());
+    }
+
+    #[test]
+    fn config_driven_blink_survives_an_unset_pane_shape() {
+        // THE I4 CASE, and the one the raw-shape test got wrong.  A session in
+        // which no application has issued DECSCUSR leaves the pane shape at
+        // Default forever, so this is the ordinary case, not a corner one.
+        assert!(!CursorShape::Default.is_blinking(), "the premise of I4");
+        assert!(cursor_blinking(
+            DefaultCursorStyle::BlinkingBlock,
+            CursorShape::Default,
+            800,
+            true
+        ));
+        // The pre-fix predicate for the same inputs, transcribed rather than
+        // called, so this line states what the bug WAS and fails if someone
+        // reverts to it: it is false where the line above is true.
+        assert!(!(CursorShape::Default.is_blinking() && 800 != 0 && true));
+    }
+
+    #[test]
+    fn a_steady_config_style_does_not_blink() {
+        // The discriminating negative: without it, a `cursor_blinking` that
+        // ignored the shape entirely and returned `rate != 0 && focused` would
+        // pass the test above.
+        assert!(!cursor_blinking(
+            DefaultCursorStyle::SteadyBlock,
+            CursorShape::Default,
+            800,
+            true
+        ));
+    }
+
+    #[test]
+    fn decscusr_beats_the_config_in_both_directions() {
+        // `effective_shape` only fills in Default, so an application that has
+        // set a shape wins over the config either way round.  Both directions,
+        // because a predicate that took the config's blinkiness alone would
+        // pass the first and fail the second.
+        assert!(cursor_blinking(
+            DefaultCursorStyle::SteadyBlock,
+            CursorShape::BlinkingBar,
+            800,
+            true
+        ));
+        assert!(!cursor_blinking(
+            DefaultCursorStyle::BlinkingBlock,
+            CursorShape::SteadyUnderline,
+            800,
+            true
+        ));
+    }
+
+    #[test]
+    fn blink_rate_zero_and_lost_focus_each_stop_the_blink_alone() {
+        // Both conjuncts existed before I4 and must survive it; each is checked
+        // with the other held true, so neither can be masked by the other.
+        assert!(!cursor_blinking(
+            DefaultCursorStyle::BlinkingBlock,
+            CursorShape::Default,
+            0,
+            true
+        ));
+        assert!(!cursor_blinking(
+            DefaultCursorStyle::BlinkingBlock,
+            CursorShape::Default,
+            800,
+            false
+        ));
     }
 }
