@@ -14,7 +14,18 @@ against that binary. Probes are recorded so they can be re-run.
 > review, before any fix existed, and its finding texts are left as they were
 > written — they describe the defect as found. What is added per finding is a
 > **Disposition** line naming the commit that addressed it, so the document does
-> not read as current while describing a binary that no longer exists. The
+> not read as current while describing a binary that no longer exists.
+>
+> **Those texts are phrased in the present tense, and that is deliberate, not an
+> oversight** (final review, Finding 5, which named I1's "`do_paint_purecpu`
+> derives its entire dirty set from `self.get_active_pane_or_overlay()`" as the
+> example). Every such paragraph describes the **pre-fix** binary
+> `wezterm-gui-prefix`. **Where a finding body and its Disposition line
+> disagree, the Disposition line is the current one** — the same rule
+> `parity-matrix.md` states for its behaviour columns. Rewriting the bodies into
+> the past tense was considered and rejected here: it would edit the record of
+> what was found, and the Disposition line already carries the tense the reader
+> needs. The
 > post-fix binary is `wezterm-gui-6311e97` (md5
 > `3c3f5bef1b91c1f08a018c2da9e054d8`); the pre-fix reference kept as the control
 > arm of every before/after comparison is `wezterm-gui-prefix`.
@@ -483,6 +494,38 @@ with N1). **Fixed in `fbbb433`, narrowed in `6311e97`.** It is recorded here
 because it is the **one defect in this pass that was reproduced in pixels rather
 than reasoned about**, and because the fix leaves a scoped limitation that is
 still open.
+
+**How to re-run the pixel demonstration.** It needs `line_height` below 1.0,
+which `gen-config.sh` could not express when Task 16 ran it — the reproduction
+was a paragraph of prose in the corpus script's header rather than a command,
+in a harness whose standing rule is that every config comes from
+`gen-config.sh`. The final review pushed back on that, and `gen-config.sh` now
+carries a `LINE_HEIGHT` knob. From `tools/purecpu-parity`, with `PARITY_XAUTH`
+set for the `:20` display:
+
+```
+LINE_HEIGHT=0.75 TEXT_BLINK_RATE=400 ANIMATION_FPS=30 \
+  ./gen-config.sh PureCpu out/purecpu-lh.lua
+```
+
+then launch `corpus/blink-descender.sh` under that config against
+`wezterm-gui-t16-before-321b7ea` and `wezterm-gui-t16-after` in turn and capture
+12 frames 0.25 s apart with `import -window`. **All three env vars are
+load-bearing**: without `TEXT_BLINK_RATE`/`ANIMATION_FPS` the harness's defaults
+(0 / 1) leave the SGR 5 text not blinking at all, and the run reports "no frozen
+row" for entirely the wrong reason — the same silent-false-parity trap
+`gen-config.sh`'s other guards exist to catch.
+
+**Re-run and confirmed with the generated config** (final review fix wave), 6 of
+12 frames per arm, counting distinct states per screen row:
+
+| binary | animated rows | row 81 (below the cell) |
+|---|---|---|
+| `wezterm-gui-t16-before-321b7ea` | 67..80 | **1 distinct state — frozen** |
+| `wezterm-gui-t16-after` | 67..81 | 5 distinct states |
+
+Same rows Task 16 reported, so the knob reproduces the demonstration rather
+than merely producing a config that parses.
 
 **Defect.** Every dirty rect PureCpu produces is *cell* geometry — a row band, a
 cursor cell, a blinking cell. A glyph quad is placed at the rasterized sprite's
@@ -1016,6 +1059,12 @@ render, and no first-render latency benchmark was built.
 
 ### L3 — `schedule_blink_timer_if_needed` divides by `animation_fps` in integer arithmetic
 
+> **The function named in this title no longer exists.** `230117c` renamed it to
+> `schedule_animation_timer_if_needed` and widened its meaning from "the blink
+> timer" to "the timer for anything animating". Grepping the tree for the title
+> above returns nothing; grep the new name. The title is left as written, per
+> the header note.
+
 `wezterm-gui/src/termwindow/mod.rs:1153-1155`
 
 `Duration::from_millis(1000 / fps)` is zero for `animation_fps > 1000`, which
@@ -1032,8 +1081,22 @@ sites, the timer that grants animation frames and the ease that asks for them,
 so the two clocks could disagree. `bce58ea` (F4) hoisted both into one
 `colorease::animation_frame_interval(fps)` using `Duration::from_secs_f64(1.0 /
 fps.max(1))`, so there is now a single definition shared with the OpenGL path.
-Task 14 confirmed the OpenGL path is bit-identical across the pass despite that
-sharing. **The `.max(1)` in the shared helper turns out to be load-bearing
+
+**That sharing makes this the one deliberate behaviour change on the GL path in
+this pass, and it was not measured there (final review, Finding 2).** The
+sentence that stood here — "Task 14 confirmed the OpenGL path is bit-identical
+across the pass despite that sharing" — cited the wrong evidence for it. Task 14
+proved that GL *static* rendering is byte-identical (`AE = 0, PAE = 0` on
+`plain`, `chrome`, `images-native`), but all three of those corpora run
+`cursor_blink_rate = 0`, `text_blink_rate = 0`, `visual_bell = false`,
+`animation_fps = 1`, so **no `ColorEase` ticks in any of them** and none of them
+can observe this change. `animation_frame_interval` reaches GL through
+`ColorEase::intensity_one_shot` (`colorease.rs:105`, from `render/mod.rs:251`)
+and there changes the animation clock from a quantised 16 ms to 16.667 ms at the
+default 60 fps, uncollapses every fps above 500, and moves the `remain` phase to
+nanoseconds. It is a fix — it makes two clocks that could disagree agree — but
+it is an **unmeasured-on-GL** one, and it should be read as such rather than as
+covered by the static-rendering result. **The `.max(1)` in the shared helper turns out to be load-bearing
 rather than defensive**, and Task 14 corrected two source comments that called
 it belt-and-braces: `ColorEase::intensity_one_shot` reads
 `config::configuration().animation_fps as u64` with no clamp of its own, and

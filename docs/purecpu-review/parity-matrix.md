@@ -37,11 +37,36 @@ Reference: `front_end = "OpenGL"` (Mesa llvmpipe 4.5)
 > treat them as pointers to the pre-fix source, and grep rather than trust an
 > offset.
 >
-> **The GL backend is bit-identical across the pass.** Captured from the pre-fix
-> and post-fix binaries sequentially, same corpus, same generated config:
+> **GL *static* rendering is bit-identical across the pass — and that is
+> precisely, and only, what was measured.** Captured from the pre-fix and
+> post-fix binaries sequentially, same corpus, same generated config:
 > `AE = 0, PAE = 0` on all three of `plain`, `chrome` and `images-native`, with
 > non-zero ink stddev on both sides (4344.39 / 3005.55 / 4431.11, identical per
-> case) so it is not a null. No PureCpu fix leaked into the OpenGL path.
+> case) so it is not a null.
+>
+> **What this does NOT prove (final review, Finding 2).** It was previously
+> written here as "no PureCpu fix leaked into the OpenGL path", which claims
+> more than the measurement supports. One change in this pass *is* shared with
+> GL and *is* a deliberate behaviour change there:
+> `colorease::animation_frame_interval`, reached on the GL path through
+> `ColorEase::intensity_one_shot` (`colorease.rs:105`, from `render/mod.rs:251`).
+> It moves the GL animation clock from a quantised 16 ms to a true 16.667 ms at
+> the default `animation_fps = 60`, uncollapses every fps above 500 (integer
+> `1000 / fps` mapped them all to 1 ms), and moves the `remain` phase from whole
+> milliseconds to nanoseconds. That is a timing **fix** — it makes the timer that
+> grants animation frames and the ease that asks for them agree, where two
+> independent copies of the same expression could disagree — not a regression,
+> and nothing here suggests GL is broken.
+>
+> But the three corpora cannot see it: all of them run `cursor_blink_rate = 0`,
+> `text_blink_rate = 0`, `visual_bell = false`, `animation_fps = 1`
+> (`gen-config.sh`), so **by construction no `ColorEase` ticks in any of them**.
+> The `AE = 0` figures above were quoted in the sentence dismissing this very
+> change. The honest statement is: GL static rendering is proved byte-identical
+> on three corpora; the one shared change is the animation frame interval, whose
+> effect on GL is a deliberate and **unmeasured-on-GL** correction. Measuring it
+> would need a corpus with a live `ColorEase` on the GL arm, which this pass did
+> not build.
 
 Verdict vocabulary: `parity`, `degraded`, `missing`, `known gap`.
 Method: `by-reading`, `needs-measurement`, `out-of-scope`.
