@@ -10,7 +10,18 @@ use std::time::{Duration, Instant};
 /// for them (`ColorEase::intensity_one_shot`) — which at the shipped default
 /// `animation_fps = 60` quantised both to 16 ms against a true 16.667 ms, and
 /// collapsed every fps above 500 to 1 ms.  It lives here once so the two
-/// clocks cannot disagree again; `fps` is expected pre-clamped to >= 1.
+/// clocks cannot disagree again.
+///
+/// The `.max(1)` is load-bearing, not belt-and-braces.  Of the two call sites
+/// only one pre-clamps: `TermWindow::schedule_animation_timer_if_needed`
+/// (`termwindow/mod.rs`) passes `config.animation_fps.max(1)`, but
+/// `ColorEase::intensity_one_shot` below reads
+/// `config::configuration().animation_fps as u64` raw, and `animation_fps` is
+/// a `u8` with no validation anywhere in `config`, so `animation_fps = 0` is a
+/// legal setting that reaches here.  Without the clamp `1.0 / 0` is `inf` and
+/// `Duration::from_secs_f64` panics on a non-finite value — i.e. the clamp
+/// removes a real, config-reachable divide-by-zero panic.
+/// `fps_zero_does_not_divide_by_zero` is the regression test for that.
 pub fn animation_frame_interval(fps: u64) -> Duration {
     Duration::from_secs_f64(1.0 / fps.max(1) as f64)
 }
@@ -228,9 +239,12 @@ mod tests {
 
     #[test]
     fn fps_zero_does_not_divide_by_zero() {
-        // Both call sites clamp with `.max(1)` before calling, but the helper
-        // is the thing that would produce an infinite Duration and panic in
-        // from_secs_f64, so it clamps too.
+        // NOT belt-and-braces: `intensity_one_shot` reads
+        // `config::configuration().animation_fps as u64` with no clamp of its
+        // own, and `animation_fps` is an unvalidated `u8`, so 0 is a legal
+        // config value that reaches the helper.  Without the clamp that is
+        // `1.0 / 0` = `inf` and `from_secs_f64` panics.  This is a genuine
+        // regression test for a config-reachable panic, not a tautology.
         assert_eq!(animation_frame_interval(0), Duration::from_secs(1));
     }
 }
