@@ -130,12 +130,44 @@ fn collect_clip_rects(
 /// it.  Anything that rounded differently would leave the blit painting outside
 /// the region this made dirty, which is the exact bug being fixed.
 ///
-/// Only vertex buffer **1** is passed in by the caller: that is the buffer the
-/// glyphs go to (`screen_line.rs`, `layers.allocate(1)`), and it is the only one
-/// whose quads can escape the cell they belong to.  Backgrounds, underlines,
-/// selection and the cursor are allocated on buffers 0 and 2 and are built at
-/// cell geometry, so growing a dirty rect to *their* extent would grow it to the
-/// pane-sized background quad and turn every incremental frame into a full one.
+/// Two filters decide which quads take part, and both are load-bearing.
+///
+/// **Buffer 1 only**, chosen by the caller: that is the buffer the glyphs go to
+/// (`screen_line.rs`, `layers.allocate(1)`).  Cell backgrounds, underlines,
+/// selection and the block cursor are allocated on buffers 0 and 2 and are built
+/// at cell geometry, so growing a dirty rect to *their* extent would grow it to
+/// the pane-sized background quad and turn every incremental frame into a full
+/// one.
+///
+/// **Sampled quads only**, chosen here.  Buffer 1 is not glyphs *exclusively*:
+/// `render/borders.rs:23,37,51,65` puts the four window-border strips on it with
+/// `filled_rectangle(layers, 1, ..)`, and the left and right strips are
+/// `euclid::rect(0., 0., border, height)` — **full window height**.  A dirty rect
+/// that touches one does not grow "to a border", it grows to `y in [0, height)`,
+/// and the touch is guaranteed rather than exotic: `purecpu_dirty::painted_x_span`
+/// gives a lone pane `x = 0` and a right edge of `window_pixel_width`, so every
+/// ordinary seqno-driven row band spans the window and meets both strips.  With
+/// `window_frame.border_*_width` set — not the default on X11, where both
+/// contributions are zero, but an ordinary setting — that would silently make
+/// every incremental frame a full repaint, which is the outcome this task exists
+/// to avoid.
+///
+/// Skipping them costs no coverage: `IS_SOLID_COLOR` writes its own rect and
+/// nothing outside it, so a dirty rect can never miss ink by not knowing about
+/// it.  Only a *sampled* quad has ink whose extent is not its cell.
+/// `IS_BG_IMAGE` is skipped on the same reasoning from the other end — it is
+/// window-sized rather than cell-sized, it is not glyph ink, and it is repainted
+/// through the full-repaint path; that is also why the `bg_image` argument below
+/// is a literal `false` and not a test of `has_color`.
+///
+/// **Known limitation, deliberately not covered:** animated *image* cells.
+/// `populate_image_quad` allocates on buffer 0 (`screen_line.rs:478`) and
+/// `render/mod.rs:510-515` shifts the quad by `padding_left`/`padding_top`, so
+/// image ink can land outside the cell that `purecpu_dirty::cell_rect` made
+/// dirty and this pass will not grow the rect to it.  Covering it would mean
+/// admitting buffer 0, which is exactly what the paragraph above forbids; it
+/// needs a filter that separates image quads from background quads, which does
+/// not exist today.
 fn collect_quad_dest_rects(
     vertices: &[Vertex],
     fb_w: usize,
@@ -148,14 +180,17 @@ fn collect_quad_dest_rects(
         let base = q * VERTICES_PER_CELL;
         let tl = &vertices[base];
         let br = &vertices[base + 3];
+        // IS_SOLID_COLOR and IS_BG_IMAGE: see the two paragraphs above.
+        if tl.has_color == 3.0 || tl.has_color == 2.0 {
+            continue;
+        }
         let dest_f = [
             tl.position[0] + half_w,
             tl.position[1] + half_h,
             br.position[0] + half_w,
             br.position[1] + half_h,
         ];
-        let [x0, y0, x1, y1] =
-            purecpu_sampler::Quad::dest_rect_of(tl.has_color == 2.0, dest_f);
+        let [x0, y0, x1, y1] = purecpu_sampler::Quad::dest_rect_of(false, dest_f);
         // Clamp to the framebuffer: an off-screen quad must not drag a dirty
         // rect off-screen with it, where clear_rect would clamp it back anyway
         // and coalesce_to_bands would widen a band for nothing.
@@ -398,6 +433,11 @@ impl crate::TermWindow {
             state.dirty_pixel_rects.clear();
             effective_dirty = effective;
         }
+        // OUTSIDE the if/else on purpose: a full repaint does not use
+        // `last_text_quads` itself, but the frame AFTER it does — that frame's
+        // `before` ink is what the full repaint drew.  Moving this into the
+        // `else` arm loses exactly one frame's erase set, silently and only
+        // after a full repaint.
         state.last_text_quads = text_quads;
 
         let blit_start = Instant::now();
@@ -2464,11 +2504,11 @@ pub(crate) mod test {
         // rule — and it must be clamped, so an off-screen quad cannot drag a
         // band off the bottom of the framebuffer.
         const FB: usize = 48;
-        let mut verts = quad([12.0, 24.0, 18.0, 43.0], [0.0; 4], 3.0, RED, FB, FB);
+        let mut verts = quad([12.0, 24.0, 18.0, 43.0], [0.0; 4], 1.0, RED, FB, FB);
         // Half off the bottom-right corner: 40..60 clamps to 40..48.
-        verts.extend(quad([40.0, 40.0, 60.0, 60.0], [0.0; 4], 3.0, RED, FB, FB));
+        verts.extend(quad([40.0, 40.0, 60.0, 60.0], [0.0; 4], 1.0, RED, FB, FB));
         // Wholly off-screen: dropped entirely rather than recorded empty.
-        verts.extend(quad([50.0, 50.0, 60.0, 60.0], [0.0; 4], 3.0, RED, FB, FB));
+        verts.extend(quad([50.0, 50.0, 60.0, 60.0], [0.0; 4], 1.0, RED, FB, FB));
         let mut out = vec![];
         collect_quad_dest_rects(&verts, FB, FB, &mut out);
         assert_eq!(out, vec![[12, 24, 18, 43], [40, 40, 48, 48]]);
@@ -2476,6 +2516,42 @@ pub(crate) mod test {
         assert_eq!(
             purecpu_sampler::Quad::dest_rect_of(false, [12.0, 24.0, 18.0, 43.0]),
             [12, 24, 18, 43]
+        );
+    }
+
+    #[test]
+    fn collect_quad_dest_rects_skips_the_full_height_border_strips() {
+        // THE REGRESSION THIS GUARDS, in the shape it actually arrives in.
+        // `render/borders.rs` puts the window border strips on buffer 1 — the
+        // glyph buffer — and the left/right strips are FULL WINDOW HEIGHT.  A
+        // lone pane's row band spans the whole window width
+        // (`purecpu_dirty::painted_x_span`), so it meets those strips on every
+        // ordinary frame; unioning them in would grow the band to the whole
+        // window and make every incremental frame a full repaint as soon as
+        // `window_frame.border_left_width` is non-zero.
+        const FB: usize = 200;
+        // A left border strip, exactly as borders.rs builds it: solid, 4 px
+        // wide, the full height of the window.
+        let mut verts = quad([0.0, 0.0, 4.0, 200.0], [0.0; 4], 3.0, RED, FB, FB);
+        // A glyph in row 5, hanging 3 px below its 20 px cell.
+        verts.extend(quad([10.0, 104.0, 18.0, 123.0], [0.0; 4], 1.0, RED, FB, FB));
+        let mut quads = vec![];
+        collect_quad_dest_rects(&verts, FB, FB, &mut quads);
+        // Discriminating in BOTH directions: an implementation that skipped
+        // nothing reports two rects, and one that skipped textured quads by
+        // mistake reports none or the wrong one.
+        assert_eq!(quads, vec![[10, 104, 18, 123]]);
+
+        // …and the consequence, which is the thing that actually matters: the
+        // row band grows to the glyph and NOT to the window.
+        let band = DirtyRect { x: 0, y: 100, width: 200, height: 20 };
+        let orig = vec![band];
+        let mut grown = orig.clone();
+        grow_rects_to_quads(&orig, &mut grown, &quads);
+        assert_eq!(
+            (grown[0].x, grown[0].y, grown[0].width, grown[0].height),
+            (0, 100, 200, 23),
+            "the band grew past the glyph — a full-height strip was unioned in"
         );
     }
 
@@ -2520,8 +2596,14 @@ pub(crate) mod test {
         // --- with the growth: the whole glyph is repainted -------------------
         let mut rig = Rig::new(FB, FB);
         rig.blit(&quad(ink, [0.0; 4], 3.0, RED, FB, FB), true, &[]);
-        let mut quads = vec![];
-        collect_quad_dest_rects(&quad(ink, [0.0; 4], 3.0, GREEN, FB, FB), FB, FB, &mut quads);
+        // The ink rect is supplied directly rather than through
+        // collect_quad_dest_rects, because this quad is IS_SOLID_COLOR and that
+        // function deliberately skips those (see its doc).  The geometry is the
+        // same either way: `dest_rect_of` applies one rule to every quad that is
+        // not IS_BG_IMAGE, so the rect below is the one a sampled glyph of this
+        // extent would contribute.  The filtering itself is graded by
+        // collect_quad_dest_rects_skips_the_full_height_border_strips.
+        let quads = vec![[12i32, 24, 18, 43]];
         let orig = vec![cell_1_1()];
         let mut grown = orig.clone();
         grow_rects_to_quads(&orig, &mut grown, &quads);
