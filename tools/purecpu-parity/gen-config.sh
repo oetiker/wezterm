@@ -11,6 +11,15 @@
 #        RENDER_TARGET=<target>    (default unset = emit nothing; Task 8.
 #                                    One of Normal, Light, Mono,
 #                                    HorizontalLcd, VerticalLcd)
+#        FORCE_FULL_REPAINT=true|false  (default false; sets
+#                                    purecpu_force_full_repaint, PureCpu only.
+#                                    Added for the measurement round: this is
+#                                    the CEILING arm — every frame repaints the
+#                                    whole window, which is what the dirty-rect
+#                                    machinery exists to avoid. Refused for
+#                                    OpenGL, where the option is inert and a
+#                                    silently-inert ceiling would read as "the
+#                                    subject already reaches the ceiling".)
 #
 # The blink/animation defaults below are off (SteadyBlock, rates 0, fps 1)
 # because Tasks 1-4 measured a deliberately static terminal — that was the
@@ -78,6 +87,7 @@ DEFAULT_CURSOR_STYLE="${DEFAULT_CURSOR_STYLE:-SteadyBlock}"
 # bell's fade-mix path (render/mod.rs:233-258), which is otherwise never
 # emitted by this generator.
 VISUAL_BELL="${VISUAL_BELL:-false}"
+FORCE_FULL_REPAINT="${FORCE_FULL_REPAINT:-false}"
 
 # (Task 8) RENDER_TARGET selects the antialiasing mode. Default unset emits
 # nothing at all, so every Tasks 1-7 case reproduces byte-for-byte.
@@ -312,6 +322,19 @@ if [ -n "$WINDOW_DECORATIONS" ]; then
 fi
 if [ "$VISUAL_BELL" = "true" ]; then
   CONFIG_LINES+=("  visual_bell = { fade_in_duration_ms = 300, fade_out_duration_ms = 300 },")
+fi
+if [ "$FORCE_FULL_REPAINT" = "true" ]; then
+  # The ceiling arm. purecpu_force_full_repaint has no effect on the OpenGL
+  # path (termwindow/mod.rs:1207 reads it only when purecpu_state exists), so
+  # emitting it for OpenGL would produce a "ceiling" identical to the subject
+  # and invite exactly the false pass this harness keeps guarding against.
+  if [ "$FRONT_END" != "PureCpu" ]; then
+    echo "gen-config.sh: FORCE_FULL_REPAINT=true is meaningless for" \
+         "front_end=${FRONT_END}; purecpu_force_full_repaint is read only on" \
+         "the PureCpu path. Refusing rather than emitting an inert ceiling." >&2
+    exit 1
+  fi
+  CONFIG_LINES+=("  purecpu_force_full_repaint = true,")
 fi
 if [ -n "$RENDER_TARGET" ]; then
   CONFIG_LINES+=("  freetype_render_target = '${RENDER_TARGET}',")
