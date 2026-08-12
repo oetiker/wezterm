@@ -28,7 +28,15 @@ against that binary. Probes are recorded so they can be re-run.
 > I4 `868159c` · I5/M1 `773b845` · M6/M7 `f78b501` · M3/M4/M5 `b10c3a5`
 > (guarded) · M2 closed by re-measurement, no code change · L1 built, measured
 > null, reverted · L2 `bce58ea` · L3 `230117c` · L4 obsolete (upstream
-> `ef7b636`) · L5 closed on inspection, non-defect · N1 (new, below) unfixed.
+> `ef7b636`) · L5 closed on inspection, non-defect.
+>
+> **Two findings carry an `N` prefix: the fix pass found them, the review did
+> not.** **N2** (Important) — glyph ink escaping a dirtied cell was left stale;
+> **fixed** in `fbbb433`/`6311e97`, and it is the one defect in this pass that
+> was **reproduced in pixels** rather than reasoned about, with a scoped
+> limitation that remains open (animated-image ink is still not covered).
+> **N1** (Low) — a static inline image costs 0.57 ms of CPU per frame;
+> pre-existing, **unfixed**.
 
 Severity vocabulary:
 
@@ -461,6 +469,102 @@ scaled glyphs.
 **Fix direction.** A nearest-neighbour source step
 (`src_col = tex_px_x + col * tex_w / dest_w`) would match the GPU's nearest
 sampler for every non-background case at modest cost.
+
+### N2 — Glyph ink that escapes its cell is left stale, because dirty rects are cell geometry and glyphs are not clipped to cells
+
+`wezterm-gui/src/termwindow/render/screen_line.rs` (the glyph arm — the
+`// TODO: clipping, but we can do that based on pixels` is not an oversight to
+be fixed elsewhere, it is *why* ink leaves the cell),
+`wezterm-gui/src/termwindow/render/purecpu.rs` (`collect_quad_dest_rects`,
+`call_draw_purecpu`)
+
+**Found during the fix pass, not by the review** (hence the `N` prefix, shared
+with N1). **Fixed in `fbbb433`, narrowed in `6311e97`.** It is recorded here
+because it is the **one defect in this pass that was reproduced in pixels rather
+than reasoned about**, and because the fix leaves a scoped limitation that is
+still open.
+
+**Defect.** Every dirty rect PureCpu produces is *cell* geometry — a row band, a
+cursor cell, a blinking cell. A glyph quad is placed at the rasterized sprite's
+own width and height with the glyph's bearings applied, and **nothing clips it
+to the cell**: not `screen_line.rs`, and not the blit, which clamps to the
+framebuffer rather than to the cell. So when a cell is marked dirty and
+repainted, the part of its glyph's ink that lies *outside* the cell is neither
+cleared nor redrawn. It keeps whatever was last presented there — frozen ink
+sitting next to an animating glyph.
+
+**Two things the fix pass had to correct about where the ink goes**, both worth
+keeping because they are the kind of thing that gets assumed:
+
+- **Box-drawing and block characters overhang by exactly zero.**
+  `customglyph.rs::block_sprite` allocates an image of exactly `cell_size` and
+  `screen_line.rs` forces `top = 0.` for a block key, so with the default
+  `custom_block_glyphs = true` they fill their cell precisely.
+- **Horizontal overhang is real** and is present in this tree's default
+  configuration: `ls-fonts` reports the Noto Color Emoji fallback rasterized to
+  a **21 px** sprite in a **19.19 px** two-cell span — ~1.8 px of ink to the
+  right. Negative `bearing_x` (the `shapecache.rs` fixtures carry `-15.0`,
+  `-18.0`) puts ink to the left.
+
+**Why a demonstration needed an unusual config, and why that is not a cheat.**
+Measured with `wezterm-gui ls-fonts --rasterize-ascii` against the harness
+config (JetBrains Mono, `font_size = 12`, 96 dpi, cell ~9.59 x 22 px), **no
+ASCII glyph in this font overhangs vertically at `line_height = 1.0`** — the
+tallest, `[`/`{`, is a 17 px sprite at `bearing_y = 14` in a 22 px cell. That is
+why `corpus/blink-text.sh`, which blinks the all-capitals word "BLINKING",
+**cannot** show this defect, and why a run against it would have reported "no
+overhang" for entirely the wrong reason.
+
+**Failure scenario, measured in pixels.** `corpus/blink-descender.sh` (new,
+committed) blinks `gggjjjyyyqqqppp`, with the blink-text config plus
+**`line_height = 0.75`** — which shrinks the cell *without* rescaling the glyph,
+so the descenders hang about 1 px below it. 12 captures 0.25 s apart per binary:
+
+| binary | row | non-background px | distinct states across frames |
+|---|---|---|---|
+| pre-fix | 79 (inside the cell) | 39 | 6 |
+| pre-fix | **81 (below the cell)** | **54** | **1** |
+| fixed | 79 | 39 | 3 |
+| fixed | **81** | **57** | **3** |
+
+Row 81 in the pre-fix binary holds 54 pixels of ink and is **bit-identical in
+every one of the 12 frames** while the glyph body two rows above it blinks
+through six distinct states. That is frozen descender ink, seen directly. In the
+fixed binary the same row animates.
+
+**Fix.** Not the cell-margin widening first proposed: no bound is derivable at
+the dirty walk, because `AnimatedCellScan` has `Line`s and `attrs()` but no
+shaping, no cluster, no `CachedGlyph` and no sprite sizes — reaching a glyph
+extent from there means re-running the shaper and glyph cache for every animated
+cell on every frame, which *is* the paint pass. Any margin chosen there would be
+a guess. Instead `call_draw_purecpu` collects the frame's **quad destination
+rects** — the exact extent that already exists one stage later — and grows the
+dirty set to the quads that overlap it, before clearing and blitting. Both the
+current frame's and the previous frame's quads are used, because ink that was
+there last frame and is gone this frame must also be erased. Growth is bounded
+by where quads actually paint (~1 px here), not by a margin, which is why it
+does not walk the blink case toward the 37.6% full-repaint ceiling.
+
+**The limitation that remains, and it is not hypothetical.** Only **vertex
+buffer 1** is collected, because that is where glyphs go; backgrounds, selection
+and the cursor sit on buffers 0 and 2 at cell geometry, and growing a rect to
+*their* extent would grow it to the pane-sized background quad and turn every
+incremental frame into a full repaint. **Animated images are on buffer 0**
+(`screen_line.rs`, `populate_image_quad`) and are additionally shifted by
+`padding_left`/`padding_top`, so **an animated image's ink that escapes its cell
+is still not repainted**. Four of the five dirty-rect producers are covered —
+both cursor-movement paths, the bell's `CursorCell`, blinking text, and the row
+bands — and the fifth, animated images, is not. The limitation is stated in
+`collect_quad_dest_rects`'s own doc comment, at the place where the decision to
+exclude buffer 0 is made, so it cannot drift away from its cause. Closing it
+means admitting buffer 0, which cannot be done wholesale.
+
+`6311e97` narrowed the fix after review: buffer 1 turned out to be a necessary
+but not sufficient filter — the window-border strips are on it too — so only
+*sampled* quads may grow a rect.
+
+**Evidence class:** **measured, in pixels**, with a pre-fix control captured in
+the same experiment.
 
 ---
 
