@@ -8,6 +8,11 @@
 #        DEFAULT_CURSOR_STYLE=<s>  (default SteadyBlock, matches Tasks 1-4)
 #        VISUAL_BELL=true|false    (default false; adds a 300ms/300ms fade
 #                                    visual_bell block when true, Task 6)
+#        LINE_HEIGHT=<f>           (default unset = emit nothing; final review.
+#                                    Below 1.0 it shrinks the CELL without
+#                                    shrinking the glyphs, which is what makes
+#                                    descender ink hang past the cell — the
+#                                    only way to reproduce N2 / Task 16.)
 #        RENDER_TARGET=<target>    (default unset = emit nothing; Task 8.
 #                                    One of Normal, Light, Mono,
 #                                    HorizontalLcd, VerticalLcd)
@@ -88,6 +93,35 @@ DEFAULT_CURSOR_STYLE="${DEFAULT_CURSOR_STYLE:-SteadyBlock}"
 # emitted by this generator.
 VISUAL_BELL="${VISUAL_BELL:-false}"
 FORCE_FULL_REPAINT="${FORCE_FULL_REPAINT:-false}"
+
+# (final review, FIX 5) LINE_HEIGHT exists so corpus/blink-descender.sh has a
+# COMMAND rather than a paragraph of prose. N2 / Task 16 is the one defect in
+# this pass reproduced in actual pixels, and its reproduction needs a cell
+# shorter than the glyphs: `RenderMetrics::scale_line_height` scales
+# `cell_size` and nothing rescales the rasterized sprite, so at line_height =
+# 0.75 the descenders of `gjyqp` hang about 1 px past the bottom of the cell.
+# Without this knob that config could not come from gen-config.sh at all, and
+# the standing rule here is that every config does.
+#
+# Default UNSET, emitting nothing — not the 1.0 the review suggested — for the
+# same reason WINDOW_DECORATIONS and RENDER_TARGET are unset by default: every
+# Tasks 1-16 case reproduces BYTE-for-byte, not merely equivalently. (1.0 is
+# also wezterm's own default, config/src/config.rs, so the two agree on
+# behaviour; they differ on whether an unrelated re-measurement can diff its
+# config against an archived one.)
+LINE_HEIGHT="${LINE_HEIGHT:-}"
+# Matched with =~ and anchored, NOT a `case` glob: `[0-9]*.[0-9]*` looks like a
+# number pattern but `*` is any string, so it happily accepts
+# `0.75; os.exit()` — verified, it did.
+if ! [[ "$LINE_HEIGHT" =~ ^$|^[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "gen-config.sh: LINE_HEIGHT=$LINE_HEIGHT is not a number. It is" \
+         "emitted into Lua verbatim as \`line_height = <value>\`, and a" \
+         "non-numeric value is a syntax error that makes wezterm reject the" \
+         "WHOLE config including front_end — both windows then fall back to" \
+         "the same default backend and the comparison measures a backend" \
+         "against itself, reporting a meaningless AE=0." >&2
+    exit 1
+fi
 
 # (Task 8) RENDER_TARGET selects the antialiasing mode. Default unset emits
 # nothing at all, so every Tasks 1-7 case reproduces byte-for-byte.
@@ -335,6 +369,9 @@ if [ "$FORCE_FULL_REPAINT" = "true" ]; then
     exit 1
   fi
   CONFIG_LINES+=("  purecpu_force_full_repaint = true,")
+fi
+if [ -n "$LINE_HEIGHT" ]; then
+  CONFIG_LINES+=("  line_height = ${LINE_HEIGHT},")
 fi
 if [ -n "$RENDER_TARGET" ]; then
   CONFIG_LINES+=("  freetype_render_target = '${RENDER_TARGET}',")

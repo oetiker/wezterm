@@ -17,6 +17,16 @@
 #      cell_size; nothing rescales the rasterized sprite).  At line_height =
 #      0.75 the descenders hang about 1 px past the bottom of the cell.
 #
+# Since the final review fix wave `gen-config.sh` can express this, so the
+# reproduction is a command rather than a paragraph:
+#
+#   LINE_HEIGHT=0.75 TEXT_BLINK_RATE=400 ANIMATION_FPS=30 \
+#     ./gen-config.sh PureCpu out/purecpu-lh.lua
+#
+# All three are load-bearing.  The harness defaults TEXT_BLINK_RATE to 0 and
+# ANIMATION_FPS to 1, and with those the SGR 5 text below does not blink at
+# all — the run then finds no frozen row for entirely the wrong reason.
+#
 # Measured at line_height = 0.75, 1280x1024 on :20, 12 captures 0.25 s apart:
 # the pre-fix binary animates screen rows 67..80 and leaves row 81 — 54 pixels
 # of descender ink — bit-identical in every frame, while the fixed binary
