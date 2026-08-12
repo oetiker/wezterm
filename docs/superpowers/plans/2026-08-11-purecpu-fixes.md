@@ -1820,13 +1820,15 @@ git commit -m "docs(purecpu): update the review deliverables to the post-fix bin
 - Whether a font yielding `glyph.scale != 1` exists on this machine (Task 1 Step 8). If not, that matrix row stays unverified and says so.
 - Whether M2 survives Task 4 at all (Task 11 Step 2).
 - Whether the shader-equivalence rewrite (spec §3 option C) becomes worthwhile now that the sampler and dirty units have tests.
+- **Cell background rendering is correct only while `cell_width` is integral, and nothing enforces that.** Answered by Task 15, not closed by it. `screen_line.rs` builds one cluster's right edge as `(left + i*cw) + (w*cw)` and the next cluster's left as `left + ((i+w)*cw)`; those are different floats. Today `cell_width = cell_size.width as f32 * width_scale` is always an integer, which makes `i * cw` exact and the two forms bit-identical over 2.34M measured boundaries. Make it fractional — fractional DPI scaling is the plausible route — and a 1px unwritten column appears at roughly 1 boundary in 30,000. Pinned by `adjacent_solid_quads_can_seam_at_a_fractional_cell_width`. **Not a parity defect:** GL rasterises the same two edges under the same pixel-centre rule and drops the same column.
 
 ---
 
 ### Task 15: A framebuffer harness for the blit loop — added by Task 7's review
 
-**Status: proposed, not authorised.** Added by the controller after Task 7's
-review; the user has not yet ruled on whether it belongs in this pass.
+**Status: AUTHORISED by the user.** Added by the controller after Task 7's
+review; the user ruled it into this pass. Item 3 below (the deferred perf fix)
+is a separate follow-up once the harness exists — not part of Task 15 itself.
 
 **Why.** `call_draw_purecpu` is executed by no test. An unconditional `panic!` on
 the first line of its clip loop leaves the suite green (69 passed, exit 0), so the
