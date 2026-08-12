@@ -2086,8 +2086,48 @@ pub(crate) mod test {
     /// 4,5,6,7 read atlas columns 12,13,14,15, whose `col % 4` is 0,1,2,3.  So
     /// the four columns carry coverage 255, 128, 64 and 0 respectively: one
     /// opaque texel, two partial, one empty.
+    ///
+    /// That alignment is *asserted* rather than left to the comment above,
+    /// because the fixture and the expectations can otherwise drift into
+    /// agreement without either being right: shift the `tex` origin from 12 to
+    /// 13 and regenerate the expected tables and both tests stay green while
+    /// "one opaque, two partial, one empty" quietly becomes a rotation of
+    /// itself.  Worse, a `dest_extent != src_extent` geometry stops `texel_x`
+    /// being a translation, so two destination columns can read one atlas
+    /// column and the four-distinct-coverages premise fails silently.  The
+    /// check below re-derives the mapping from [`purecpu_sampler::Quad`] — the
+    /// same type the loop uses — so it cannot agree with a wrong fixture.
+    /// [`quad`] and [`quad_at`] guard the analogous hazard for their own
+    /// arithmetic; this is the missing third.
     fn coverage_quad(has_color: f32, fg: [f32; 4]) -> Vec<Vertex> {
-        quad([4.0, 4.0, 8.0, 8.0], [12.0, 0.0, 16.0, 4.0], has_color, fg, 16, 16)
+        let dest = [4.0, 4.0, 8.0, 8.0];
+        let tex = [12.0, 0.0, 16.0, 4.0];
+
+        let probe = purecpu_sampler::Quad::new(
+            false,
+            dest,
+            tex,
+            PROBE_ATLAS as i32,
+            PROBE_ATLAS as i32,
+        );
+        let [dx0, _, dx1, _] = probe.dest_rect();
+        assert_eq!(
+            dx1 - dx0,
+            COVERAGE.len() as i32,
+            "the coverage fixture needs exactly one destination column per COVERAGE entry"
+        );
+        let seen: Vec<u8> = (dx0..dx1)
+            .map(|dx| COVERAGE[(probe.texel_x(dx) as usize) % COVERAGE.len()])
+            .collect();
+        assert_eq!(
+            seen,
+            COVERAGE.to_vec(),
+            "the coverage quad no longer reads one opaque, two partial and one \
+             empty texel in that order — re-derive the expected tables in the \
+             tests below rather than adjusting this assertion"
+        );
+
+        quad(dest, tex, has_color, fg, 16, 16)
     }
 
     #[test]
