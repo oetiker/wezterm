@@ -15,6 +15,8 @@ use skrifa::color::{Brush, ColorPainter, CompositeMode as SkrifaCompositeMode, E
 use skrifa::instance::Size;
 use skrifa::outline::{DrawSettings, HintingInstance, OutlinePen, SmoothMode, Target};
 use skrifa::MetadataProvider;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 use wezterm_color_types::linear_u8_to_srgb8;
 
@@ -62,6 +64,23 @@ pub struct SkrifaRasterizer {
     scale: f64,
     hinting_config: HintingConfig,
     use_lcd_subpixel: bool,
+    /// L2: `HintingInstance::new` interprets the font's hinting programs
+    /// (`fpgm`/`prep` for glyf, or builds the autohint analysis) and was
+    /// being rebuilt for every glyph rasterized.  Nothing it depends on
+    /// varies per glyph, so it is cached here instead.
+    ///
+    /// The key is the pixel size's bit pattern.  `HintingInstance::new`
+    /// takes four inputs (skrifa-0.40.0 `outline/hint.rs:290`): the outline
+    /// collection, the size, the variation location and the target.  Of
+    /// those, the collection and the target are fixed for the life of this
+    /// rasterizer (`font_data`/`font_index` and `hinting_config` are never
+    /// mutated) and the location is always `LocationRef::default()` at the
+    /// single call site, so the size is the only thing that varies.  It is
+    /// an `f32`, hence `to_bits` rather than a float key: two sizes that
+    /// are bit-identical produce an identical instance, and any other pair
+    /// simply misses the cache.  **If a variable location is ever passed
+    /// here, its normalized coords must join this key.**
+    hinting_cache: RefCell<HashMap<u32, Arc<HintingInstance>>>,
 }
 
 impl SkrifaRasterizer {
@@ -87,7 +106,34 @@ impl SkrifaRasterizer {
             scale: parsed.scale.unwrap_or(1.0),
             hinting_config,
             use_lcd_subpixel,
+            hinting_cache: RefCell::new(HashMap::new()),
         })
+    }
+
+    /// L2: the cached `HintingInstance` for `skrifa_size`, built on first
+    /// use.  See the field comment for why the size alone keys it.
+    fn hinting_instance(
+        &self,
+        outlines: &skrifa::outline::OutlineGlyphCollection<'_>,
+        skrifa_size: Size,
+        location: skrifa::instance::LocationRef<'_>,
+        target: Target,
+    ) -> anyhow::Result<Arc<HintingInstance>> {
+        // `Size::ppem()` is `None` for an unscaled size; fold that to 0.0,
+        // which no scaled size can take, so the unhinted-metrics case gets
+        // its own slot instead of colliding with one.
+        let key = skrifa_size.ppem().unwrap_or(0.0).to_bits();
+        if let Some(hinting) = self.hinting_cache.borrow().get(&key) {
+            return Ok(Arc::clone(hinting));
+        }
+        let hinting = Arc::new(
+            HintingInstance::new(outlines, skrifa_size, location, target)
+                .map_err(|e| anyhow::anyhow!("hinting instance error: {}", e))?,
+        );
+        self.hinting_cache
+            .borrow_mut()
+            .insert(key, Arc::clone(&hinting));
+        Ok(hinting)
     }
 
     fn font_ref(&self) -> anyhow::Result<skrifa::FontRef<'_>> {
@@ -160,14 +206,8 @@ impl SkrifaRasterizer {
         // Draw with or without hinting
         let _adjusted = match &self.hinting_config {
             HintingConfig::Hinted(target) => {
-                let hinting = HintingInstance::new(
-                    outlines,
-                    skrifa_size,
-                    location,
-                    *target,
-                )
-                .map_err(|e| anyhow::anyhow!("hinting instance error: {}", e))?;
-                let settings = DrawSettings::hinted(&hinting, false);
+                let hinting = self.hinting_instance(outlines, skrifa_size, location, *target)?;
+                let settings = DrawSettings::hinted(hinting.as_ref(), false);
                 outline_glyph
                     .draw(settings, &mut pen)
                     .map_err(|e| anyhow::anyhow!("outline draw error: {}", e))?
@@ -859,6 +899,91 @@ mod tests {
         let colors = palette_colors(&records, Some(0), 2).expect("palette 0 exists");
         assert_eq!(colors[0].as_rgba(), (10, 20, 30, 255));
         assert_eq!(colors[1].as_rgba(), (0, 0, 0, 255));
+    }
+
+    // L2: the HintingInstance cache. These tests DO use a font file, because
+    // there is no way to build a HintingInstance without one.
+
+    const TEST_FONT: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../assets/fonts/JetBrainsMono-Regular.ttf"
+    );
+
+    fn hinted_rasterizer() -> SkrifaRasterizer {
+        let data = std::fs::read(TEST_FONT).expect("bundled test font is readable");
+        SkrifaRasterizer {
+            font_data: Arc::new(data),
+            font_index: 0,
+            synthesize_bold: false,
+            synthesize_italic: false,
+            display_pixel_geometry: DisplayPixelGeometry::RGB,
+            scale: 1.0,
+            hinting_config: HintingConfig::Hinted(Target::Smooth {
+                mode: SmoothMode::Normal,
+                symmetric_rendering: true,
+                preserve_linear_metrics: false,
+            }),
+            use_lcd_subpixel: false,
+            hinting_cache: RefCell::new(HashMap::new()),
+        }
+    }
+
+    fn glyph_for(r: &SkrifaRasterizer, c: char) -> u32 {
+        let font_ref = r.font_ref().expect("test font parses");
+        font_ref
+            .charmap()
+            .map(c)
+            .expect("test font covers ASCII")
+            .to_u32()
+    }
+
+    #[test]
+    fn hinting_instance_is_built_once_per_size_not_once_per_glyph() {
+        let r = hinted_rasterizer();
+        let (a, b) = (glyph_for(&r, 'A'), glyph_for(&r, 'B'));
+        assert_ne!(a, b, "two distinct glyphs, or the test proves nothing");
+
+        r.rasterize_glyph(a, 12.0, 96).expect("rasterize A");
+        r.rasterize_glyph(b, 12.0, 96).expect("rasterize B");
+        r.rasterize_glyph(a, 12.0, 96).expect("rasterize A again");
+        assert_eq!(
+            r.hinting_cache.borrow().len(),
+            1,
+            "three rasterizations at one size must share one instance"
+        );
+
+        // The discriminating negative: a different size is a different
+        // instance and must not be served from the first one's slot.
+        r.rasterize_glyph(a, 24.0, 96).expect("rasterize A at 24");
+        assert_eq!(r.hinting_cache.borrow().len(), 2);
+
+        // dpi feeds the same pixel_size, so 12pt@192dpi keys with 24pt@96dpi.
+        r.rasterize_glyph(a, 12.0, 192)
+            .expect("rasterize A at 192dpi");
+        assert_eq!(r.hinting_cache.borrow().len(), 2);
+    }
+
+    #[test]
+    fn a_cached_hinting_instance_rasterizes_identically_to_a_fresh_one() {
+        // The cache must be invisible in the output. Warm one rasterizer on a
+        // different glyph first, then compare its 'A' against a cold
+        // rasterizer's 'A': if the cached instance carried any per-glyph
+        // state, these would differ.
+        let cold = hinted_rasterizer();
+        let warm = hinted_rasterizer();
+        let a = glyph_for(&cold, 'A');
+        warm.rasterize_glyph(glyph_for(&warm, 'W'), 18.0, 96)
+            .expect("warm-up");
+
+        let from_cold = cold.rasterize_glyph(a, 18.0, 96).expect("cold A");
+        let from_warm = warm.rasterize_glyph(a, 18.0, 96).expect("warm A");
+
+        assert!(!from_cold.data.is_empty(), "'A' must actually rasterize");
+        assert_eq!(from_cold.width, from_warm.width);
+        assert_eq!(from_cold.height, from_warm.height);
+        assert_eq!(from_cold.bearing_x, from_warm.bearing_x);
+        assert_eq!(from_cold.bearing_y, from_warm.bearing_y);
+        assert_eq!(from_cold.data, from_warm.data);
     }
 
     #[test]
