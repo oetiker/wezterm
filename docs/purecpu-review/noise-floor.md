@@ -1,5 +1,21 @@
 # PureCpu / OpenGL noise floor
 
+> **Status after the fix pass (Task 14).** This document is a *calibration
+> record*, so its numbers are left as they were measured, against the pre-fix
+> binary. Two things have changed since, and both are marked at the point of
+> use below:
+>
+> 1. **Finding 2 is closed.** The fancy tab bar's 1 px glyph shift was fixed by
+>    `773b845`; the tab strip now behaves like the body. See "Finding 2 —
+>    closed" below for the re-run numbers.
+> 2. **The noise floor itself is unchanged**, which is the more important of
+>    the two: body `AE = 2434`, body `PAE = 257`, body `AE = 0` from 0.5% fuzz
+>    upward, empty background `AE = 0`. The gate below therefore stands exactly
+>    as written and needs no recalibration.
+>
+> Re-run against `wezterm-gui-6311e97` with the same two commands the
+> "Reproducing" section prints.
+
 **Task 3 (gate) — outcome: PROCEED for the terminal body with `FUZZ = 1` plus a
 body `PAE <= 257` assertion, STOP for the tab-bar strip.**
 
@@ -140,6 +156,53 @@ The difference is deterministic, reproducible, and independent of focus.
 window chrome parity). It must **not** be dissolved into `FUZZ` — no fuzz value
 absorbs it anyway. Task 5 should treat the tab strip as a region with a known
 open defect rather than as a clean baseline.
+
+### Finding 2 — CLOSED (Task 14), fixed in `773b845`
+
+The cause was `findings.md` M1: destination coordinates were truncated with
+`as i32` instead of rounded, so a quad whose destination edge is not integral
+started up to one pixel early. The fancy tab bar computes element positions in
+floats, which is why it showed the defect and the retro bar (ordinary monospace
+cells on an integral grid) never did. The fix rounds.
+
+Re-running `./focus-probe.sh` unmodified against `wezterm-gui-6311e97` — the
+same script, the same corpus, the same two comparisons — now reports the
+**opposite** result on the test that originally established the finding:
+
+| region (y 12-23) | gl[x] vs cpu[x] | gl[x] vs cpu[x-1] |
+|---|---|---|
+| x 29-40 | **AE = 0** | AE = 88 |
+| x 49-58 | **AE = 0** | AE = 69 |
+
+The `AE = 0` has moved from the shifted alignment to the unshifted one. That is
+the sharpest form the result can take: those glyph runs are now bit-identical
+to OpenGL's, and it is the *shifted* comparison that is wrong. The global-`dx`
+sweep agrees — `dx = 0` gives `AE = 0`, against 349 at ±1 and 432 at ±2, where
+before the best value at `dx = 0` was 164 and nothing reached zero.
+
+**This also removes the one thing that kept the tab strip out of the gate.**
+The strip's fuzz-0 `AE` falls **188 → 24**, and it now reaches **0 from 0.5%
+fuzz upward**, exactly like the body — where before, residuals there survived
+every fuzz value up to 50%. Post-fix sweep, focus-matched, whole
+frame / tab strip / body:
+
+| fuzz | whole frame | tab strip | body |
+|---|---|---|---|
+| 0%    | 2458 | 24 | 2434 |
+| 0.25% | 2458 | 24 | 2434 |
+| 0.5% and above (to 50%) | **0** | **0** | **0** |
+
+The focus arithmetic still closes exactly, which is the check that the harness
+itself has not drifted: focus-mismatched 2618, focus-matched 2458, focus delta
+160, and 2458 + 160 = 2618.
+
+**Scope limit 1 in "Decision" below is therefore obsolete as a statement about
+the current binary** — the tab strip no longer has an open defect that no fuzz
+value hides. It is left in place because the rule it states ("do not raise
+`FUZZ` to make the tab strip pass") is still the right rule, and because the
+tab strip still has no independently calibrated noise floor of its own: chrome
+pixels are graded on explicit per-region evidence, not on a threshold. See
+`parity-matrix.md`, "Grading basis for chrome pixels".
 
 ---
 
