@@ -429,26 +429,18 @@ fn blit_vertex_buffer(
                 br.position[0] + half_w,
                 br.position[1] + half_h,
             ];
-            let tex_f = [
-                tl.tex[0] * atlas_w as f32,
-                tl.tex[1] * atlas_h as f32,
-                br.tex[0] * atlas_w as f32,
-                br.tex[1] * atlas_h as f32,
-            ];
-
             // `has_color == 2.0` (IS_BG_IMAGE) stays on the pre-Task-7
             // path — truncated rect, 1:1 crop — because background
             // image is out of scope for this pass and GL samples that
             // branch with a linear sampler, not Nearest.  See the
             // `purecpu_sampler` module doc.
-            let quad = purecpu_sampler::Quad::new(
-                has_color == 2.0,
-                dest_f,
-                tex_f,
-                atlas_w as i32,
-                atlas_h as i32,
-            );
-            let [dest_x, dest_y, dest_x2, dest_y2] = quad.dest_rect();
+            let bg_image = has_color == 2.0;
+
+            // Destination rect only, for now: the source mapping is built
+            // further down, after the two bails, so an incremental repaint
+            // does not pay to sample a quad it discards.
+            let [dest_x, dest_y, dest_x2, dest_y2] =
+                purecpu_sampler::Quad::dest_rect_of(bg_image, dest_f);
 
             let dest_w = dest_x2 - dest_x;
             let dest_h = dest_y2 - dest_y;
@@ -545,6 +537,24 @@ fn blit_vertex_buffer(
             // — non-native inline images, DECDWL/DECDHL, and scaled
             // bitmap glyphs.  `blit_end` still crops for IS_BG_IMAGE,
             // and still drops the quad when that crop is empty.
+            //
+            // This is the first point where the source mapping is needed at
+            // all — solid-colour quads returned above without one — so it is
+            // built here rather than at the top of the iteration.
+            let tex_f = [
+                tl.tex[0] * atlas_w as f32,
+                tl.tex[1] * atlas_h as f32,
+                br.tex[0] * atlas_w as f32,
+                br.tex[1] * atlas_h as f32,
+            ];
+            let quad = purecpu_sampler::Quad::new(
+                bg_image,
+                dest_f,
+                tex_f,
+                atlas_w as i32,
+                atlas_h as i32,
+            );
+
             let Some((blit_x2, blit_y2)) = quad.blit_end() else {
                 continue;
             };
