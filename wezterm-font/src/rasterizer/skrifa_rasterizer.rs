@@ -367,21 +367,12 @@ impl SkrifaRasterizer {
         let cpal = font_ref.cpal().ok()?;
         let num_entries = cpal.num_palette_entries();
         let color_records = cpal.color_records_array()?.ok()?;
-        let first_color_index = cpal.color_record_indices()[0].get() as usize;
-        let colors: Vec<wezterm_color_types::SrgbaPixel> = (0..num_entries as usize)
-            .map(|i| {
-                let idx = first_color_index + i;
-                if idx < color_records.len() {
-                    let c = &color_records[idx];
-                    wezterm_color_types::SrgbaPixel::rgba(c.red(), c.green(), c.blue(), c.alpha())
-                } else {
-                    wezterm_color_types::SrgbaPixel::rgba(0, 0, 0, 255)
-                }
-            })
-            .collect();
+        // A CPAL table declaring numPalettes = 0 has an empty index array;
+        // indexing it would abort the process.
+        let first_color_index = cpal.color_record_indices().first().map(|i| i.get() as usize);
+        let colors = palette_colors(color_records, first_color_index, num_entries)?;
 
-        let upem = font_ref.head().ok()?.units_per_em() as f32;
-        let scale = pixel_size / upem;
+        let scale = colr_scale(pixel_size, font_ref.head().ok()?.units_per_em())?;
 
         let mut collector = PaintOpCollector {
             ops: Vec::new(),
@@ -402,6 +393,45 @@ impl SkrifaRasterizer {
             _ => None,
         }
     }
+}
+
+/// Resolve the default CPAL palette into a colour table.
+///
+/// `first_color_index` is the start of the first palette in the colour-record
+/// array, or `None` when the CPAL table declares no palettes at all. There is
+/// nothing to render a COLR glyph with in that case, so we return `None` and
+/// let the caller fall back to the monochrome outline path.
+fn palette_colors(
+    color_records: &[read_fonts::tables::cpal::ColorRecord],
+    first_color_index: Option<usize>,
+    num_entries: u16,
+) -> Option<Vec<wezterm_color_types::SrgbaPixel>> {
+    let first_color_index = first_color_index?;
+    Some(
+        (0..num_entries as usize)
+            .map(|i| {
+                let idx = first_color_index + i;
+                if idx < color_records.len() {
+                    let c = &color_records[idx];
+                    wezterm_color_types::SrgbaPixel::rgba(c.red(), c.green(), c.blue(), c.alpha())
+                } else {
+                    wezterm_color_types::SrgbaPixel::rgba(0, 0, 0, 255)
+                }
+            })
+            .collect(),
+    )
+}
+
+/// Font-units-to-pixels scale for the COLR path.
+///
+/// `unitsPerEm` comes straight off the `head` table as a `u16`; a malformed
+/// font may declare zero, which would make the scale infinite and push
+/// non-finite coordinates into every path we build. Refuse instead.
+fn colr_scale(pixel_size: f32, units_per_em: u16) -> Option<f32> {
+    if units_per_em == 0 {
+        return None;
+    }
+    Some(pixel_size / units_per_em as f32)
 }
 
 /// Bridges skrifa's ColorPainter trait to our PaintOp list for skia_colr rendering.
@@ -782,5 +812,66 @@ fn map_freetype_config(
             }),
             true,
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use read_fonts::tables::cpal::ColorRecord;
+
+    // These tests exercise the guards themselves, not any font that reaches
+    // them. No font file is involved: the degenerate inputs (an absent first
+    // palette index, a zero unitsPerEm) are constructed directly.
+
+    fn record(red: u8, green: u8, blue: u8, alpha: u8) -> ColorRecord {
+        ColorRecord {
+            blue,
+            green,
+            red,
+            alpha,
+        }
+    }
+
+    #[test]
+    fn cpal_without_palettes_yields_no_colors() {
+        // numPalettes == 0 leaves color_record_indices() empty, so the caller
+        // has no first index to hand us.
+        let records = [record(1, 2, 3, 255)];
+        assert!(palette_colors(&records, None, 1).is_none());
+    }
+
+    #[test]
+    fn cpal_with_a_palette_resolves_its_colors() {
+        // The discriminating negative: a well-formed CPAL must still resolve.
+        let records = [record(10, 20, 30, 255), record(40, 50, 60, 128)];
+        let colors = palette_colors(&records, Some(0), 2).expect("palette 0 exists");
+        assert_eq!(colors.len(), 2);
+        assert_eq!(colors[0].as_rgba(), (10, 20, 30, 255));
+        assert_eq!(colors[1].as_rgba(), (40, 50, 60, 128));
+    }
+
+    #[test]
+    fn palette_entries_past_the_record_array_fall_back_to_opaque_black() {
+        // Pre-existing behaviour, pinned so the guard's refactor is visible if
+        // it ever changes.
+        let records = [record(10, 20, 30, 255)];
+        let colors = palette_colors(&records, Some(0), 2).expect("palette 0 exists");
+        assert_eq!(colors[0].as_rgba(), (10, 20, 30, 255));
+        assert_eq!(colors[1].as_rgba(), (0, 0, 0, 255));
+    }
+
+    #[test]
+    fn zero_units_per_em_has_no_colr_scale() {
+        // Without the guard this is pixel_size / 0.0 == inf, which poisons
+        // every path coordinate downstream.
+        assert_eq!(colr_scale(16.0, 0), None);
+    }
+
+    #[test]
+    fn a_normal_units_per_em_scales() {
+        // The discriminating negative for the zero check.
+        assert_eq!(colr_scale(16.0, 1000), Some(0.016));
+        assert_eq!(colr_scale(32.0, 2048), Some(0.015625));
     }
 }

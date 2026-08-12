@@ -134,12 +134,20 @@ fn render_ops_to_pixmap(
                 }
             }
             PaintOp::PushClip(draw_ops) => {
-                let path = draw_ops_to_path(draw_ops);
-                let ts = compute_transform(&transform_stack);
-                let mut mask = tiny_skia::Mask::new(pixmap.width(), pixmap.height())
-                    .ok_or_else(|| anyhow::anyhow!("failed to create clip mask"))?;
-                mask.fill_path(&path, tiny_skia::FillRule::Winding, true, ts);
-                clip_mask_stack.push(Some(mask));
+                // The ops may not form a usable path (no outline for the
+                // referenced glyph, or non-finite coordinates). Push an
+                // unclipped entry rather than a mask, exactly as PushRectClip
+                // below does when its rect is degenerate: the stack has to stay
+                // balanced for the matching PopClip.
+                if let Some(path) = draw_ops_to_path(draw_ops) {
+                    let ts = compute_transform(&transform_stack);
+                    let mut mask = tiny_skia::Mask::new(pixmap.width(), pixmap.height())
+                        .ok_or_else(|| anyhow::anyhow!("failed to create clip mask"))?;
+                    mask.fill_path(&path, tiny_skia::FillRule::Winding, true, ts);
+                    clip_mask_stack.push(Some(mask));
+                } else {
+                    clip_mask_stack.push(None);
+                }
             }
             PaintOp::PushRectClip {
                 xmin,
@@ -661,4 +669,101 @@ fn reduce_anchors(
 
     let k = (q2x * q1x + q2y * q1y) / s;
     (x0, y0, x1 - k * q2x, y1 - k * q2y)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wezterm_color_types::SrgbaPixel;
+
+    // These tests exercise how the renderer handles a PushClip whose draw ops
+    // do not form a usable path. They test the guard, not a font that reaches
+    // it: the empty op list is constructed directly, and no COLR font that
+    // produces one was ever obtained.
+
+    const SIZE: u32 = 8;
+
+    fn opaque_pixel_count(pixmap: &tiny_skia::Pixmap) -> usize {
+        pixmap.data().chunks_exact(4).filter(|p| p[3] == 255).count()
+    }
+
+    fn opaque_columns(pixmap: &tiny_skia::Pixmap) -> Vec<usize> {
+        let data = pixmap.data();
+        (0..SIZE as usize)
+            .filter(|x| data[x * 4 + 3] == 255)
+            .collect()
+    }
+
+    fn red() -> PaintOp {
+        PaintOp::PaintSolid(SrgbaPixel::rgba(255, 0, 0, 255))
+    }
+
+    #[test]
+    fn an_unusable_clip_path_leaves_the_paint_unclipped() {
+        // PushClip(vec![]) cannot produce a path. We push an unclipped entry,
+        // so the solid fill still covers the whole pixmap. The alternative --
+        // pushing an all-zero mask -- would paint nothing at all.
+        let mut pixmap = tiny_skia::Pixmap::new(SIZE, SIZE).unwrap();
+        let ops = vec![PaintOp::PushClip(vec![]), red(), PaintOp::PopClip];
+        let has_color =
+            render_ops_to_pixmap(&mut pixmap, &ops, tiny_skia::Transform::identity()).unwrap();
+        assert!(has_color);
+        assert_eq!(opaque_pixel_count(&pixmap), (SIZE * SIZE) as usize);
+    }
+
+    #[test]
+    fn an_unusable_clip_path_still_balances_the_clip_stack() {
+        // The inner PushClip/PopClip pair must cancel out and leave the outer
+        // rect clip in force. If the unusable push were simply skipped, the
+        // inner PopClip would drop the outer clip and the fill would cover the
+        // whole pixmap instead of its left half.
+        let mut pixmap = tiny_skia::Pixmap::new(SIZE, SIZE).unwrap();
+        let ops = vec![
+            PaintOp::PushRectClip {
+                xmin: 0.0,
+                ymin: 0.0,
+                xmax: 4.0,
+                ymax: SIZE as f32,
+            },
+            PaintOp::PushClip(vec![]),
+            PaintOp::PopClip,
+            red(),
+            PaintOp::PopClip,
+        ];
+        render_ops_to_pixmap(&mut pixmap, &ops, tiny_skia::Transform::identity()).unwrap();
+        assert_eq!(opaque_columns(&pixmap), vec![0, 1, 2, 3]);
+        assert_eq!(opaque_pixel_count(&pixmap), (4 * SIZE) as usize);
+    }
+
+    #[test]
+    fn a_usable_clip_path_still_clips() {
+        // The discriminating negative: a real clip path must still restrict
+        // the paint, otherwise the guard is indistinguishable from dropping
+        // clipping altogether.
+        use crate::rasterizer::paint_ops::DrawOp;
+        let mut pixmap = tiny_skia::Pixmap::new(SIZE, SIZE).unwrap();
+        let clip = vec![
+            DrawOp::MoveTo {
+                to_x: 0.0,
+                to_y: 0.0,
+            },
+            DrawOp::LineTo {
+                to_x: 4.0,
+                to_y: 0.0,
+            },
+            DrawOp::LineTo {
+                to_x: 4.0,
+                to_y: SIZE as f32,
+            },
+            DrawOp::LineTo {
+                to_x: 0.0,
+                to_y: SIZE as f32,
+            },
+            DrawOp::ClosePath,
+        ];
+        let ops = vec![PaintOp::PushClip(clip), red(), PaintOp::PopClip];
+        render_ops_to_pixmap(&mut pixmap, &ops, tiny_skia::Transform::identity()).unwrap();
+        assert_eq!(opaque_columns(&pixmap), vec![0, 1, 2, 3]);
+        assert_eq!(opaque_pixel_count(&pixmap), (4 * SIZE) as usize);
+    }
 }

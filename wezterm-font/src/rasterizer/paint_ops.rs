@@ -286,7 +286,13 @@ pub struct ImageExtents {
 }
 
 /// Convert draw ops to a tiny_skia path.
-pub fn draw_ops_to_path(ops: &[DrawOp]) -> tiny_skia::Path {
+///
+/// Returns `None` when the ops cannot form a path: an empty op list, a lone
+/// `MoveTo`, or non-finite coordinates all make `PathBuilder::finish` fail.
+/// The caller decides what to do with an unusable path; there is no degenerate
+/// path that can be manufactured here, because a builder holding a single verb
+/// cannot be finished either.
+pub fn draw_ops_to_path(ops: &[DrawOp]) -> Option<tiny_skia::Path> {
     let mut pb = tiny_skia::PathBuilder::new();
     for op in ops {
         match op {
@@ -326,10 +332,79 @@ pub fn draw_ops_to_path(ops: &[DrawOp]) -> tiny_skia::Path {
             }
         }
     }
-    pb.finish().unwrap_or_else(|| {
-        // Return an empty path as fallback
-        let mut pb2 = tiny_skia::PathBuilder::new();
-        pb2.move_to(0.0, 0.0);
-        pb2.finish().unwrap()
-    })
+    pb.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These tests exercise the guard itself, not any font that reaches it.
+    // No font file is involved and none of these inputs was observed in the
+    // wild; they are the shapes of draw-op list that make PathBuilder::finish
+    // fail.
+
+    #[test]
+    fn empty_op_list_has_no_path() {
+        // The reachable case: PaintOpCollector emits PushClip(vec![]) for a
+        // glyph with no outline.
+        assert!(draw_ops_to_path(&[]).is_none());
+    }
+
+    #[test]
+    fn lone_move_to_has_no_path() {
+        // tiny-skia refuses a builder holding exactly one verb, so this is the
+        // input that made the old `move_to`-only fallback unfinishable.
+        let ops = vec![DrawOp::MoveTo {
+            to_x: 0.0,
+            to_y: 0.0,
+        }];
+        assert!(draw_ops_to_path(&ops).is_none());
+    }
+
+    #[test]
+    fn non_finite_coordinates_have_no_path() {
+        // What an infinite scale (units_per_em == 0) would produce.
+        let ops = vec![
+            DrawOp::MoveTo {
+                to_x: 0.0,
+                to_y: 0.0,
+            },
+            DrawOp::LineTo {
+                to_x: f32::INFINITY,
+                to_y: 0.0,
+            },
+            DrawOp::ClosePath,
+        ];
+        assert!(draw_ops_to_path(&ops).is_none());
+    }
+
+    #[test]
+    fn a_real_triangle_still_becomes_a_path() {
+        // The discriminating negative: a well-formed outline must still take
+        // the normal path, otherwise the guard is indistinguishable from a
+        // function that always returns None.
+        let ops = vec![
+            DrawOp::MoveTo {
+                to_x: 0.0,
+                to_y: 0.0,
+            },
+            DrawOp::LineTo {
+                to_x: 4.0,
+                to_y: 0.0,
+            },
+            DrawOp::LineTo {
+                to_x: 4.0,
+                to_y: 2.0,
+            },
+            DrawOp::ClosePath,
+        ];
+        let path = draw_ops_to_path(&ops).expect("a closed triangle is a valid path");
+        let bounds = path.bounds();
+        assert_eq!(bounds.left(), 0.0);
+        assert_eq!(bounds.top(), 0.0);
+        assert_eq!(bounds.right(), 4.0);
+        assert_eq!(bounds.bottom(), 2.0);
+        assert_eq!(path.len(), 4);
+    }
 }
