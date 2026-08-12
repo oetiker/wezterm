@@ -797,18 +797,25 @@ impl crate::TermWindow {
                     // part of blinking then set fg = bg.  This is a cheap
                     // means of getting it done without impacting other
                     // features.
-                    let blink_rate = match attrs.blink() {
+                    let colorease = match attrs.blink() {
                         Blink::None => None,
-                        Blink::Slow => {
-                            Some((params.config.text_blink_rate, self.blink_state.borrow_mut()))
-                        }
-                        Blink::Rapid => Some((
-                            params.config.text_blink_rate_rapid,
-                            self.rapid_blink_state.borrow_mut(),
-                        )),
+                        Blink::Slow => Some(self.blink_state.borrow_mut()),
+                        Blink::Rapid => Some(self.rapid_blink_state.borrow_mut()),
                     };
-                    if let Some((blink_rate, mut colorease)) = blink_rate {
-                        if blink_rate != 0 {
+                    if let Some(mut colorease) = colorease {
+                        // The `rate != 0` test this used to spell out inline now
+                        // lives in purecpu_dirty, and the renderer consumes it
+                        // rather than the other way round.  PureCpu has to
+                        // predict, from outside the paint pass, exactly which
+                        // cells this branch will ease — a second copy of the
+                        // rule would be free to drift, and a blinking cell
+                        // PureCpu fails to repaint stays at the intensity the
+                        // last paint left, which starts at fg == bg.
+                        if crate::termwindow::purecpu_dirty::text_blink_animates(
+                            attrs.blink(),
+                            params.config.text_blink_rate,
+                            params.config.text_blink_rate_rapid,
+                        ) {
                             let (intensity, next) = colorease.intensity_continuous();
 
                             let (r1, g1, b1, a) = bg.tuple();

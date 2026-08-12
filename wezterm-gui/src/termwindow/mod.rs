@@ -1143,16 +1143,28 @@ impl TermWindow {
         Ok(true)
     }
 
-    /// Schedule the next blink animation check without running paint_impl.
+    /// Schedule the next animation check without running paint_impl.
     /// Uses the same has_animation / scheduled_animation mechanism as
     /// paint_impl so the two don't conflict.
-    fn schedule_blink_timer_if_needed(&mut self) {
-        // Only schedule if cursor blink is active
-        if self.config.cursor_blink_rate == 0 || self.focused.is_none() {
+    ///
+    /// **Renamed from `schedule_blink_timer_if_needed`, and it now means more
+    /// than it did.**  It used to gate on `cursor_blink_rate != 0`, because the
+    /// cursor's blink was the only thing that depended on it.  The visual bell,
+    /// SGR 5 text and animated images depend on it too, and every one of them
+    /// must keep animating in a session where the cursor does not blink — which
+    /// `cursor_blink_rate = 0` or `default_cursor_style = "SteadyBlock"` makes
+    /// an ordinary session, not a corner case.  The caller now decides liveness
+    /// with `purecpu_dirty::animation_timer_needed` and passes the answer in.
+    fn schedule_animation_timer_if_needed(&mut self, animation_live: bool) {
+        if !animation_live {
             return;
         }
         let fps = self.config.animation_fps.max(1) as u64;
-        let frame_interval = std::time::Duration::from_millis(1000 / fps);
+        // L3: `1000 / fps` is integer division, so the interval was quantised
+        // to whole milliseconds before it was ever used — at animation_fps = 60
+        // that is 16 ms rather than 16.667 ms, a 4% fast clock, and every fps
+        // above 500 collapsed to the same 1 ms.
+        let frame_interval = std::time::Duration::from_secs_f64(1.0 / fps as f64);
         let next_due = std::time::Instant::now() + frame_interval;
 
         // Use the same scheduling mechanism as paint_impl
@@ -1275,8 +1287,91 @@ impl TermWindow {
             state.last_seqno_by_pane = seqnos.into_iter().collect();
         }
 
+        // Whether anything at all is animating, and so whether the animation
+        // timer must be rescheduled if we end up skipping the paint.  It stays
+        // false on a full-repaint frame, where paint_impl does its own
+        // scheduling and never reaches the idle skip.
+        let mut animation_live = false;
+
         // Compute dirty pixel regions if not doing full repaint
         if !force_full {
+            /// Collects the cells of one pane that animate on a clock rather
+            /// than on a content change: SGR 5 blinking text and the cells of
+            /// an animated image.
+            ///
+            /// Neither bumps the pane's seqno while it animates — the content
+            /// is unchanged, only its appearance over time — so `get_changed_
+            /// since` reports nothing and the idle skip fires.  That is I3:
+            /// blinking text is left at the intensity of the single paint that
+            /// happened when the window settled, and that intensity starts at
+            /// `fg == bg`, which is why the review saw the word as blank space
+            /// rather than as a frozen word.
+            struct AnimatedCellScan {
+                viewport: StableRowIndex,
+                text_blink_rate: u64,
+                text_blink_rate_rapid: u64,
+                /// `(row_in_viewport, col)` per column a blinking cell covers.
+                blink_cells: Vec<(i32, i32)>,
+                /// `(row_in_viewport, col, image)` for each image-bearing cell.
+                image_cells: Vec<(i32, i32, Arc<termwiz::image::ImageData>)>,
+            }
+
+            impl mux::pane::WithPaneLines for AnimatedCellScan {
+                fn with_lines_mut(
+                    &mut self,
+                    first_row: StableRowIndex,
+                    lines: &mut [&mut termwiz::surface::Line],
+                ) {
+                    for (idx, line) in lines.iter().enumerate() {
+                        let row_in_viewport =
+                            (first_row + idx as StableRowIndex - self.viewport) as i32;
+                        for cell in line.visible_cells() {
+                            let attrs = cell.attrs();
+                            if purecpu_dirty::text_blink_animates(
+                                attrs.blink(),
+                                self.text_blink_rate,
+                                self.text_blink_rate_rapid,
+                            ) {
+                                // A wide grapheme occupies more than one column
+                                // and is painted across all of them; dirtying
+                                // only cell_index() would leave the right half
+                                // of a blinking CJK character stale.
+                                for i in 0..cell.width().max(1) {
+                                    self.blink_cells
+                                        .push((row_in_viewport, (cell.cell_index() + i) as i32));
+                                }
+                            }
+                            if let Some(images) = attrs.images() {
+                                for image in images {
+                                    self.image_cells.push((
+                                        row_in_viewport,
+                                        cell.cell_index() as i32,
+                                        Arc::clone(image.image_data()),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let now = Instant::now();
+            // Animations only run while the window has focus, because
+            // paint_impl gates its own rescheduling on exactly that
+            // (render/paint.rs:121).  Keeping them alive here would diverge
+            // from the renderer this is meant to track, not match it.
+            let focused = self.focused.is_some();
+            // The clock for cell-level animations: the earliest instant any
+            // animation the last paint drew asked to be redrawn at.  Reusing
+            // the renderer's own timetable is what keeps PureCpu's blink
+            // cadence identical to the GPU path's.  It is only a clock —
+            // liveness is decided from what this frame actually finds, because
+            // has_animation outlives whatever set it (see
+            // purecpu_dirty::animation_frame_due).
+            let frame_due = purecpu_dirty::animation_frame_due(*self.has_animation.borrow(), now);
+            let mut bell_ringing = false;
+            let mut animated_cells_present = false;
+
             let cell_w = self.render_metrics.cell_size.width as i32;
             let cell_h = self.render_metrics.cell_size.height as i32;
             let (padding_left, padding_top) = self.padding_left_top();
@@ -1295,7 +1390,10 @@ impl TermWindow {
                 tab_bar_height
             };
             let border = self.get_os_border();
-            let content_top = (top_bar_height + padding_top + border.top.get() as f32) as i32;
+            // Unrounded, for painted_y_span, for the same reason content_left
+            // is kept unrounded below.
+            let content_top_px = top_bar_height + padding_top + border.top.get() as f32;
+            let content_top = content_top_px as i32;
             // Kept UNROUNDED for painted_x_span: it feeds the right edge of the
             // span, so truncating it here leaves a stale column at the split
             // gutter with a fractional window_padding.  pane_placement still
@@ -1303,7 +1401,9 @@ impl TermWindow {
             let content_left_px = padding_left + border.left.get() as f32;
             let content_left = content_left_px as i32;
             let total_cols = self.terminal_size.cols as i32;
+            let total_rows = self.terminal_size.rows as i32;
             let window_pixel_width = self.dimensions.pixel_width as i32;
+            let window_pixel_height = self.dimensions.pixel_height as i32;
 
             // I1: walk the same pane list paint_impl renders, not just the
             // active pane.  A build running in one split while you read in
@@ -1361,7 +1461,7 @@ impl TermWindow {
                     .get(&pane_id)
                     .copied()
                     .unwrap_or(0);
-                let dirty_rows = pos.pane.get_changed_since(visible_range, baseline);
+                let dirty_rows = pos.pane.get_changed_since(visible_range.clone(), baseline);
                 seqnos.insert(pane_id, pos.pane.get_current_seqno());
 
                 // Convert dirty row ranges to per-pane pixel bands.  Line-level
@@ -1408,6 +1508,95 @@ impl TermWindow {
                         }
                     }
                 }
+
+                // ---- I3: content driven by the clock, not by the seqno ------
+                //
+                // The visual bell.  The plan called for "the whole window", but
+                // the bell is a second background quad over this pane's own
+                // background_rect (render/pane.rs:176-215), so the pane rect is
+                // both correct and narrower; with a single pane the two are the
+                // same rect.  A rect is pushed on every frame of the fade,
+                // because the Alert::Bell handler's lone window.invalidate()
+                // gets us exactly one frame and the fade needs all of them.
+                let bell_start = self.pane_state(pane_id).bell_start;
+                match purecpu_dirty::bell_region(bell_start, &self.config.visual_bell) {
+                    purecpu_dirty::BellRegion::None => {}
+                    purecpu_dirty::BellRegion::PaneBackground => {
+                        bell_ringing = true;
+                        let vspan = purecpu_dirty::painted_y_span(
+                            pos.top as i32,
+                            pos.height as i32,
+                            total_rows,
+                            content_top_px,
+                            padding_top,
+                            cell_h,
+                            window_pixel_height,
+                        );
+                        collected.push(purecpu_dirty::pane_rect(&span, &vspan));
+                    }
+                    purecpu_dirty::BellRegion::CursorCell => {
+                        bell_ringing = true;
+                        let cursor = pos.pane.get_cursor_position();
+                        if let Some(rect) = purecpu_dirty::cell_rect(
+                            &placement,
+                            (cursor.y - viewport) as i32,
+                            cursor.x as i32,
+                        ) {
+                            collected.push(rect);
+                        }
+                    }
+                }
+
+                // Blinking text and animated images.  One walk of the pane's
+                // visible cells answers both.
+                if focused {
+                    let mut scan = AnimatedCellScan {
+                        viewport,
+                        text_blink_rate: self.config.text_blink_rate,
+                        text_blink_rate_rapid: self.config.text_blink_rate_rapid,
+                        blink_cells: vec![],
+                        image_cells: vec![],
+                    };
+                    pos.pane.with_lines_mut(visible_range, &mut scan);
+
+                    if !scan.blink_cells.is_empty() {
+                        animated_cells_present = true;
+                        if frame_due {
+                            for (row, col) in &scan.blink_cells {
+                                if let Some(rect) =
+                                    purecpu_dirty::cell_rect(&placement, *row, *col)
+                                {
+                                    collected.push(rect);
+                                }
+                            }
+                        }
+                    }
+
+                    if !scan.image_cells.is_empty() {
+                        // Whether a given image is animating, and when its next
+                        // frame falls due, is known only to the glyph cache
+                        // that decodes it; image_next_frame_due asks it the
+                        // same question cached_image asks, without the side
+                        // effect of advancing the frame.  A still image answers
+                        // None and costs nothing here, forever.
+                        let mut glyph_cache =
+                            self.render_state.as_ref().unwrap().glyph_cache.borrow_mut();
+                        for (row, col, image_data) in &scan.image_cells {
+                            let due = glyph_cache.image_next_frame_due(image_data);
+                            if due.is_none() {
+                                continue;
+                            }
+                            animated_cells_present = true;
+                            if purecpu_dirty::animation_frame_due(due, now) {
+                                if let Some(rect) =
+                                    purecpu_dirty::cell_rect(&placement, *row, *col)
+                                {
+                                    collected.push(rect);
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // Cursor blink: detect phase transitions (visible<->invisible) and
@@ -1418,12 +1607,13 @@ impl TermWindow {
             // paints/cycle.
             let mut blink_rect = None;
             let mut new_blink_visible = None;
+            let mut cursor_blinking = false;
             if let Some((placement, viewport, cursor)) = active.as_ref() {
                 // I4: the shape must be resolved against default_cursor_style
                 // the way the render path resolves it before we ask whether it
                 // blinks; the raw pane shape is Default until an application
                 // sets one with DECSCUSR.  See purecpu_dirty::cursor_blinking.
-                let cursor_blinking = purecpu_dirty::cursor_blinking(
+                cursor_blinking = purecpu_dirty::cursor_blinking(
                     self.config.default_cursor_style,
                     cursor.shape,
                     self.config.cursor_blink_rate,
@@ -1455,6 +1645,16 @@ impl TermWindow {
                     }
                 }
             }
+
+            // L3's other half: the timer that carries every one of these
+            // animations across an idle skip must stay alive for all of them,
+            // not only for a blinking cursor.
+            animation_live = purecpu_dirty::animation_timer_needed(
+                cursor_blinking,
+                bell_ringing,
+                animated_cells_present,
+                focused,
+            );
 
             // Only now take the &mut borrow: the loop above calls &self methods.
             let state = self.purecpu_state.as_mut().unwrap();
@@ -1497,7 +1697,7 @@ impl TermWindow {
                 // next phase transition.  Compute the next frame time from
                 // animation_fps and schedule it using the same mechanism
                 // as paint_impl.
-                self.schedule_blink_timer_if_needed();
+                self.schedule_animation_timer_if_needed(animation_live);
                 return Ok(true);
             }
         }

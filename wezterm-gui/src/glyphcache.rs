@@ -473,6 +473,18 @@ impl FrameState {
         self.current_frame.duration
     }
 
+    /// Whether this image has more than one frame to show.
+    ///
+    /// A still image settles into a single frame with an 86400 s duration (see
+    /// the `frames.len() == 1` arm of [`Self::load_next_frame`]), so "is there
+    /// a next frame" cannot be answered from the duration alone.  While the
+    /// decoder thread is still attached we answer yes: the frame count is not
+    /// final yet, and a spurious yes costs one repaint of the image's own cells
+    /// whereas a spurious no freezes the animation permanently.
+    fn is_animating(&self) -> bool {
+        self.frames.len() > 1 || matches!(self.source, FrameSource::Decoder(_))
+    }
+
     fn frame_hash(&self) -> [u8; 32] {
         self.current_frame.lease.content_id().as_hash_bytes()
     }
@@ -896,6 +908,72 @@ impl GlyphCache {
         Ok(Rc::new(glyph))
     }
 
+    /// When the frame that started at `frame_start` and lasts `duration` goes
+    /// stale.
+    ///
+    /// We round up the frame duration to at least the minimum frame duration
+    /// that wezterm can use when rendering.  There's no point trying to deal
+    /// with smaller intervals because we simply cannot render them without
+    /// dropping frames.  In addition, with a 1ms frame delay, there's a good
+    /// chance that any given cell may switch to a different frame from its
+    /// neighbor while we are rendering the entire terminal frame, so we want to
+    /// avoid that.  <https://github.com/wezterm/wezterm/issues/3260>
+    ///
+    /// Hoisted out of the six places that used to spell it out so that
+    /// [`Self::image_next_frame_due`] — which PureCpu's dirty-rect walk asks
+    /// when it must repaint an image's cells — cannot answer a different
+    /// question from the one the paint pass asks.
+    fn frame_due_at(
+        frame_start: Instant,
+        duration: Duration,
+        min_frame_duration: Duration,
+    ) -> Instant {
+        frame_start + duration.max(min_frame_duration)
+    }
+
+    /// The instant at which `image_data`'s next animation frame becomes due, or
+    /// `None` when the image is not animating.
+    ///
+    /// Read-only by construction: unlike [`Self::cached_image`] it never
+    /// advances a frame, allocates a sprite or touches the atlas.  PureCpu's
+    /// dirty-rect walk runs *before* the paint pass and must not perturb the
+    /// state the paint pass is about to read.
+    ///
+    /// `None` also covers "the paint pass has never drawn this image".  That is
+    /// the right answer rather than a gap: an image the renderer has not seen
+    /// arrived with a line change, so its line is already dirty on this frame
+    /// for the ordinary seqno reason, and it acquires a cache entry as it is
+    /// drawn.
+    pub fn image_next_frame_due(&mut self, image_data: &Arc<ImageData>) -> Option<Instant> {
+        let min_frame_duration = self.min_frame_duration;
+        let decoded = self.image_cache.get(&image_data.hash())?;
+        let frame_start = *decoded.frame_start.borrow();
+        let current_frame = *decoded.current_frame.borrow();
+
+        match &*decoded.image.data() {
+            ImageDataType::AnimRgba8 {
+                frames, durations, ..
+            } if frames.len() > 1 => Some(Self::frame_due_at(
+                frame_start,
+                durations[current_frame],
+                min_frame_duration,
+            )),
+            ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => {
+                let frames = decoded.frames.borrow();
+                let frames = frames.as_ref()?;
+                if !frames.is_animating() {
+                    return None;
+                }
+                Some(Self::frame_due_at(
+                    frame_start,
+                    frames.frame_duration(),
+                    min_frame_duration,
+                ))
+            }
+            _ => None,
+        }
+    }
+
     fn cached_image_impl(
         frame_cache: &mut HashMap<[u8; 32], Sprite>,
         atlas: &mut Atlas,
@@ -938,18 +1016,11 @@ impl GlyphCache {
                 if frames.len() > 1 {
                     let now = Instant::now();
 
-                    // We round up the frame duration to at least the minimum
-                    // frame duration that wezterm can use when rendering.
-                    // There's no point trying to deal with smaller intervals
-                    // because we simply cannot render them without dropping
-                    // frames.
-                    // In addition, with a 1ms frame delay, there's a good chance
-                    // that any given cell may switch to a different frame from
-                    // its neighbor while we are rendering the entire terminal
-                    // frame, so we want to avoid that.
-                    // <https://github.com/wezterm/wezterm/issues/3260>
-                    let mut next_due = *decoded_frame_start
-                        + durations[*decoded_current_frame].max(min_frame_duration);
+                    let mut next_due = Self::frame_due_at(
+                        *decoded_frame_start,
+                        durations[*decoded_current_frame],
+                        min_frame_duration,
+                    );
                     if now >= next_due {
                         // Advance to next frame
                         *decoded_current_frame = *decoded_current_frame + 1;
@@ -961,8 +1032,11 @@ impl GlyphCache {
                             }
                         }
                         *decoded_frame_start = now;
-                        next_due = *decoded_frame_start
-                            + durations[*decoded_current_frame].max(min_frame_duration);
+                        next_due = Self::frame_due_at(
+                            *decoded_frame_start,
+                            durations[*decoded_current_frame],
+                            min_frame_duration,
+                        );
                         handle.current_frame = *decoded_current_frame;
                     }
 
@@ -983,10 +1057,11 @@ impl GlyphCache {
 
                 return Ok((
                     sprite,
-                    Some(
-                        *decoded_frame_start
-                            + durations[*decoded_current_frame].max(min_frame_duration),
-                    ),
+                    Some(Self::frame_due_at(
+                        *decoded_frame_start,
+                        durations[*decoded_current_frame],
+                        min_frame_duration,
+                    )),
                     LoadState::Loaded,
                 ));
             }
@@ -1007,25 +1082,21 @@ impl GlyphCache {
                 }
 
                 let now = Instant::now();
-                // We round up the frame duration to at least the minimum
-                // frame duration that wezterm can use when rendering.
-                // There's no point trying to deal with smaller intervals
-                // because we simply cannot render them without dropping
-                // frames.
-                // In addition, with a 1ms frame delay, there's a good chance
-                // that any given cell may switch to a different frame from
-                // its neighbor while we are rendering the entire terminal
-                // frame, so we want to avoid that.
-                // <https://github.com/wezterm/wezterm/issues/3260>
-                let mut next_due =
-                    *decoded_frame_start + frames.frame_duration().max(min_frame_duration);
+                let mut next_due = Self::frame_due_at(
+                    *decoded_frame_start,
+                    frames.frame_duration(),
+                    min_frame_duration,
+                );
                 if now >= next_due {
                     // Advance to next frame
                     if frames.load_next_frame() {
                         *decoded_current_frame = *decoded_current_frame + 1;
                         *decoded_frame_start = now;
-                        next_due =
-                            *decoded_frame_start + frames.frame_duration().max(min_frame_duration);
+                        next_due = Self::frame_due_at(
+                            *decoded_frame_start,
+                            frames.frame_duration(),
+                            min_frame_duration,
+                        );
                         handle.current_frame = *decoded_current_frame;
                     }
                 }
@@ -1074,7 +1145,11 @@ impl GlyphCache {
 
                 Ok((
                     sprite,
-                    Some(*decoded_frame_start + frames.frame_duration().max(min_frame_duration)),
+                    Some(Self::frame_due_at(
+                        *decoded_frame_start,
+                        frames.frame_duration(),
+                        min_frame_duration,
+                    )),
                     frames.load_state,
                 ))
             }
@@ -1372,5 +1447,43 @@ impl GlyphCache {
         }
 
         self.line_sprite(key, metrics)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_frame_shorter_than_the_render_minimum_is_stretched_to_it() {
+        // min_frame_duration is 1000/max_fps: a GIF whose frames are shorter
+        // than one rendered frame cannot be shown at its own rate, and asking
+        // for it would busy-repaint the image's cells without ever changing a
+        // pixel.  60 fps -> 16 ms, and a 5 ms frame is due at 16 ms, not 5.
+        let t0 = Instant::now();
+        assert_eq!(
+            GlyphCache::frame_due_at(
+                t0,
+                Duration::from_millis(5),
+                Duration::from_millis(16)
+            ),
+            t0 + Duration::from_millis(16)
+        );
+    }
+
+    #[test]
+    fn a_frame_longer_than_the_render_minimum_keeps_its_own_duration() {
+        // The discriminating negative: a helper that always returned the
+        // minimum would pass the test above and would run every animation at
+        // max_fps regardless of its authored timing.
+        let t0 = Instant::now();
+        assert_eq!(
+            GlyphCache::frame_due_at(
+                t0,
+                Duration::from_millis(50),
+                Duration::from_millis(16)
+            ),
+            t0 + Duration::from_millis(50)
+        );
     }
 }
