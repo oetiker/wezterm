@@ -119,10 +119,28 @@ impl SkrifaRasterizer {
         location: skrifa::instance::LocationRef<'_>,
         target: Target,
     ) -> anyhow::Result<Arc<HintingInstance>> {
-        // `Size::ppem()` is `None` for an unscaled size; fold that to 0.0,
-        // which no scaled size can take, so the unhinted-metrics case gets
-        // its own slot instead of colliding with one.
+        // `Size::ppem()` is `None` for an unscaled size; fold that to 0.0 so
+        // the unhinted-metrics case still gets a slot.
+        //
+        // This fold is NOT collision-free in general, and an earlier version
+        // of this comment claimed it was ("no scaled size can take 0.0").
+        // That is false: `Size::new` is `Self(Some(ppem))` unconditionally
+        // (skrifa-0.40.0 `instance.rs:23-25`), so `Size::new(0.0).ppem()` is
+        // `Some(0.0)` and would key to the same slot as `Size::unscaled()`.
+        // It is safe only because of the call site, not because of the type:
+        // `render_outline` is the sole caller and always passes a size
+        // derived from a real pixel size.  A future caller that can pass
+        // `Size::new(0.0)` must widen this key rather than trust the fold.
         let key = skrifa_size.ppem().unwrap_or(0.0).to_bits();
+        // The field comment warns that a variable location must join this key.
+        // Make that enforceable: this function ignores `outlines`, `location`
+        // and `target` on a cache hit, which is only sound while the location
+        // is the default (empty coords) at every call site.
+        debug_assert!(
+            location.coords().is_empty(),
+            "hinting_cache is keyed by size alone; a variable location must \
+             join the key before one can be passed here"
+        );
         if let Some(hinting) = self.hinting_cache.borrow().get(&key) {
             return Ok(Arc::clone(hinting));
         }
