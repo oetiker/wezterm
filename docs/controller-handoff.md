@@ -12,7 +12,7 @@
 
 Handoff commit: `6311e97`   Date: 2026-08-12   Reason: context budget — Tasks 13 and 16 closed, Task 14 dispatched and IN FLIGHT
 Worktree / branch: `/scratch/oetiker/wezterm` (primary checkout) @ `update-optimization-rebased`
-Trunk at time of writing: **`origin/main`** @ e723cf5 (merge base) — **reader: if trunk has moved, §2 is provisionally stale; if trunk now contains this branch's HEAD, this file is a tombstone** (`git merge-base --is-ancestor HEAD origin/main`). **Do NOT check against local `main`: it has NO common ancestor with this branch** (`git merge-base main HEAD` exits 1), so `--is-ancestor HEAD main` always reports "not merged" and is not a real check. `origin` is upstream wezterm (`wez/wezterm`) and legitimately runs ahead by ordinary upstream commits — that is NOT a merge signal. `fork` (`oetiker/wezterm`) is this fork's own remote and is where a merge would actually show up.
+Trunk at time of writing: **`origin/main`** @ e723cf5 (merge base) — **reader: if trunk has moved, §2 is provisionally stale; if trunk now contains this branch's HEAD, this file is a tombstone** (`git merge-base --is-ancestor HEAD origin/main`). **THIS IS A SHALLOW CLONE** (`.git/shallow`, created 2026-08-10, boundaries `d3b0fda` and `e723cf5`), so ancestry queries answer about the *local* data, not about the real repository. Local `main` is truncated at `d3b0fda` and this branch at `e723cf5`; the commits that actually join them upstream were never fetched, so `git merge-base main HEAD` exits 1 and `--is-ancestor HEAD main` reports "not merged" unconditionally. **That is a clone artifact, NOT a fact about the branches — they do share history upstream.** `git fetch --unshallow` restores real ancestry and makes these checks meaningful; until then, do NOT reach for `--allow-unrelated-histories`, which would paper over the truncation and create a genuinely wrong merge. `origin` is upstream wezterm (`wez/wezterm`) and legitimately runs ahead by ordinary upstream commits — that is NOT a merge signal. `fork` (`oetiker/wezterm`) is this fork's own remote and is where a merge would actually show up.
 Sibling worktrees: `/scratch/oetiker/claude-worktrees/wezterm-osc52-upstream` @ `osc52-x11-fix` — the two-commit upstream PR (wezterm/wezterm#8043), unrelated to this pass but **now load-bearing for it** (§4, the L4 story); leave it alone until that PR resolves. This line cannot see worktrees created later; check yourself.
 
 ## 1. Mission
@@ -399,12 +399,21 @@ matter most:
   `git merge-base --is-ancestor HEAD origin/main`, `git log --oneline HEAD..origin/main`,
   `git branch -a --contains HEAD`. If this branch is merged, stop reading and go
   to the successor's handoff.
-  **Use `origin/main`, not local `main`.** Local `main` has NO common ancestor
-  with this branch — `git merge-base main HEAD` exits 1 — so
-  `--is-ancestor HEAD main` reports "not merged" unconditionally and looks like a
-  passing check while testing nothing. This cost the controller a wrong reading at
-  the end of the pass. `origin` is upstream wezterm and legitimately runs ahead;
-  `fork` (`oetiker/wezterm`) is where a merge of this work would actually appear.
+  **THE REPO IS A SHALLOW CLONE AND THAT BREAKS EVERY ANCESTRY CHECK HERE.**
+  `.git/shallow` (2026-08-10) truncates local `main` at `d3b0fda` and this branch
+  at `e723cf5`. The commits joining them upstream were never fetched, so
+  `git merge-base main HEAD` exits 1 and `--is-ancestor HEAD main` reports "not
+  merged" unconditionally — a passing-looking check that tests nothing. **This is
+  an artifact of the clone, not a property of the branches**; they do share history
+  in the real repository, since this branch is the fork's work rebased onto
+  upstream main. The controller stated it the wrong way round twice before
+  diagnosing it — `.git/shallow` and `git rev-list --max-parents=0 <ref>` are what
+  settle it in one command each.
+  **Before trusting any merged/not-merged answer, run `git fetch --unshallow`**
+  (a large fetch — ask first). **Never use `--allow-unrelated-histories` here:** it
+  would paper over the truncation and produce a genuinely wrong merge.
+  `origin` is upstream wezterm and legitimately runs ahead; `fork`
+  (`oetiker/wezterm`) is where a merge of this work would actually appear.
 - **Sibling worktrees / other workstreams may exist that this file cannot name** —
   anything started after the handoff commit is invisible here.
 - **Task 14 was IN FLIGHT when this was written.** §2's task state and the suite
