@@ -64,6 +64,10 @@ pub struct SkrifaRasterizer {
     scale: f64,
     hinting_config: HintingConfig,
     use_lcd_subpixel: bool,
+    /// `freetype_load_flags = "NO_BITMAP"`.  See `bitmaps_disabled` for the
+    /// FreeType semantics this reproduces, and `rasterize_glyph` for the
+    /// outline test that gates it.
+    no_bitmap: bool,
     /// L2: `HintingInstance::new` interprets the font's hinting programs
     /// (`fpgm`/`prep` for glyf, or builds the autohint analysis) and was
     /// being rebuilt for every glyph rasterized.  Nothing it depends on
@@ -96,6 +100,7 @@ impl SkrifaRasterizer {
 
         let (hinting_config, use_lcd_subpixel) =
             map_freetype_config(parsed.freetype_load_target, parsed.freetype_load_flags);
+        let no_bitmap = bitmaps_disabled(parsed.freetype_load_flags);
 
         Ok(Self {
             font_data,
@@ -106,6 +111,7 @@ impl SkrifaRasterizer {
             scale: parsed.scale.unwrap_or(1.0),
             hinting_config,
             use_lcd_subpixel,
+            no_bitmap,
             hinting_cache: RefCell::new(HashMap::new()),
         })
     }
@@ -178,14 +184,19 @@ impl FontRasterizer for SkrifaRasterizer {
             return Ok(result);
         }
 
-        // Try bitmap strikes (CBDT/sbix)
-        if let Some(result) = self.render_bitmap(&font_ref, glyph_id, skrifa_size) {
-            return Ok(result);
+        let outlines = font_ref.outline_glyphs();
+        let outline_glyph = outlines.get(glyph_id);
+
+        // Try bitmap strikes (EBDT/CBDT/sbix).  `NO_BITMAP` suppresses them,
+        // but only where the outline can take over -- see `bitmaps_disabled`.
+        if !(self.no_bitmap && outline_glyph.is_some()) {
+            if let Some(result) = self.render_bitmap(&font_ref, glyph_id, skrifa_size) {
+                return Ok(result);
+            }
         }
 
         // Try outline rendering
-        let outlines = font_ref.outline_glyphs();
-        if let Some(outline_glyph) = outlines.get(glyph_id) {
+        if let Some(outline_glyph) = outline_glyph {
             return self.render_outline(
                 &font_ref,
                 &outlines,
@@ -335,6 +346,9 @@ impl SkrifaRasterizer {
 
         let bitmap = font_ref.bitmap_strikes().glyph_for_size(size, glyph_id)?;
         let bmp_data = &bitmap.data;
+        // `Size::ppem()` is `None` only for an unscaled size, which no caller
+        // passes; fold it to 0.0, which `mask_strike_matches_size` rejects.
+        let requested_ppem = size.ppem().unwrap_or(0.0);
         let width = bitmap.width as usize;
         let height = bitmap.height as usize;
 
@@ -386,15 +400,25 @@ impl SkrifaRasterizer {
                 (rgba, true)
             }
             BitmapData::Mask(mask) => {
-                // For 8-bit masks, use data directly. For other bit depths,
-                // we'd need to unpack, but 8bpp is the common case.
-                if mask.bpp == 8 {
-                    let rgba = alpha_mask_to_rgba(mask.data, width, height);
-                    (rgba, false)
-                } else {
-                    // Unsupported bit depth for now
+                // A mask strike is painted at its own pixel size: this
+                // function reports `is_scaled: false`, and for the base font
+                // the glyph cache then applies no scale at all (see the
+                // `info.font_idx == 0` arm of `glyphcache.rs`).  The bearings
+                // above are pixels at the strike's ppem too, so a strike of
+                // the wrong size would be both missized and misplaced.
+                //
+                // `glyph_for_size` always yields *some* strike -- the smallest
+                // at or above the request, else the largest that exists
+                // (skrifa-0.40.0 `bitmap.rs:99`) -- so this is the only thing
+                // stopping a 13ppem strike from being painted into a 20px
+                // cell.  Take the strike at its own size, and let every other
+                // size fall through to the outline.
+                if !mask_strike_matches_size(bitmap.ppem_y, requested_ppem) {
                     return None;
                 }
+                let alpha =
+                    unpack_mask_to_alpha(mask.data, mask.bpp, mask.is_packed, width, height)?;
+                (alpha_mask_to_rgba(&alpha, width, height), false)
             }
         };
 
@@ -741,6 +765,83 @@ impl<'a> ColorPainter for PaintOpCollector<'a> {
 }
 
 /// Convert 8-bit alpha mask to premultiplied RGBA 32bpp.
+/// True when `freetype_load_flags` asks for embedded bitmap strikes to be
+/// skipped in favour of the outline.
+///
+/// This is FreeType's `FT_LOAD_NO_BITMAP`, and it reproduces that flag's
+/// scope as well as its name: FreeType applies it only to a *scalable* face,
+/// so a bitmap-only font ignores it.  `rasterize_glyph` reproduces that by
+/// consulting this only for a glyph that actually has an outline, which is
+/// what keeps a bitmap-only colour emoji font rendering for a user who sets
+/// the flag on the global config to escape a bitmap text font.
+fn bitmaps_disabled(load_flags: Option<FreeTypeLoadFlags>) -> bool {
+    load_flags
+        .map(|f| f.contains(FreeTypeLoadFlags::NO_BITMAP))
+        .unwrap_or(false)
+}
+
+/// True when a mask strike is at the pixel size the caller asked for.
+///
+/// Both values are pixels-per-em.  A strike's ppem is a whole number by
+/// construction (EBLC stores it in a byte) while the request is the
+/// fractional pixel size computed from `font_size` and the dpi, so the
+/// comparison carries a quarter-pixel of slack: enough to absorb rounding in
+/// that arithmetic, and small enough that an accepted strike can never be off
+/// its cell by a visible amount.
+fn mask_strike_matches_size(strike_ppem: f32, requested_ppem: f32) -> bool {
+    requested_ppem > 0.0 && (strike_ppem - requested_ppem).abs() <= 0.25
+}
+
+/// Expands a `bpp`-bits-per-pixel bitmap mask to one alpha byte per pixel.
+///
+/// `bpp` is 1, 2, 4 or 8 (skrifa-0.40.0 `bitmap.rs:365`); anything else
+/// yields `None` so the caller falls through to the outline.  `is_packed` is
+/// skrifa's row-alignment flag: when true the rows run continuously through
+/// the bit stream (EBDT image formats 2/5/7), when false each row restarts at
+/// the next byte boundary (formats 1/6).  Anonymous Pro uses format 1.
+///
+/// Values are scaled so the depth's maximum becomes 255 -- a set bit in a
+/// 1bpp mask is fully opaque.  A short `data` yields `None` rather than a
+/// panic, so a malformed strike degrades to the outline.
+fn unpack_mask_to_alpha(
+    data: &[u8],
+    bpp: u8,
+    is_packed: bool,
+    width: usize,
+    height: usize,
+) -> Option<Vec<u8>> {
+    let max_value: u32 = match bpp {
+        1 => 1,
+        2 => 3,
+        4 => 15,
+        8 => 255,
+        _ => return None,
+    };
+    let bpp = bpp as usize;
+    let mut alpha = vec![0u8; width.checked_mul(height)?];
+    let row_bits = width.checked_mul(bpp)?;
+    // Byte-aligned rows pad up to the next multiple of 8 bits.
+    let row_stride_bits = if is_packed {
+        row_bits
+    } else {
+        row_bits.checked_add(7)? / 8 * 8
+    };
+    for y in 0..height {
+        let row_start = y.checked_mul(row_stride_bits)?;
+        for x in 0..width {
+            let bit = row_start + x * bpp;
+            let byte = *data.get(bit / 8)? as u32;
+            // `bit % 8` is always a multiple of `bpp` for these depths, so
+            // no pixel ever straddles a byte boundary and the shift is
+            // never negative.
+            let shift = 8 - bpp - (bit % 8);
+            let value = (byte >> shift) & max_value;
+            alpha[y * width + x] = (value * 255 / max_value) as u8;
+        }
+    }
+    Some(alpha)
+}
+
 fn alpha_mask_to_rgba(alpha_data: &[u8], width: usize, height: usize) -> Vec<u8> {
     let mut rgba = vec![0u8; width * height * 4];
     for y in 0..height {
@@ -942,6 +1043,7 @@ mod tests {
                 preserve_linear_metrics: false,
             }),
             use_lcd_subpixel: false,
+            no_bitmap: false,
             hinting_cache: RefCell::new(HashMap::new()),
         }
     }
@@ -1016,5 +1118,84 @@ mod tests {
         // The discriminating negative for the zero check.
         assert_eq!(colr_scale(16.0, 1000), Some(0.016));
         assert_eq!(colr_scale(32.0, 2048), Some(0.015625));
+    }
+
+    // L3: embedded bitmap strikes. Again no font file: the mask bit patterns
+    // and the strike sizes are the inputs, and they are written out here.
+
+    #[test]
+    fn one_bit_masks_expand_to_opaque_and_transparent() {
+        // The depth Anonymous Pro uses. Before this, `bpp != 8` was dropped
+        // outright and such a font silently rendered from its outlines.
+        // Row of 4 pixels `1010`, then `0101`, byte-aligned rows.
+        let data = [0b1010_0000, 0b0101_0000];
+        let alpha = unpack_mask_to_alpha(&data, 1, false, 4, 2).expect("1bpp is supported");
+        assert_eq!(alpha, vec![255, 0, 255, 0, 0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn packed_rows_continue_through_the_bit_stream() {
+        // The discriminating negative for the row alignment: the same two
+        // 4-pixel rows packed end to end occupy one byte, not two, so
+        // reading them as byte-aligned would return the wrong second row.
+        let data = [0b1010_0101];
+        let packed = unpack_mask_to_alpha(&data, 1, true, 4, 2).expect("1bpp is supported");
+        assert_eq!(packed, vec![255, 0, 255, 0, 0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn intermediate_depths_scale_to_full_range() {
+        // 2bpp: values 0,1,2,3 must span 0..=255 rather than stay 0..=3.
+        let data = [0b00_01_10_11];
+        let alpha = unpack_mask_to_alpha(&data, 2, false, 4, 1).expect("2bpp is supported");
+        assert_eq!(alpha, vec![0, 85, 170, 255]);
+
+        // 4bpp: two pixels per byte, the maximum staying exactly opaque.
+        let data = [0x0F, 0x80];
+        let alpha = unpack_mask_to_alpha(&data, 4, false, 2, 2).expect("4bpp is supported");
+        assert_eq!(alpha, vec![0, 255, 136, 0]);
+    }
+
+    #[test]
+    fn eight_bit_masks_pass_through_unchanged() {
+        // The pre-existing path, pinned now that it shares the unpacker.
+        let data = [0, 17, 200, 255];
+        let alpha = unpack_mask_to_alpha(&data, 8, false, 4, 1).expect("8bpp is supported");
+        assert_eq!(alpha, vec![0, 17, 200, 255]);
+    }
+
+    #[test]
+    fn a_short_or_odd_mask_is_declined_rather_than_panicking() {
+        // Both yield None so the caller falls through to the outline.
+        assert_eq!(unpack_mask_to_alpha(&[0xFF], 1, false, 4, 2), None);
+        assert_eq!(unpack_mask_to_alpha(&[0xFF, 0xFF], 3, false, 4, 2), None);
+    }
+
+    #[test]
+    fn a_strike_is_taken_only_at_its_own_size() {
+        // The size a strike exists at, and the quarter-pixel of slack for
+        // rounding in the font_size * dpi / 72 arithmetic.
+        assert!(mask_strike_matches_size(12.0, 12.0));
+        assert!(mask_strike_matches_size(12.0, 11.8));
+
+        // The case this guard exists for: `glyph_for_size` hands back the
+        // largest strike it has for any larger request, and painting that
+        // 13ppem strike unscaled into a 20px cell is the bug.
+        assert!(!mask_strike_matches_size(13.0, 20.0));
+        assert!(!mask_strike_matches_size(12.0, 11.0));
+        // An unscaled request folds to 0.0 and must never match.
+        assert!(!mask_strike_matches_size(12.0, 0.0));
+    }
+
+    #[test]
+    fn no_bitmap_is_off_unless_the_flag_asks_for_it() {
+        assert!(!bitmaps_disabled(None));
+        assert!(!bitmaps_disabled(Some(FreeTypeLoadFlags::DEFAULT)));
+        assert!(bitmaps_disabled(Some(FreeTypeLoadFlags::NO_BITMAP)));
+        // The flag must survive being combined with others.
+        assert!(bitmaps_disabled(Some(
+            FreeTypeLoadFlags::NO_BITMAP | FreeTypeLoadFlags::NO_HINTING
+        )));
+        assert!(!bitmaps_disabled(Some(FreeTypeLoadFlags::NO_HINTING)));
     }
 }
