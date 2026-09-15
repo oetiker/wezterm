@@ -848,7 +848,8 @@ mod tests {
         };
         assert!(
             err.to_string().contains("larger than the max"),
-            "unexpected error text: {err}"
+            "unexpected error text: {}",
+            err
         );
     }
 

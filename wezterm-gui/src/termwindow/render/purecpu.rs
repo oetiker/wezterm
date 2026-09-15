@@ -1167,7 +1167,7 @@ pub(crate) mod test {
     fn srgb_linear_roundtrip() {
         for &v in &[0.0_f32, 0.01, 0.04045, 0.5, 0.75, 1.0] {
             let rt = linear_to_srgb(srgb_to_linear(v));
-            assert!(approx_eq(rt, v), "roundtrip failed for {v}: got {rt}");
+            assert!(approx_eq(rt, v), "roundtrip failed for {}: got {}", v, rt);
         }
     }
 
@@ -1195,7 +1195,13 @@ pub(crate) mod test {
             let (r2, g2, b2) = hsv_to_rgb(h, s, v);
             assert!(
                 approx_eq(r, r2) && approx_eq(g, g2) && approx_eq(b, b2),
-                "HSV roundtrip failed for ({r},{g},{b}): got ({r2},{g2},{b2})"
+                "HSV roundtrip failed for ({},{},{}): got ({},{},{})",
+                r,
+                g,
+                b,
+                r2,
+                g2,
+                b2
             );
         }
     }
