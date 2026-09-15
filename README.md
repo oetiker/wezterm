@@ -22,6 +22,10 @@ code other people depend on, and they trade breadth for one particular
 deployment. Upstream wezterm is the right choice for almost everyone; this fork
 is for the case where it is not.
 
+The branch is **rebased** onto upstream `main`, not merged, so the history stays
+linear and the fork's own work is exactly `git log origin/main..HEAD`. The
+upstream commit it currently sits on is `git merge-base HEAD origin/main`.
+
 Three substantial differences from upstream:
 
 ### 1. A pure-Rust font stack
@@ -35,6 +39,13 @@ The vendored C dependencies are **gone** — `deps/freetype`, `deps/harfbuzz`,
 | rasterizer | FreeType | [skrifa](https://crates.io/crates/skrifa) (+ [zeno](https://crates.io/crates/zeno), [tiny-skia](https://crates.io/crates/tiny-skia) for COLR) |
 | shaper | HarfBuzz | [harfrust](https://crates.io/crates/harfrust) |
 | font discovery | FontConfig | [fontdb](https://crates.io/crates/fontdb) |
+
+**These versions are coupled and cannot be bumped independently.** harfrust and
+skrifa must resolve to a single `read-fonts`: a `FontRef` from one version is a
+different type to the other, and this code reads tables off the font it hands to
+the shaper. harfrust 0.13 requires `read-fonts ^0.43`, which holds skrifa at
+0.46 although 0.47 is released. Taking skrifa 0.47 puts two copies of the parser
+in the tree and stops the shaper compiling. Check that before `cargo update`.
 
 The build no longer needs a C toolchain or system font libraries. Hinting, COLR
 colour fonts, synthetic bold/italic and subpixel positioning are all still
@@ -78,6 +89,17 @@ result, not the percentages.
   request length.
 - **The framebuffer is re-presented on `Expose`**, so switching virtual desktops
   no longer leaves a blank window.
+
+## Building
+
+`cargo build` is enough — there is no C toolchain and no system font library to
+install, which is the point of the font stack above.
+
+One upstream defect is inherited here rather than fixed: `cargo check
+--all-targets` fails in `wezterm-char-props`, which declares a `wcwidth` bench
+but lists neither `criterion` nor `termwiz` in its `[dev-dependencies]`. It
+behaves identically on `origin/main`, so it is not something this fork broke.
+`cargo check --workspace --tests` is clean.
 
 ## How the PureCpu renderer was verified
 
