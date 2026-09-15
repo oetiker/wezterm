@@ -97,7 +97,7 @@ fixedbitset = {version="0.4", default-features=false}
 flume = "0.11"
 fnv = "1.0"
 fontconfig-parser = "0.5"
-fontdb = "0.23"
+fontdb = "0.24"
 frecency = { path = "frecency" }
 futures = "0.3"
 futures-lite = "2.3"
@@ -109,7 +109,7 @@ gl_generator = "0.14"
 glium = { version = "0.35", default-features = false }
 governor = {version="0.5", default-features=false, features=["std"]}
 guillotiere = "0.6"
-harfrust = "0.5"
+harfrust = "0.13"
 heapless = "0.8"
 hdrhistogram = "7.1"
 hex = {version="0.4", default-features=false}
@@ -177,7 +177,7 @@ quote = "1.0.2"
 rangeset = { path = "rangeset" }
 ratelim= { path = "ratelim" }
 raw-window-handle = "0.6"
-read-fonts = "0.37"
+read-fonts = "0.43"
 rayon = "1.10"
 rcgen = "0.12"
 regex = "1"
@@ -208,7 +208,7 @@ ssh-funcs = { path = "lua-api-crates/ssh-funcs" }
 ssh2 = "0.9.3"
 starship-battery = "0.10"
 strsim = "0.11"
-skrifa = "0.40"
+skrifa = "0.46"
 syn = "1.0"
 tabout = { path = "tabout" }
 tar = "0.4"

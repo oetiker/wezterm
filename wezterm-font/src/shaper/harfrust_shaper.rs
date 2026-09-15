@@ -259,11 +259,7 @@ impl HarfrustShaper {
                     // harfrust uses font units internally; we scale the output
                     let ppem_scale = pixel_size / pair.units_per_em as f64;
 
-                    let shaper = pair
-                        .shaper_data
-                        .shaper(&font_ref)
-                        .point_size(Some(font_size as f32))
-                        .build();
+                    let shaper = pair.shaper_data.shaper(&font_ref).build();
 
                     let mut buffer = harfrust::UnicodeBuffer::new();
                     buffer.set_direction(match direction {
@@ -282,7 +278,14 @@ impl HarfrustShaper {
                         harfrust::BufferClusterLevel::MonotoneGraphemes,
                     );
 
-                    let glyph_buf = shaper.shape(buffer, &pair.features);
+                    // harfrust carries the point size and the features on the
+                    // per-shape options, not on the shaper itself.
+                    let glyph_buf = shaper.shape(
+                        buffer,
+                        harfrust::ShapeOptions::new()
+                            .point_size(Some(font_size as f32))
+                            .features(&pair.features),
+                    );
 
                     let infos = glyph_buf.glyph_infos();
                     let positions = glyph_buf.glyph_positions();
